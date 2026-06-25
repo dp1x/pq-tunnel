@@ -1,0 +1,29 @@
+# Planning and state files - never commit
+CHECKPOINT.md
+AGENT_STATE.md
+AGENTS.md
+
+# External agent workspace - not part of this project
+autonomous-engineering-agent/
+BUILD_TEST.md
+
+# Empty placeholder dirs for future crates (Phase 2+)
+pq-tunnel-core/src/
+pq-tun/src/
+pq-tunnel-bin/src/
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
