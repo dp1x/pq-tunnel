@@ -1,0 +1,11 @@
+[package]
+name = "pq-tun"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tun = "0.7"
+tokio = { workspace = true }
+tracing = { workspace = true }
+ipnet = "2"
+thiserror = { workspace = true }
