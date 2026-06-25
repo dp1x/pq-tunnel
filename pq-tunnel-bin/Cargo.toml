@@ -1,0 +1,25 @@
+[package]
+name = "pq-tunnel-bin"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pq-tunnel-client"
+path = "src/main.rs"
+
+[[bin]]
+name = "pq-tunnel-server"
+path = "src/main.rs"
+
+[dependencies]
+pq-tunnel-core = { path = "../pq-tunnel-core" }
+pq-tun = { path = "../pq-tun" }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+tracing-subscriber = "0.3"
+thiserror = { workspace = true }
+
+[features]
+default = []
+proxy = []
