@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "pq-crypto",
+    "pq-tunnel-core",
+    "pq-tun",
+    "pq-proxy",
+    "pq-tunnel-bin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+thiserror = "1"
+rand = "0.9"
+rand_core = "0.9"
+getrandom = "0.3"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

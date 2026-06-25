@@ -1,0 +1,19 @@
+[package]
+name = "pq-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
+ml-dsa = { version = "0.1.1", features = ["getrandom"] }
+x25519-dalek = { version = "3.0.0-rc.1", features = ["getrandom", "static_secrets"] }
+sha2 = "0.10"
+thiserror.workspace = true
+zeroize = { version = "1", features = ["derive"] }
+hybrid-array = "0.4"
+signature = "3"
+kem = "0.3"
+curve25519-dalek = { version = "5.0.0-rc.1", features = ["rand_core"] }
+# rand_core 0.10 for RustCrypto 2026 ecosystem compatibility
+rand_core = "0.10"
+getrandom = "0.3"
