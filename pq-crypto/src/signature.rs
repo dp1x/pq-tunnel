@@ -1,37 +1,29 @@
 use crate::error::CryptoError;
-use ml_dsa::{MlDsa65, Signer, SigningKey, Verifier, VerifyingKey};
+use kem::KeyExport;
+use ml_dsa::{Keypair, MlDsa65 as MlDsaParams, Generate, Signer, SigningKey, Verifier, VerifyingKey};
 use zeroize::ZeroizeOnDrop;
 
-/// ML-DSA-65 public key size in bytes.
 pub const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1952;
-/// ML-DSA-65 secret key size in bytes (expanded form).
 pub const ML_DSA_65_SECRET_KEY_BYTES: usize = 4032;
-/// ML-DSA-65 signature size in bytes.
 pub const ML_DSA_65_SIGNATURE_BYTES: usize = 3309;
 
-/// ML-DSA-65 public key.
 #[derive(Debug, Clone)]
-pub struct MlDsaPublicKey(VerifyingKey<MlDsa65>);
+pub struct MlDsaPublicKey(pub(crate) VerifyingKey<MlDsaParams>);
 
-/// ML-DSA-65 secret key. Automatically zeroed on drop.
 #[derive(Debug, ZeroizeOnDrop)]
-pub struct MlDsaSecretKey(SigningKey<MlDsa65>);
+pub struct MlDsaSecretKey(pub(crate) SigningKey<MlDsaParams>);
 
-/// ML-DSA-65 signature.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MlDsaSignature(ml_dsa::Signature<MlDsa65>);
+#[derive(Debug, Clone, PartialEq)]
+pub struct MlDsaSignature(pub(crate) ml_dsa::Signature<MlDsaParams>);
 
-/// ML-DSA-65 keypair.
 pub struct MlDsaKeypair {
     pub public: MlDsaPublicKey,
     pub secret: MlDsaSecretKey,
 }
 
 impl MlDsaKeypair {
-    /// Generate a new ML-DSA-65 keypair using the system CSPRNG.
     pub fn generate() -> Result<Self, CryptoError> {
-        use ml_dsa::Generate;
-        let sk = SigningKey::<MlDsa65>::generate();
+        let sk = SigningKey::<MlDsaParams>::generate();
         let vk = sk.verifying_key();
         Ok(MlDsaKeypair {
             public: MlDsaPublicKey(vk),
@@ -39,19 +31,16 @@ impl MlDsaKeypair {
         })
     }
 
-    /// Sign a message with ML-DSA-65.
-    pub fn sign(&self, msg: &[u8]) -> Result<MlDsaSignature, CryptoError> {
-        let sig = self.0.sign(msg);
-        Ok(MlDsaSignature(sig))
+    pub fn public_key(&self) -> MlDsaPublicKey {
+        MlDsaPublicKey(self.secret.0.verifying_key())
     }
 
-    /// Get the verifying key for this keypair.
-    pub fn verifying_key(&self) -> MlDsaPublicKey {
-        MlDsaPublicKey(self.0.verifying_key())
+    pub fn sign(&self, msg: &[u8]) -> Result<MlDsaSignature, CryptoError> {
+        let sig = self.secret.0.sign(msg);
+        Ok(MlDsaSignature(sig))
     }
 }
 
-/// Verify an ML-DSA-65 signature on a message.
 pub fn verify(pk: &MlDsaPublicKey, msg: &[u8], sig: &MlDsaSignature) -> Result<bool, CryptoError> {
     match pk.0.verify(msg, &sig.0) {
         Ok(()) => Ok(true),
