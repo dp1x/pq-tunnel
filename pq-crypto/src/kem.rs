@@ -20,6 +20,7 @@ pub struct MlKemCiphertext(pub(crate) Ciphertext<MlKem768>);
 #[derive(Debug, ZeroizeOnDrop)]
 pub struct MlKemSharedSecret(pub(crate) SharedKey<MlKem768>);
 
+#[derive(Debug)]
 pub struct MlKemKeypair {
     pub public: MlKemPublicKey,
     pub secret: MlKemSecretKey,

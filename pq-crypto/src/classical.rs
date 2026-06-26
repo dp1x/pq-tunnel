@@ -1,3 +1,4 @@
+use std::fmt;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 pub type X25519PublicKey = PublicKey;
@@ -6,6 +7,15 @@ pub type X25519SecretKey = StaticSecret;
 pub struct X25519Keypair {
     pub public: X25519PublicKey,
     pub secret: X25519SecretKey,
+}
+
+impl fmt::Debug for X25519Keypair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("X25519Keypair")
+            .field("public", &self.public)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl X25519Keypair {
