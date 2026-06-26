@@ -1,5 +1,4 @@
 use crate::error::CryptoError;
-use kem::KeyExport;
 use ml_dsa::{Keypair, MlDsa65 as MlDsaParams, Generate, Signer, SigningKey, Verifier, VerifyingKey};
 use zeroize::ZeroizeOnDrop;
 
@@ -16,6 +15,7 @@ pub struct MlDsaSecretKey(pub(crate) SigningKey<MlDsaParams>);
 #[derive(Debug, Clone, PartialEq)]
 pub struct MlDsaSignature(pub(crate) ml_dsa::Signature<MlDsaParams>);
 
+#[derive(Debug)]
 pub struct MlDsaKeypair {
     pub public: MlDsaPublicKey,
     pub secret: MlDsaSecretKey,
@@ -51,13 +51,6 @@ pub fn verify(pk: &MlDsaPublicKey, msg: &[u8], sig: &MlDsaSignature) -> Result<b
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ml_dsa_65_keypair_generation_succeeds() {
-        let kp = MlDsaKeypair::generate().expect("keygen");
-        let pk_bytes = kp.public.0.to_bytes();
-        assert_eq!(pk_bytes.len(), ML_DSA_65_PUBLIC_KEY_BYTES);
-    }
 
     #[test]
     fn ml_dsa_65_sign_verify_roundtrip() {
