@@ -5,11 +5,11 @@ edition.workspace = true
 
 [[bin]]
 name = "pq-tunnel-client"
-path = "src/main.rs"
+path = "src/client.rs"
 
 [[bin]]
 name = "pq-tunnel-server"
-path = "src/main.rs"
+path = "src/server.rs"
 
 [dependencies]
 pq-tunnel-core = { path = "../pq-tunnel-core" }
