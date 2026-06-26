@@ -1,27 +1,20 @@
-use crate::error::CryptoError;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// X25519 public key (32 bytes).
 pub type X25519PublicKey = PublicKey;
-
-/// X25519 secret key (32 bytes).
 pub type X25519SecretKey = StaticSecret;
 
-/// X25519 keypair.
 pub struct X25519Keypair {
     pub public: X25519PublicKey,
     pub secret: X25519SecretKey,
 }
 
 impl X25519Keypair {
-    /// Generate a new X25519 keypair using the system CSPRNG.
     pub fn generate() -> Self {
         let secret = StaticSecret::random();
         let public = PublicKey::from(&secret);
         X25519Keypair { public, secret }
     }
 
-    /// Compute the X25519 Diffie-Hellman shared secret.
     pub fn diffie_hellman(&self, other: &X25519PublicKey) -> [u8; 32] {
         let shared = self.secret.diffie_hellman(other);
         *shared.as_bytes()
