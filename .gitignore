@@ -22,6 +22,7 @@ config/prod*.*
 *.pfx
 
 # Agent / Ephemeral
+.kilo/
 agent-logs/
 handoff-*.md
 session-state.md
