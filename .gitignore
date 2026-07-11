@@ -1,29 +1,55 @@
-# Planning and state files - never commit
+# Proprietary / Internal
+docs/superpowers/specs/
+docs/internal/
+post_quantum_tunnel_blueprint.md
+
+# Machine / Build
+target/
+**/target/
+.msvc_libs/
+.cargo/
+install_arm64_tools.ps1
+
+# Secrets & Config
+.env*
+*.secret
+*.secret.key
+credentials.*
+config/prod*.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Agent / Ephemeral
+agent-logs/
+handoff-*.md
+session-state.md
+.tmp/
+temp/
+tmp/
+*.tmp
+*.log
+logs/
+
+# Rust / General
+**/*.rs.bk
+**/*.db
+**/*.bin
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Planning / Agent state - never commit
 CHECKPOINT.md
 AGENT_STATE.md
 AGENTS.md
+BLUEPRINT.md
+docs/superpowers/plans/
 
-# External agent workspace - not part of this project
-autonomous-engineering-agent/
-BUILD_TEST.md
-
-# Empty placeholder dirs for future crates (Phase 2+)
-pq-tunnel-core/src/
-pq-tun/src/
-pq-tunnel-bin/src/
-
-# Rust build artifacts
-/target/
-**/*.rs.bk
-Cargo.lock
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
+# Test scratch
+test_flatline.ps1
