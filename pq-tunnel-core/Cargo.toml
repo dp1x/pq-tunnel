@@ -6,10 +6,20 @@ edition.workspace = true
 [dependencies]
 pq-crypto = { path = "../pq-crypto" }
 quinn = "0.11"
-rustls = "0.23"
+rustls = { workspace = true }
 rustls-pki-types = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }
 rcgen = "0.12"
 webpki-roots = "1"
 thiserror.workspace = true
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+x25519-dalek = { workspace = true }
+ml-kem = { version = "0.3.2", features = ["getrandom"] }
+ml-dsa = { version = "0.1.1", features = ["getrandom"] }
+hybrid-array = "0.4"
+kem = "0.3"
+subtle = "2"
+ zeroize = { workspace = true }
+ hkdf = "0.12"
