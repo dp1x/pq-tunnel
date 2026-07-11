@@ -6,12 +6,12 @@ edition.workspace = true
 [dependencies]
 ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
 ml-dsa = { version = "0.1.1", features = ["getrandom", "zeroize"] }
-x25519-dalek = { version = "3.0.0-rc.1", features = ["getrandom", "static_secrets"] }
+x25519-dalek = { version = "=3.0.0-rc.1", features = ["getrandom", "static_secrets"] }
 sha2 = "0.10"
 thiserror.workspace = true
 zeroize = { version = "1", features = ["derive"] }
 hybrid-array = "0.4"
 signature = "3"
 kem = "0.3"
-curve25519-dalek = { version = "5.0.0-rc.1", features = ["rand_core"] }
+curve25519-dalek = { version = "=5.0.0-rc.1", features = ["rand_core"] }
 typenum = "1"

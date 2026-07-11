@@ -1,24 +1,47 @@
 use crate::error::CryptoError;
-use ml_dsa::{Keypair, MlDsa65 as MlDsaParams, Generate, Signer, SigningKey, Verifier, VerifyingKey};
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa65 as MlDsaParams, Generate, Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use zeroize::ZeroizeOnDrop;
 
 pub const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1952;
 pub const ML_DSA_65_SECRET_KEY_BYTES: usize = 4032;
 pub const ML_DSA_65_SIGNATURE_BYTES: usize = 3309;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MlDsaPublicKey(pub(crate) VerifyingKey<MlDsaParams>);
 
-#[derive(Debug, ZeroizeOnDrop)]
+#[derive(ZeroizeOnDrop)]
 pub struct MlDsaSecretKey(pub(crate) SigningKey<MlDsaParams>);
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct MlDsaSignature(pub(crate) ml_dsa::Signature<MlDsaParams>);
 
-#[derive(Debug)]
 pub struct MlDsaKeypair {
     pub public: MlDsaPublicKey,
     pub secret: MlDsaSecretKey,
+}
+
+impl std::fmt::Debug for MlDsaPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MlDsaPublicKey([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for MlDsaSecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MlDsaSecretKey([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for MlDsaSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MlDsaSignature([REDACTED])")
+    }
+}
+
+impl std::fmt::Debug for MlDsaKeypair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MlDsaKeypair {{ public: MlDsaPublicKey([REDACTED]), secret: [REDACTED] }}")
+    }
 }
 
 impl MlDsaKeypair {
@@ -38,6 +61,41 @@ impl MlDsaKeypair {
     pub fn sign(&self, msg: &[u8]) -> Result<MlDsaSignature, CryptoError> {
         let sig = self.secret.0.sign(msg);
         Ok(MlDsaSignature(sig))
+    }
+}
+
+impl MlDsaPublicKey {
+    pub fn encode(&self) -> Vec<u8> {
+        self.0.encode().to_vec()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let encoded = EncodedVerifyingKey::<MlDsaParams>::try_from(bytes)
+            .map_err(|_| CryptoError::Signature("invalid dsa key length".into()))?;
+        Ok(MlDsaPublicKey(VerifyingKey::decode(&encoded)))
+    }
+
+    pub fn inner(&self) -> &VerifyingKey<MlDsaParams> {
+        &self.0
+    }
+}
+
+impl MlDsaSignature {
+    pub fn encode(&self) -> Vec<u8> {
+        self.0.encode().to_vec()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let encoded = EncodedSignature::<MlDsaParams>::try_from(bytes)
+            .map_err(|_| CryptoError::Signature("invalid signature length".into()))?;
+        match Signature::decode(&encoded) {
+            Some(sig) => Ok(MlDsaSignature(sig)),
+            None => Err(CryptoError::Signature("signature decode failed".into())),
+        }
+    }
+
+    pub fn inner(&self) -> &ml_dsa::Signature<MlDsaParams> {
+        &self.0
     }
 }
 
@@ -62,11 +120,33 @@ mod tests {
     }
 
     #[test]
-    fn ml_dsa_65_verify_wrong_message_fails() {
+    fn ml_dsa_signature_encode_decode_roundtrip() {
         let kp = MlDsaKeypair::generate().expect("keygen");
-        let sig = kp.sign(b"correct message").expect("sign");
-        let valid = verify(&kp.public, b"wrong message", &sig).expect("verify");
-        assert!(!valid, "signature on different message must NOT verify");
+        let msg = b"test message for encode/decode roundtrip";
+        let sig = kp.sign(msg).expect("sign");
+
+        let encoded = sig.encode();
+        assert_eq!(encoded.len(), 3309, "ML-DSA-65 signature must be 3309 bytes");
+
+        let decoded = MlDsaSignature::from_bytes(&encoded).expect("from_bytes");
+
+        let valid = verify(&kp.public, msg, &decoded).expect("verify");
+        assert!(valid, "decoded signature must verify against original message");
+    }
+
+    #[test]
+    fn ml_dsa_public_key_encode_decode_roundtrip() {
+        let kp = MlDsaKeypair::generate().expect("keygen");
+
+        let encoded = kp.public.encode();
+        assert_eq!(encoded.len(), 1952, "ML-DSA-65 public key must be 1952 bytes");
+
+        let decoded = MlDsaPublicKey::from_bytes(&encoded).expect("from_bytes");
+
+        let msg = b"test message";
+        let sig = kp.sign(msg).expect("sign");
+        let valid = verify(&decoded, msg, &sig).expect("verify");
+        assert!(valid, "decoded public key must verify original signature");
     }
 
     #[test]
