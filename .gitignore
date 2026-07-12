@@ -1,7 +1,14 @@
-# Proprietary / Internal
-docs/superpowers/specs/
+# Proprietary / Internal — ALL .md are proprietary except README.md
+docs/superpowers/
 docs/internal/
 post_quantum_tunnel_blueprint.md
+HYGIENE.md
+AGENTS.md
+CHECKPOINT.md
+PROTOCOL.md
+ARCHITECTURE.md
+*.md
+!README.md
 
 # Machine / Build
 target/
@@ -45,12 +52,9 @@ logs/
 *.swp
 *~
 
-# Planning / Agent state - never commit
-CHECKPOINT.md
+# Planning / Agent state - never commit (all .md covered by *.md above)
 AGENT_STATE.md
-AGENTS.md
 BLUEPRINT.md
-docs/superpowers/plans/
 
 # Test scratch
 test_flatline.ps1
