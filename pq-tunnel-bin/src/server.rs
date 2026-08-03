@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -29,7 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     let args = Args::parse();
@@ -72,22 +74,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(conn) => {
                                 let (mut send, mut recv) = match conn.accept_bi().await {
                                     Ok(s) => s,
-                                    Err(e) => { tracing::debug!("accept_bi failed: {}", e); return; }
+                                    Err(e) => {
+                                        tracing::debug!("accept_bi failed: {}", e);
+                                        return;
+                                    }
                                 };
-                                match pq_tunnel_core::server_handshake(&id, &mut send, &mut recv).await {
+                                match pq_tunnel_core::server_handshake(&id, &mut send, &mut recv)
+                                    .await
+                                {
                                     Ok(result) => {
                                         ths.fetch_add(1, Ordering::Relaxed);
-                                        tracing::info!("Handshake complete: {}ms", result.handshake_duration_ms);
+                                        tracing::info!(
+                                            "Handshake complete: {}ms",
+                                            result.handshake_duration_ms
+                                        );
                                         run_data_loop(send, recv).await;
                                     }
-                                    Err(e) => { tracing::warn!("Handshake failed: {}", e); }
+                                    Err(e) => {
+                                        tracing::warn!("Handshake failed: {}", e);
+                                    }
                                 }
                             }
-                            Err(e) => { tracing::debug!("Connection failed: {}", e); }
+                            Err(e) => {
+                                tracing::debug!("Connection failed: {}", e);
+                            }
                         }
                     });
                 }
-                None => { tracing::info!("Endpoint closed"); break; }
+                None => {
+                    tracing::info!("Endpoint closed");
+                    break;
+                }
             }
         }
     });
@@ -98,12 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_data_loop(mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
-    use pq_tunnel_core::handshake::{send_data_packet, recv_data_packet};
+    use pq_tunnel_core::handshake::{recv_data_packet, send_data_packet};
 
     loop {
         match recv_data_packet(&mut recv).await {
             Ok(data) => {
-                if send_data_packet(&mut send, &data).await.is_err() { break; }
+                if send_data_packet(&mut send, &data).await.is_err() {
+                    break;
+                }
             }
             Err(_) => break,
         }

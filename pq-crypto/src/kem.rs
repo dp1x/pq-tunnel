@@ -11,7 +11,7 @@ pub const ML_KEM_768_SHARED_SECRET_BYTES: usize = 32;
 #[derive(Clone)]
 pub struct MlKemPublicKey(pub(crate) EncapsulationKey<MlKem768>);
 
-#[derive(ZeroizeOnDrop)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct MlKemSecretKey(pub(crate) DecapsulationKey<MlKem768>);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -41,8 +41,14 @@ impl MlKemCiphertext {
     }
 }
 
-#[derive(Debug, ZeroizeOnDrop)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct MlKemSharedSecret(pub(crate) SharedKey<MlKem768>);
+
+impl std::fmt::Debug for MlKemSharedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MlKemSharedSecret([REDACTED])")
+    }
+}
 
 impl MlKemSharedSecret {
     pub fn as_bytes(&self) -> [u8; 32] {
@@ -52,7 +58,7 @@ impl MlKemSharedSecret {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MlKemKeypair {
     pub public: MlKemPublicKey,
     pub secret: MlKemSecretKey,
@@ -99,12 +105,17 @@ impl MlKemCiphertext {
     }
 }
 
-pub fn encapsulate(pk: &MlKemPublicKey) -> Result<(MlKemSharedSecret, MlKemCiphertext), CryptoError> {
+pub fn encapsulate(
+    pk: &MlKemPublicKey,
+) -> Result<(MlKemSharedSecret, MlKemCiphertext), CryptoError> {
     let (ct, ss) = pk.0.encapsulate();
     Ok((MlKemSharedSecret(ss), MlKemCiphertext(ct)))
 }
 
-pub fn decapsulate(sk: &MlKemSecretKey, ct: &MlKemCiphertext) -> Result<MlKemSharedSecret, CryptoError> {
+pub fn decapsulate(
+    sk: &MlKemSecretKey,
+    ct: &MlKemCiphertext,
+) -> Result<MlKemSharedSecret, CryptoError> {
     let ss = sk.0.decapsulate(&ct.0);
     Ok(MlKemSharedSecret(ss))
 }

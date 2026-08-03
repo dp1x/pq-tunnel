@@ -35,12 +35,19 @@ impl HybridIdentity {
     }
 }
 
+#[allow(deprecated)]
 impl Clone for HybridIdentity {
     fn clone(&self) -> Self {
         HybridIdentity {
-            x25519: X25519Keypair::generate(),
-            ml_kem: MlKemKeypair::generate().expect("keygen"),
-            ml_dsa: MlDsaKeypair::generate().expect("keygen"),
+            x25519: self.x25519.clone(),
+            ml_kem: MlKemKeypair {
+                public: self.ml_kem.public.clone(),
+                secret: self.ml_kem.secret.clone(),
+            },
+            ml_dsa: MlDsaKeypair {
+                public: self.ml_dsa.public.clone(),
+                secret: self.ml_dsa.secret.clone(),
+            },
         }
     }
 }

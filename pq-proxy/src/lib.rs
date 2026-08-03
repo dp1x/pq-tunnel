@@ -14,7 +14,10 @@ pub struct PqProxy {
 
 impl PqProxy {
     pub fn new(config: TunnelConfig, listen_addr: SocketAddr) -> Self {
-        PqProxy { config, listen_addr }
+        PqProxy {
+            config,
+            listen_addr,
+        }
     }
 
     pub async fn run(&self) -> Result<(), ProxyError> {
@@ -61,20 +64,26 @@ async fn handle_client(
     let atyp = buf[3];
     let (host, port) = match atyp {
         0x01 => {
-            if n < 7 { return Err(ProxyError::InvalidRequest("short IPv4".into())); }
+            if n < 7 {
+                return Err(ProxyError::InvalidRequest("short IPv4".into()));
+            }
             let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
             let port = u16::from_be_bytes([buf[8], buf[9]]);
             (ip.to_string(), port)
         }
         0x03 => {
             let len = buf[4] as usize;
-            if n < 5 + len + 2 { return Err(ProxyError::InvalidRequest("short domain".into())); }
+            if n < 5 + len + 2 {
+                return Err(ProxyError::InvalidRequest("short domain".into()));
+            }
             let host = String::from_utf8_lossy(&buf[5..5 + len]).to_string();
             let port = u16::from_be_bytes([buf[5 + len], buf[6 + len]]);
             (host, port)
         }
         0x06 => {
-            if n < 19 { return Err(ProxyError::InvalidRequest("short IPv6".into())); }
+            if n < 19 {
+                return Err(ProxyError::InvalidRequest("short IPv6".into()));
+            }
             let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&buf[4..20]).unwrap());
             let port = u16::from_be_bytes([buf[20], buf[21]]);
             (ip.to_string(), port)
@@ -85,7 +94,8 @@ async fn handle_client(
     let target = format!("{}:{}", host, port);
     tracing::info!("proxy {} -> {}", addr, target);
 
-    let session = connect(config).await
+    let session = connect(config)
+        .await
         .map_err(|e| ProxyError::Tunnel(format!("connect failed: {}", e)))?;
 
     let conn = session.connection().clone();
@@ -116,7 +126,9 @@ async fn handle_client(
         loop {
             match conn.read_datagram().await {
                 Ok(data) => {
-                    if client_write.write_all(&data).await.is_err() { break; }
+                    if client_write.write_all(&data).await.is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -130,7 +142,9 @@ async fn handle_client(
                 Ok(0) => break,
                 Ok(n) => {
                     let data = bytes::Bytes::from(buf[..n].to_vec());
-                    if conn2.send_datagram(data).is_err() { break; }
+                    if conn2.send_datagram(data).is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }

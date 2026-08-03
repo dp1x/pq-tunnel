@@ -1,60 +1,95 @@
-# Proprietary / Internal — ALL .md are proprietary except README.md
-docs/superpowers/
-docs/internal/
-post_quantum_tunnel_blueprint.md
-HYGIENE.md
-AGENTS.md
-CHECKPOINT.md
-PROTOCOL.md
-ARCHITECTURE.md
-*.md
-!README.md
+# ============================================================
+# Tunnel Project - Git Hygiene
+# ============================================================
 
-# Machine / Build
+# ---- Build artifacts ----
 target/
 **/target/
-.msvc_libs/
-.cargo/
-install_arm64_tools.ps1
 
-# Secrets & Config
-.env*
+# Fuzz runtime outputs / lock (volatile deps; not pinned for release)
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/Cargo.lock
+
+# Native compilation outputs that may escape target/
+*.o
+*.obj
+*.lib
+*.exp
+*.dll
+*.so
+*.dylib
+*.a
+*.pdb
+*.ilk
+*.exe
+
+# ---- Local / environment toolchain config ----
+# `.cargo/config.toml` is a local override; the portable template is
+# `.cargo/config.toml.example`. Do NOT commit your local config.
+# (Use `.cargo/*` — not `.cargo/` — so the `.example` negation can match.)
+.cargo/*
+.cargo/config.toml
+!.cargo/config.toml.example
+
+# ---- Environment / Secrets ----
+.env
+.env.*
 *.secret
 *.secret.key
 credentials.*
-config/prod*.*
 *.pem
 *.key
 *.p12
 *.pfx
+*.crt
+*.asc
+*.gpg
 
-# Agent / Ephemeral
-.kilo/
-agent-logs/
+config/prod*.*
+config/*.secret
+
+# ---- Agent / AI runtime & internal process files ----
+# Internal agent workflow state is NOT part of the public release.
+# AGENTS.md is intentionally public: it is contributor governance
+# (coding rules, testing requirements, security rules).
+.agent-summary.md
+checkpoints/
+docs/internal/
+docs/superpowers/
+internal/
+
+*.private.md
+
+ARCHITECTURE_REVIEW.md
+AGENT_CONTEXT.md
+AGENT_STATE.md
+BLUEPRINT.md
+CHECKPOINT.md
+HYGIENE.md
 handoff-*.md
 session-state.md
-.tmp/
-temp/
-tmp/
-*.tmp
-*.log
-logs/
 
-# Rust / General
-**/*.rs.bk
-**/*.db
-**/*.bin
+# Private (internal) project documents
+post_quantum_tunnel_blueprint.md
+ARCHITECTURE.md
+PROTOCOL.md
 
-# OS / IDE
+# ---- Machine / IDE ----
 .DS_Store
 .vscode/
 .idea/
 *.swp
 *~
 
-# Planning / Agent state - never commit (all .md covered by *.md above)
-AGENT_STATE.md
-BLUEPRINT.md
-
-# Test scratch
+# ---- Local scripts / experiments (not part of the release) ----
+install_arm64_tools.ps1
 test_flatline.ps1
+
+# ============================================================
+# Public Documentation Exception
+# ============================================================
+# README.md, LICENSE-*, and the public design docs are intended for the
+# public repository. Everything below that is NOT matched by an ignore rule
+# is eligible to be committed.

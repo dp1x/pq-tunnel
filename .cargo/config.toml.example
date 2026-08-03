@@ -1,0 +1,10 @@
+# Tunnel build configuration — portable template.
+#
+# Copy this file to `.cargo/config.toml` (which is gitignored) and adjust for
+# your local toolchain. Tunnel's canonical build/test target is
+# `x86_64-pc-windows-msvc` (see AGENTS.md → Build & Test Commands).
+
+# Example: optional GNU-target linker. The msvc target above needs no override.
+# [target.x86_64-pc-windows-gnu]
+# linker = "x86_64-w64-mingw32-gcc"
+# rustflags = ["-C", "link-arg=-static-libgcc"]

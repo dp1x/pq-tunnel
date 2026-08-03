@@ -9,33 +9,33 @@
 //! — Hybrid PQ: ML-KEM-768 + X25519 key exchange, ML-DSA-65 signatures
 
 use pq_crypto::HybridIdentity;
-use quinn::{SendStream, RecvStream};
+use quinn::{RecvStream, SendStream};
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
+/// Legacy v1 QUIC handshake framing size (8192 bytes).
+///
+/// DEPRECATED path: this constant is the v1 handshake's own fragment size and is
+/// **not** interchangeable with the canonical Tunnel wire size
+/// `pq_tunnel_core::PACKET_SIZE` (1280, see [`crate::codec`]).  The legacy
+/// `handshake` module does not use `WirePacket`/the codec and is replaced by the
+/// codec wire format in Phase 5.
 pub const PACKET_SIZE: usize = 8192;
 pub const MAX_PAYLOAD_PER_PACKET: usize = PACKET_SIZE;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
+    #[error("io: {0}")]
     Io(String),
+    #[error("protocol: {0}")]
     Protocol(String),
+    #[error("verification failed")]
     VerificationFailed,
+    #[error("crypto: {0}")]
     Crypto(String),
 }
 
-impl std::fmt::Display for HandshakeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HandshakeError::Io(s) => write!(f, "io: {}", s),
-            HandshakeError::Protocol(s) => write!(f, "protocol: {}", s),
-            HandshakeError::VerificationFailed => write!(f, "verification failed"),
-            HandshakeError::Crypto(s) => write!(f, "crypto: {}", s),
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct HandshakeResult {
     pub shared_secret: [u8; 32],
     pub peer_ml_dsa_key: [u8; 1952],
@@ -43,6 +43,33 @@ pub struct HandshakeResult {
     pub handshake_duration_ms: u64,
 }
 
+impl std::fmt::Debug for HandshakeResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeResult")
+            .field("shared_secret", &"<redacted>")
+            .field(
+                "peer_ml_dsa_key",
+                &format_args!("<redacted: {} bytes>", self.peer_ml_dsa_key.len()),
+            )
+            .field("session_id", &self.session_id)
+            .field("handshake_duration_ms", &self.handshake_duration_ms)
+            .finish()
+    }
+}
+
+impl Drop for HandshakeResult {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.shared_secret.zeroize();
+    }
+}
+
+/// Legacy v1 handshake message wire type.
+///
+/// ⚠️ Byte values are NOT compatible with [`crate::codec::MessageType`]: this
+/// enum encodes `Data = 0x10` / `Cover = 0x11`, whereas the codec encodes
+/// `Data = 0x01` / `Cover = 0x02`.  The legacy `handshake` module is a separate
+/// v1 QUIC framing superseded by the codec in Phase 5; do not mix the two.
 #[repr(u8)]
 #[derive(Clone, Copy)]
 pub enum MsgType {
@@ -60,8 +87,12 @@ pub fn rand_bytes<const N: usize>() -> [u8; N] {
     a
 }
 
-fn rand32() -> [u8; 32] { rand_bytes::<32>() }
-fn rand8() -> [u8; 8] { rand_bytes::<8>() }
+fn rand32() -> [u8; 32] {
+    rand_bytes::<32>()
+}
+fn rand8() -> [u8; 8] {
+    rand_bytes::<8>()
+}
 
 pub fn pad_packet(payload: &[u8]) -> Vec<u8> {
     let mut pkt = vec![0u8; PACKET_SIZE];
@@ -71,14 +102,16 @@ pub fn pad_packet(payload: &[u8]) -> Vec<u8> {
 }
 
 pub async fn send_packet(s: &mut SendStream, pkt: &[u8]) -> Result<(), HandshakeError> {
-    s.write_all(pkt).await
+    s.write_all(pkt)
+        .await
         .map_err(|e| HandshakeError::Io(e.to_string()))?;
     Ok(())
 }
 
 pub async fn recv_packet(r: &mut RecvStream) -> Result<Vec<u8>, HandshakeError> {
     let mut buf = vec![0u8; PACKET_SIZE];
-    r.read_exact(&mut buf).await
+    r.read_exact(&mut buf)
+        .await
         .map_err(|e| HandshakeError::Io(e.to_string()))?;
     Ok(buf)
 }
@@ -92,7 +125,7 @@ fn hkdf_derive(input: &[u8; 32], salt: &[u8; 8]) -> [u8; 32] {
 }
 
 fn build_confirm_ct(secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(b"pq-tunnel-confirm-v2");
     h.update(secret);
@@ -102,7 +135,12 @@ fn build_confirm_ct(secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-fn serialize_client_hello(sid: &[u8; 8], nonce: &[u8; 32], identity: &HybridIdentity, sig: &[u8]) -> Vec<u8> {
+fn serialize_client_hello(
+    sid: &[u8; 8],
+    nonce: &[u8; 32],
+    identity: &HybridIdentity,
+    sig: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(MsgType::ClientHello as u8);
     buf.extend_from_slice(sid);
@@ -115,7 +153,13 @@ fn serialize_client_hello(sid: &[u8; 8], nonce: &[u8; 32], identity: &HybridIden
     buf
 }
 
-fn serialize_server_hello(sid: &[u8; 8], nonce: &[u8; 32], identity: &HybridIdentity, kem_ct: &[u8], dsa_sig: &[u8]) -> Vec<u8> {
+fn serialize_server_hello(
+    sid: &[u8; 8],
+    nonce: &[u8; 32],
+    identity: &HybridIdentity,
+    kem_ct: &[u8],
+    dsa_sig: &[u8],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(MsgType::ServerHello as u8);
     buf.extend_from_slice(sid);
@@ -128,7 +172,9 @@ fn serialize_server_hello(sid: &[u8; 8], nonce: &[u8; 32], identity: &HybridIden
 }
 
 #[allow(clippy::type_complexity)]
-fn deserialize_client_hello(data: &[u8]) -> Result<([u8; 8], Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>), HandshakeError> {
+fn deserialize_client_hello(
+    data: &[u8],
+) -> Result<([u8; 8], Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>), HandshakeError> {
     let min_len = 1 + 8 + 1184 + 1952 + 32 + 32 + 2;
     if data.len() < min_len {
         return Err(HandshakeError::Protocol("short client hello".into()));
@@ -144,7 +190,9 @@ fn deserialize_client_hello(data: &[u8]) -> Result<([u8; 8], Vec<u8>, Vec<u8>, [
 }
 
 #[allow(clippy::type_complexity)]
-fn deserialize_server_hello(data: &[u8]) -> Result<([u8; 8], Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>), HandshakeError> {
+fn deserialize_server_hello(
+    data: &[u8],
+) -> Result<([u8; 8], Vec<u8>, Vec<u8>, [u8; 32], [u8; 32], Vec<u8>), HandshakeError> {
     if data.len() < 1 + 8 + 1088 + 3309 + 32 + 32 + 1952 {
         return Err(HandshakeError::Protocol("short server hello".into()));
     }
@@ -169,7 +217,10 @@ pub async fn client_handshake(
     let mut ch_sig_msg = Vec::with_capacity(8 + 32);
     ch_sig_msg.extend_from_slice(&sid);
     ch_sig_msg.extend_from_slice(&nonce);
-    let ch_sig = id.ml_dsa.sign(&ch_sig_msg).map_err(|e| HandshakeError::Crypto(e.to_string()))?;
+    let ch_sig = id
+        .ml_dsa
+        .sign(&ch_sig_msg)
+        .map_err(|e| HandshakeError::Crypto(e.to_string()))?;
     let ch_sig_bytes = ch_sig.encode();
 
     let ch_payload = serialize_client_hello(&sid, &nonce, id, &ch_sig_bytes);
@@ -177,7 +228,8 @@ pub async fn client_handshake(
     send_packet(send, &ch_pkt).await?;
 
     let sh_pkt = recv_packet(recv).await?;
-    let (sh_sid, sh_kem_ct, sh_dsa_sig, sh_x25519, sh_nonce, ref sh_dsa_pk) = deserialize_server_hello(&sh_pkt)?;
+    let (sh_sid, sh_kem_ct, sh_dsa_sig, sh_x25519, sh_nonce, ref sh_dsa_pk) =
+        deserialize_server_hello(&sh_pkt)?;
 
     if !bool::from(sh_sid.ct_eq(&sid)) {
         return Err(HandshakeError::Protocol("session_id mismatch".into()));
@@ -197,7 +249,9 @@ pub async fn client_handshake(
     let ecdh_secret = id.x25519.diffie_hellman(&peer_x);
 
     let mut hybrid_secret = [0u8; 32];
-    for i in 0..32 { hybrid_secret[i] = kem_bytes[i] ^ ecdh_secret[i]; }
+    for i in 0..32 {
+        hybrid_secret[i] = kem_bytes[i] ^ ecdh_secret[i];
+    }
 
     let hybrid_secret = hkdf_derive(&hybrid_secret, &sid);
 
@@ -207,7 +261,9 @@ pub async fn client_handshake(
 
     let valid = pq_crypto::signature::verify(&peer_dsa_pk, &sig_msg, &sig)
         .map_err(|e| HandshakeError::Crypto(format!("verify: {}", e)))?;
-    if !valid { return Err(HandshakeError::VerificationFailed); }
+    if !valid {
+        return Err(HandshakeError::VerificationFailed);
+    }
 
     let confirm = build_confirm_ct(&hybrid_secret, &sh_nonce);
     let mut cf_payload = vec![MsgType::Confirm as u8];
@@ -219,7 +275,10 @@ pub async fn client_handshake(
 
     Ok(HandshakeResult {
         shared_secret: hybrid_secret,
-        peer_ml_dsa_key: sh_dsa_pk.as_slice().try_into().map_err(|_| HandshakeError::Protocol("bad dsa key len".into()))?,
+        peer_ml_dsa_key: sh_dsa_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| HandshakeError::Protocol("bad dsa key len".into()))?,
         session_id: sid,
         handshake_duration_ms: t0.elapsed().as_millis() as u64,
     })
@@ -233,7 +292,8 @@ pub async fn server_handshake(
     let t0 = Instant::now();
 
     let ch_pkt = recv_packet(recv).await?;
-    let (ch_sid, ch_kem_pk, ch_dsa_pk, ch_x25519, _ch_nonce, ch_sig) = deserialize_client_hello(&ch_pkt)?;
+    let (ch_sid, ch_kem_pk, ch_dsa_pk, ch_x25519, _ch_nonce, ch_sig) =
+        deserialize_client_hello(&ch_pkt)?;
 
     let client_dsa_pk = pq_crypto::signature::MlDsaPublicKey::from_bytes(&ch_dsa_pk)
         .map_err(|e| HandshakeError::Crypto(format!("bad client dsa key: {}", e)))?;
@@ -261,7 +321,9 @@ pub async fn server_handshake(
     let ecdh_secret = id.x25519.diffie_hellman(&peer_x);
 
     let mut hybrid_secret = [0u8; 32];
-    for i in 0..32 { hybrid_secret[i] = kem_bytes[i] ^ ecdh_secret[i]; }
+    for i in 0..32 {
+        hybrid_secret[i] = kem_bytes[i] ^ ecdh_secret[i];
+    }
 
     let hybrid_secret = hkdf_derive(&hybrid_secret, &ch_sid);
 
@@ -270,7 +332,9 @@ pub async fn server_handshake(
     sig_msg.extend_from_slice(&nonce);
     sig_msg.extend_from_slice(&ch_x25519);
 
-    let sig = id.ml_dsa.sign(&sig_msg)
+    let sig = id
+        .ml_dsa
+        .sign(&sig_msg)
         .map_err(|e| HandshakeError::Crypto(e.to_string()))?;
     let sig_bytes = sig.encode();
     let ct_bytes = ct.to_bytes();
@@ -295,7 +359,10 @@ pub async fn server_handshake(
 
     Ok(HandshakeResult {
         shared_secret: hybrid_secret,
-        peer_ml_dsa_key: ch_dsa_pk.as_slice().try_into().map_err(|_| HandshakeError::Protocol("bad dsa key len".into()))?,
+        peer_ml_dsa_key: ch_dsa_pk
+            .as_slice()
+            .try_into()
+            .map_err(|_| HandshakeError::Protocol("bad dsa key len".into()))?,
         session_id: ch_sid,
         handshake_duration_ms: t0.elapsed().as_millis() as u64,
     })

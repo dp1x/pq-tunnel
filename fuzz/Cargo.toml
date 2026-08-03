@@ -1,0 +1,47 @@
+[package]
+name = "pq-tunnel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+pq-tunnel-core = { path = "../pq-tunnel-core" }
+pq-crypto = { path = "../pq-crypto" }
+arbitrary = "1"
+libfuzzer-sys = "0.4"
+# cargo-fuzz injects libfuzzer-sys at runtime via RUSTFLAGS; the target file
+# just needs to compile under it. No additional deps required.
+
+[[bin]]
+name = "wire_packet_from_bytes"
+path = "fuzz_targets/wire_packet_from_bytes.rs"
+
+[[bin]]
+name = "inner_plaintext_decode"
+path = "fuzz_targets/inner_plaintext_decode.rs"
+
+[[bin]]
+name = "envelope_decrypt"
+path = "fuzz_targets/envelope_decrypt.rs"
+
+[[bin]]
+name = "replay_window"
+path = "fuzz_targets/replay_window.rs"
+
+[[bin]]
+name = "handshake_message_decode"
+path = "fuzz_targets/handshake_message_decode.rs"
+
+[[bin]]
+name = "handshake_driver_receive"
+path = "fuzz_targets/handshake_driver_receive.rs"
+
+[[bin]]
+name = "session_manager_receive"
+path = "fuzz_targets/session_manager_receive.rs"
+
+[workspace]
+resolver = "2"
