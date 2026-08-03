@@ -34,17 +34,31 @@ struct Args {
 
 fn parse_tun_addr(s: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), String> {
     let parts: Vec<&str> = s.split('/').collect();
-    if parts.len() != 2 { return Err("expected IP/CIDR format".into()); }
-    let ip: std::net::IpAddr = parts[0].parse().map_err(|e: std::net::AddrParseError| e.to_string())?;
-    let prefix: u8 = parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if parts.len() != 2 {
+        return Err("expected IP/CIDR format".into());
+    }
+    let ip: std::net::IpAddr = parts[0]
+        .parse()
+        .map_err(|e: std::net::AddrParseError| e.to_string())?;
+    let prefix: u8 = parts[1]
+        .parse()
+        .map_err(|e: std::num::ParseIntError| e.to_string())?;
     let mask = match ip {
         std::net::IpAddr::V4(_) => {
-            let m = if prefix == 0 { 0u32 } else { u32::MAX << (32 - prefix) };
+            let m = if prefix == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix)
+            };
             let b = m.to_be_bytes();
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))
         }
         std::net::IpAddr::V6(_) => {
-            let m = if prefix == 0 { 0u128 } else { u128::MAX << (128 - prefix) };
+            let m = if prefix == 0 {
+                0u128
+            } else {
+                u128::MAX << (128 - prefix)
+            };
             let b = m.to_be_bytes();
             std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
         }
@@ -56,7 +70,9 @@ fn parse_tun_addr(s: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), Strin
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
 
     let args = Args::parse();
@@ -76,16 +92,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Connecting to {}...", args.remote);
     let _t0 = Instant::now();
     let session = connect(config).await?;
-    tracing::info!("Connected! handshake={:?}ms", session.stats().handshake_duration_ms);
+    tracing::info!(
+        "Connected! handshake={:?}ms",
+        session.stats().handshake_duration_ms
+    );
 
-    if args.flood { run_flood_mode(&args, session).await?; }
-    else if args.cover { run_cover_mode(&args, session).await?; }
-    else { run_tunnel_mode(&args, session, tun_ip, tun_mask).await?; }
+    if args.flood {
+        run_flood_mode(&args, session).await?;
+    } else if args.cover {
+        run_cover_mode(&args, session).await?;
+    } else {
+        run_tunnel_mode(&args, session, tun_ip, tun_mask).await?;
+    }
     Ok(())
 }
 
-async fn run_flood_mode(args: &Args, session: pq_tunnel_core::Session) -> Result<(), Box<dyn std::error::Error>> {
-    use pq_tunnel_core::handshake::{send_data_packet, send_dummy_packet, recv_data_packet, PACKET_SIZE};
+async fn run_flood_mode(
+    args: &Args,
+    session: pq_tunnel_core::Session,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pq_tunnel_core::handshake::{
+        PACKET_SIZE, recv_data_packet, send_data_packet, send_dummy_packet,
+    };
 
     let mut send = session.take_send().ok_or("no send stream")?;
     let mut recv = session.take_recv().ok_or("no recv stream")?;
@@ -93,8 +121,13 @@ async fn run_flood_mode(args: &Args, session: pq_tunnel_core::Session) -> Result
     let rate = args.rate;
     let duration = args.duration;
 
-    tracing::info!("FLOOD MODE: packet_size={}bytes, rate={}pps, duration={}s, flatline={}",
-        PACKET_SIZE, rate, duration, args.flatline);
+    tracing::info!(
+        "FLOOD MODE: packet_size={}bytes, rate={}pps, duration={}s, flatline={}",
+        PACKET_SIZE,
+        rate,
+        duration,
+        args.flatline
+    );
 
     let mut buf = vec![0u8; packet_size];
     getrandom::fill(&mut buf[..16]).expect("rand");
@@ -108,42 +141,77 @@ async fn run_flood_mode(args: &Args, session: pq_tunnel_core::Session) -> Result
     while start.elapsed() < Duration::from_secs(duration) {
         let mut pkt = vec![0u8; packet_size];
         pkt[..16].copy_from_slice(&buf[..16]);
-        if args.flatline { pkt = vec![0u8; packet_size]; pkt[..16].copy_from_slice(&buf[..16]); }
+        if args.flatline {
+            pkt = vec![0u8; packet_size];
+            pkt[..16].copy_from_slice(&buf[..16]);
+        }
 
         match send_data_packet(&mut send, &pkt).await {
-            Ok(()) => { sent += 1; if sent <= 3 { tracing::debug!("sent packet {}", sent); } }
-            Err(e) => { tracing::warn!("send error #{}: {}", sent + 1, e); break; }
+            Ok(()) => {
+                sent += 1;
+                if sent <= 3 {
+                    tracing::debug!("sent packet {}", sent);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("send error #{}: {}", sent + 1, e);
+                break;
+            }
         }
 
         match recv_data_packet(&mut recv).await {
-            Ok(_) => { recv_count += 1; if recv_count <= 3 { tracing::debug!("recv packet {}", recv_count); } }
-            Err(e) => { if sent <= 3 { tracing::debug!("recv error: {}", e); } }
+            Ok(_) => {
+                recv_count += 1;
+                if recv_count <= 3 {
+                    tracing::debug!("recv packet {}", recv_count);
+                }
+            }
+            Err(e) => {
+                if sent <= 3 {
+                    tracing::debug!("recv error: {}", e);
+                }
+            }
         }
 
         next += interval;
         let now = Instant::now();
         if next > now {
-            let mut jb = [0u8; 1]; let _ = getrandom::fill(&mut jb);
+            let mut jb = [0u8; 1];
+            let _ = getrandom::fill(&mut jb);
             tokio::time::sleep((next - now) + Duration::from_nanos((jb[0] as u64) * 100_000)).await;
         }
     }
 
     let expected = rate * duration;
-    let throughput_mbps = (sent as f64 * PACKET_SIZE as f64 * 8.0) / (duration as f64 * 1_000_000.0);
-    tracing::info!("FLOOD COMPLETE: sent={}, recv={}, throughput={:.2} Mbps", sent, recv_count, throughput_mbps);
+    let throughput_mbps =
+        (sent as f64 * PACKET_SIZE as f64 * 8.0) / (duration as f64 * 1_000_000.0);
+    tracing::info!(
+        "FLOOD COMPLETE: sent={}, recv={}, throughput={:.2} Mbps",
+        sent,
+        recv_count,
+        throughput_mbps
+    );
 
     if args.flatline {
         let ratio = sent as f64 / expected as f64;
-        if ratio > 0.95 && ratio < 1.05 { tracing::info!("FLAT-LINE: PASS"); }
-        else { tracing::warn!("FLAT-LINE: FAIL (ratio={:.4})", ratio); }
+        if ratio > 0.95 && ratio < 1.05 {
+            tracing::info!("FLAT-LINE: PASS");
+        } else {
+            tracing::warn!("FLAT-LINE: FAIL (ratio={:.4})", ratio);
+        }
     }
 
     let _ = send_dummy_packet(&mut send).await;
     Ok(())
 }
 
-async fn run_cover_mode(args: &Args, session: pq_tunnel_core::Session) -> Result<(), Box<dyn std::error::Error>> {
-    use pq_tunnel_core::handshake::{send_data_packet, send_dummy_packet, recv_data_packet, PACKET_SIZE};
+async fn run_cover_mode(
+    args: &Args,
+    session: pq_tunnel_core::Session,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pq_tunnel_core::handshake::{
+        PACKET_SIZE, recv_data_packet, send_data_packet, send_dummy_packet,
+    };
 
     let mut send = session.take_send().ok_or("no send stream")?;
     let mut recv = session.take_recv().ok_or("no recv stream")?;
@@ -151,7 +219,12 @@ async fn run_cover_mode(args: &Args, session: pq_tunnel_core::Session) -> Result
     let rate = args.rate;
     let duration = args.duration;
 
-    tracing::info!("COVER MODE: packet_size={}bytes, rate={}pps, duration={}s", PACKET_SIZE, rate, duration);
+    tracing::info!(
+        "COVER MODE: packet_size={}bytes, rate={}pps, duration={}s",
+        PACKET_SIZE,
+        rate,
+        duration
+    );
 
     let mut buf = vec![0u8; packet_size];
     getrandom::fill(&mut buf[..16]).expect("rand");
@@ -166,20 +239,34 @@ async fn run_cover_mode(args: &Args, session: pq_tunnel_core::Session) -> Result
         if Instant::now() >= next_send {
             let mut pkt = vec![0u8; packet_size];
             pkt[..16].copy_from_slice(&buf[..16]);
-            if send_data_packet(&mut send, &pkt).await.is_ok() { sent += 1; }
-            let mut jb = [0u8; 1]; let _ = getrandom::fill(&mut jb);
+            if send_data_packet(&mut send, &pkt).await.is_ok() {
+                sent += 1;
+            }
+            let mut jb = [0u8; 1];
+            let _ = getrandom::fill(&mut jb);
             next_send += send_interval + Duration::from_nanos((jb[0] as u64) * 100_000);
         }
 
-        if recv_data_packet(&mut recv).await.is_ok() { recv_count += 1; }
+        if recv_data_packet(&mut recv).await.is_ok() {
+            recv_count += 1;
+        }
         tokio::task::yield_now().await;
     }
 
-    let throughput_mbps = (sent as f64 * PACKET_SIZE as f64 * 8.0) / (duration as f64 * 1_000_000.0);
-    tracing::info!("COVER COMPLETE: sent={}, recv={}, throughput={:.2} Mbps", sent, recv_count, throughput_mbps);
+    let throughput_mbps =
+        (sent as f64 * PACKET_SIZE as f64 * 8.0) / (duration as f64 * 1_000_000.0);
+    tracing::info!(
+        "COVER COMPLETE: sent={}, recv={}, throughput={:.2} Mbps",
+        sent,
+        recv_count,
+        throughput_mbps
+    );
 
-    if sent > 0 && recv_count > 0 { tracing::info!("COVER: PASS"); }
-    else { tracing::warn!("COVER: FAIL"); }
+    if sent > 0 && recv_count > 0 {
+        tracing::info!("COVER: PASS");
+    } else {
+        tracing::warn!("COVER: FAIL");
+    }
 
     let _ = send_dummy_packet(&mut send).await;
     Ok(())
@@ -191,7 +278,7 @@ async fn run_tunnel_mode(
     tun_ip: std::net::IpAddr,
     tun_mask: std::net::IpAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use pq_tunnel_core::handshake::{send_data_packet, send_cover_packet, recv_data_packet};
+    use pq_tunnel_core::handshake::{recv_data_packet, send_cover_packet, send_data_packet};
 
     let tun = pq_tun::TunDevice::create("pq-tun", tun_ip, tun_mask, args.mtu)
         .map_err(|e| format!("TUN creation failed: {}", e))?;
@@ -219,9 +306,14 @@ async fn run_tunnel_mode(
                     continue;
                 }
                 Ok(n) => {
-                    if send_data_packet(&mut send1, &buf[..n]).await.is_err() { break; }
+                    if send_data_packet(&mut send1, &buf[..n]).await.is_err() {
+                        break;
+                    }
                 }
-                Err(e) => { tracing::debug!("TUN read error: {}", e); break; }
+                Err(e) => {
+                    tracing::debug!("TUN read error: {}", e);
+                    break;
+                }
             }
         }
     });
@@ -229,8 +321,14 @@ async fn run_tunnel_mode(
     let quic_to_tun = tokio::spawn(async move {
         loop {
             match recv_data_packet(&mut recv2).await {
-                Ok(data) => { if writer.write_packet(&data).await.is_err() { break; } }
-                Err(_) => { break; }
+                Ok(data) => {
+                    if writer.write_packet(&data).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    break;
+                }
             }
         }
     });

@@ -2,6 +2,7 @@
 name = "pq-tunnel-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 pq-crypto = { path = "../pq-crypto" }
@@ -18,8 +19,8 @@ getrandom = { workspace = true }
 x25519-dalek = { workspace = true }
 ml-kem = { version = "0.3.2", features = ["getrandom"] }
 ml-dsa = { version = "0.1.1", features = ["getrandom"] }
-hybrid-array = "0.4"
-kem = "0.3"
-subtle = "2"
+ hybrid-array = "0.4"
+ kem = "0.3"
+ subtle = "2"
  zeroize = { workspace = true }
  hkdf = "0.12"

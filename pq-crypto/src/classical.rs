@@ -4,6 +4,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub type X25519PublicKey = PublicKey;
 pub type X25519SecretKey = StaticSecret;
 
+#[derive(Clone)]
 pub struct X25519Keypair {
     pub public: X25519PublicKey,
     pub secret: X25519SecretKey,

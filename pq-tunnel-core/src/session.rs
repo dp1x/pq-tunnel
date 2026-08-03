@@ -1,4 +1,4 @@
-use quinn::{Connection, Endpoint, SendStream, RecvStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

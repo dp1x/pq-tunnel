@@ -15,8 +15,7 @@ pub struct TunnelConfig {
 impl Default for TunnelConfig {
     fn default() -> Self {
         TunnelConfig {
-            identity: HybridIdentity::generate()
-                .expect("key generation must not fail"),
+            identity: HybridIdentity::generate().expect("key generation must not fail"),
             listen_addr: None,
             remote_addr: None,
             mtu: 1400,

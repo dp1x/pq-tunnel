@@ -1,5 +1,8 @@
 use crate::error::CryptoError;
-use ml_dsa::{EncodedSignature, EncodedVerifyingKey, Keypair, MlDsa65 as MlDsaParams, Generate, Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ml_dsa::{
+    EncodedSignature, EncodedVerifyingKey, Generate, Keypair, MlDsa65 as MlDsaParams, Signature,
+    Signer, SigningKey, Verifier, VerifyingKey,
+};
 use zeroize::ZeroizeOnDrop;
 
 pub const ML_DSA_65_PUBLIC_KEY_BYTES: usize = 1952;
@@ -9,7 +12,7 @@ pub const ML_DSA_65_SIGNATURE_BYTES: usize = 3309;
 #[derive(Clone)]
 pub struct MlDsaPublicKey(pub(crate) VerifyingKey<MlDsaParams>);
 
-#[derive(ZeroizeOnDrop)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct MlDsaSecretKey(pub(crate) SigningKey<MlDsaParams>);
 
 #[derive(Clone, PartialEq)]
@@ -18,6 +21,15 @@ pub struct MlDsaSignature(pub(crate) ml_dsa::Signature<MlDsaParams>);
 pub struct MlDsaKeypair {
     pub public: MlDsaPublicKey,
     pub secret: MlDsaSecretKey,
+}
+
+impl Clone for MlDsaKeypair {
+    fn clone(&self) -> Self {
+        MlDsaKeypair {
+            public: self.public.clone(),
+            secret: self.secret.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for MlDsaPublicKey {
@@ -40,7 +52,10 @@ impl std::fmt::Debug for MlDsaSignature {
 
 impl std::fmt::Debug for MlDsaKeypair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "MlDsaKeypair {{ public: MlDsaPublicKey([REDACTED]), secret: [REDACTED] }}")
+        write!(
+            f,
+            "MlDsaKeypair {{ public: MlDsaPublicKey([REDACTED]), secret: [REDACTED] }}"
+        )
     }
 }
 
@@ -126,12 +141,19 @@ mod tests {
         let sig = kp.sign(msg).expect("sign");
 
         let encoded = sig.encode();
-        assert_eq!(encoded.len(), 3309, "ML-DSA-65 signature must be 3309 bytes");
+        assert_eq!(
+            encoded.len(),
+            3309,
+            "ML-DSA-65 signature must be 3309 bytes"
+        );
 
         let decoded = MlDsaSignature::from_bytes(&encoded).expect("from_bytes");
 
         let valid = verify(&kp.public, msg, &decoded).expect("verify");
-        assert!(valid, "decoded signature must verify against original message");
+        assert!(
+            valid,
+            "decoded signature must verify against original message"
+        );
     }
 
     #[test]
@@ -139,7 +161,11 @@ mod tests {
         let kp = MlDsaKeypair::generate().expect("keygen");
 
         let encoded = kp.public.encode();
-        assert_eq!(encoded.len(), 1952, "ML-DSA-65 public key must be 1952 bytes");
+        assert_eq!(
+            encoded.len(),
+            1952,
+            "ML-DSA-65 public key must be 1952 bytes"
+        );
 
         let decoded = MlDsaPublicKey::from_bytes(&encoded).expect("from_bytes");
 

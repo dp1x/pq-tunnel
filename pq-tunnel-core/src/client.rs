@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
-use quinn::{Endpoint, ClientConfig, crypto::rustls::QuicClientConfig};
+use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use rustls::{ClientConfig as RustlsClientConfig, pki_types::CertificateDer};
 
 use crate::config::TunnelConfig;
 use crate::error::TunnelError;
 
 pub async fn connect(config: TunnelConfig) -> Result<crate::session::Session, TunnelError> {
-    let remote = config.remote_addr.ok_or(TunnelError::InvalidConfig(
-        "remote address required".into(),
-    ))?;
+    let remote = config
+        .remote_addr
+        .ok_or(TunnelError::InvalidConfig("remote address required".into()))?;
 
     let tls_config = RustlsClientConfig::builder()
         .dangerous()
@@ -29,18 +29,20 @@ pub async fn connect(config: TunnelConfig) -> Result<crate::session::Session, Tu
         .map_err(|e| TunnelError::Quic(format!("connect: {}", e)))?;
     tracing::info!("QUIC connection established, waiting for handshake...");
 
-    let quic_conn = conn.await
+    let quic_conn = conn
+        .await
         .map_err(|e| TunnelError::Quic(format!("connecting: {}", e)))?;
     tracing::info!("QUIC handshake complete, opening bidirectional stream...");
 
-    let (mut send, mut recv) = quic_conn.open_bi().await
+    let (mut send, mut recv) = quic_conn
+        .open_bi()
+        .await
         .map_err(|e| TunnelError::Quic(format!("open_bi: {}", e)))?;
 
-    let handshake_result = crate::handshake::client_handshake(
-        &config.identity,
-        &mut send,
-        &mut recv,
-    ).await.map_err(|e| TunnelError::Quic(format!("handshake: {}", e)))?;
+    let handshake_result =
+        crate::handshake::client_handshake(&config.identity, &mut send, &mut recv)
+            .await
+            .map_err(|e| TunnelError::Quic(format!("handshake: {}", e)))?;
 
     Ok(crate::session::Session::new_with_streams(
         config,
