@@ -6,17 +6,17 @@ reference implementation. It is designed to keep traffic confidential against
 computers) while limiting the information leaked by traffic patterns
 (metadata resistance).
 
-This is the **first public release (v0.1.0)**. It ships the Phase-6
+This is the **first public release (v0.1.0-alpha)**. It ships the
 validated `pq-tunnel-core` data plane: a 1.5-RTT, mutual-authentication,
 hybrid (ML-KEM-768 + X25519) handshake, fixed 1280-byte wire datagrams,
-AEAD envelope with a 64-bit replay window, per-direction nonce accounting,
-and a single-event-per-call session manager with DoS-rate limiting and
-fail-secure semantics.
+AEAD envelope with a sliding 1024-bit replay window over a 64-bit sequence
+counter, per-direction nonce accounting, and a single-event-per-call session
+manager with DoS-rate limiting and fail-secure semantics.
 
 > **Status:** The v2 data plane is implemented and tested
 > (`cargo test --workspace`: 265 tests pass). The legacy QUIC/TCP transport
-> in `pq-tunnel-bin` is transitional and is being retired by the v2 path in
-> Phase 6+; it is **not** the security-relevant code path.
+> in `pq-tunnel-bin` is transitional and will be retired in a future
+> release; it is **not** the security-relevant code path.
 
 ---
 
@@ -42,8 +42,6 @@ Core principles (see [PROJECT_CHARTER.md](PROJECT_CHARTER.md)):
 ## Project layout
 
 ```
-```
-.
 ├── Cargo.toml              # workspace manifest + shared metadata
 ├── Cargo.lock              # pinned, reproducible dependency set
 ├── LICENSE-APACHE          # Apache-2.0 license
@@ -54,7 +52,7 @@ Core principles (see [PROJECT_CHARTER.md](PROJECT_CHARTER.md)):
 ├── pq-tun/                 # TUN/TAP device integration
 ├── pq-proxy/               # SOCKS5 proxy
 ├── pq-tunnel-bin/          # client/server binaries (transitional QUIC path)
-└── fuzz/                   # cargo-fuzz targets (never-panic contract) 
+└── fuzz/                   # cargo-fuzz targets (never-panic contract)
 ```
 
 Design and security documentation:
@@ -66,18 +64,22 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.1.0):** 265 unit tests pass (`cargo test --workspace`),
+**Validation (v0.1.0-alpha):** 265 unit tests pass (`cargo test --workspace`),
 adversarial design-review campaigns (cryptography, protocol, security) were
-completed and their findings fixed, and the cargo-fuzz targets compile
-(continuous fuzz execution requires an ASan-capable host; see Fuzzing below).
+completed and their findings fixed, and the modern-harness cargo-fuzz targets
+compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
+below).
 Detailed validation logs are kept private (not part of the public release).
 
 ## Build
 
 Tunnel is a Rust workspace. The canonical build/test target is
 `x86_64-pc-windows-msvc` (the default host `aarch64-pc-windows-msvc` cannot
-compile the `aws-lc-sys` dependency from `rustls`). On a non-macOS/ARM64
-host you may drop the `--target` flag.
+compile the `aws-lc-sys` dependency from `rustls`). On an aarch64 Windows
+host, select the x86_64 **toolchain** as well as the target:
+`cargo +stable-x86_64-pc-windows-msvc test --workspace --target
+x86_64-pc-windows-msvc`. On a non-macOS/ARM host you may drop the `--target`
+flag.
 
 ```sh
 # check + test the whole workspace
@@ -106,20 +108,23 @@ cargo +nightly fuzz run <target> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 ```
 
 The `cargo-fuzz` ASan runtime is not supported on this Windows host under VBS;
-fuzz **execution** should be run on a Linux host. The targets still compile
-and define the never-panic contract.
+fuzz **execution** should be run on a Linux host. 3 of the 7 targets use the
+modern nightly harness (`fuzz_target!`) and compile under it; the other 4 still
+export the legacy `rust_fuzzer_test_input` symbol and are pending harness
+migration. All targets define the never-panic contract.
 
 ## Tests
 
 - `pq-crypto`: 51 unit tests
 - `pq-tunnel-core`: 214 unit tests (incl. session-manager & handshake-v2 tests)
 - `pq-proxy`, `pq-tun`, `pq-tunnel-bin`: 0 unit tests (library/bin build verified)
-- 7 `cargo-fuzz` targets are defined; they compile under the fuzz harness
-  (execution requires an ASan-capable host — see Fuzzing above).
+- 7 `cargo-fuzz` targets are defined; the 3 modern (`fuzz_target!`) targets
+  compile under the fuzz harness (execution requires an ASan-capable host —
+  see Fuzzing above).
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --target x86_64-pc-windows-msvc
+cargo clippy --all-targets --target x86_64-pc-windows-msvc   # library crates only
 cargo test --workspace --target x86_64-pc-windows-msvc
 ```
 
@@ -128,15 +133,14 @@ cargo test --workspace --target x86_64-pc-windows-msvc
 Tunnel is a security project; responsible disclosure is welcome.
 
 - **Do not** open a public GitHub issue for a security vulnerability.
-- Email the maintainers at **security@tunnel.email** (or open a private
-  security advisory on GitHub) with a description, reproduction, and impact
-  assessment. You will receive an acknowledgment within 48 hours.
+- Open a **private security advisory** on GitHub with a description,
+  reproduction, and impact assessment.
 - Proposed fixes are coordinated before any public disclosure.
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 [PROJECT_CHARTER.md](PROJECT_CHARTER.md) for the security principles.
 
-### Known issues / limitations (v0.1.0)
+### Known issues / limitations (v0.1.0-alpha)
 
 - The v2 handshake is validated at the unit/campaign level; **interoperability
   with other implementations is not yet verified** (no independent
@@ -147,16 +151,16 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
   path and is **not** part of the v2 security model — the v2 raw-UDP data
   plane with mutual ML-DSA authentication is the security-relevant path.
   Do not deploy the v1 binaries against untrusted networks.
-- The cover-traffic *scheduler* (Phase-7 fixed-rate pacing) is not implemented;
+- The cover-traffic *scheduler* (fixed-rate pacing) is not implemented;
   only the `cover_packet` hooks exist (see [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)).
 - Rekeying is close-and-re-establish (no in-place key rotation).
 - Fuzz execution is unavailable on Windows/VBS hosts (see Build above), and 4
   legacy fuzz targets still use the pre-cargo-fuzz-0.13 harness style.
-- v0.1.0 is **not** API- or wire-stable; expect breaking changes before 1.0.
+- v0.1.0-alpha is **not** API- or wire-stable; expect breaking changes before 1.0.
 
 ## Future work
 
-- Phase 7: cover-traffic scheduler + pacing (metadata resistance at scale).
+- Cover-traffic scheduler + pacing (metadata resistance at scale).
 - Interoperability testing against a second implementation.
 - crates.io publishing of library crates (`pq-crypto`, `pq-tunnel-core`,
   `pq-tun`, `pq-proxy`).
@@ -164,9 +168,11 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 ## Contributing
 
 See [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) for engineering
-guidance. All submissions must pass `cargo fmt --check`,
-`cargo clippy --all-targets`, and `cargo test --workspace` on
-`x86_64-pc-windows-msvc`.
+guidance. All submissions must pass `cargo fmt --check` and
+`cargo test --workspace` on `x86_64-pc-windows-msvc`; `cargo clippy
+--all-targets` must be clean on the library crates (the `pq-tunnel-bin`
+binaries have a known clippy-driver issue with `#[tokio::main]` under the
+Rust 2024 edition).
 
 ## License
 
