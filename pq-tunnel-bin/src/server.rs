@@ -82,9 +82,10 @@ async fn run_quic(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_handshakes = Arc::new(AtomicU64::new(0));
 
     let stats_hs = total_handshakes.clone();
+    let stats_interval = args.stats_interval;
     let stats_handle = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(args.stats_interval)).await;
+            tokio::time::sleep(Duration::from_secs(stats_interval)).await;
             let hs = stats_hs.load(Ordering::Relaxed);
             tracing::info!("STATS: handshakes={}", hs);
         }

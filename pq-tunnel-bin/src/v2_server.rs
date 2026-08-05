@@ -73,8 +73,9 @@ pub async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let stats_total = total_handshakes.clone();
     let stats_active = active_sessions.clone();
+    let stats_interval = args.stats_interval;
     let stats_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(args.stats_interval));
+        let mut interval = tokio::time::interval(Duration::from_secs(stats_interval));
         loop {
             interval.tick().await;
             tracing::info!(
