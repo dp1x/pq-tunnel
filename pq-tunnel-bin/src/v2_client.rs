@@ -23,7 +23,7 @@ use pq_tunnel_core::{
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::Args;
+use crate::ClientArgs;
 use crate::identity;
 use crate::packet_len::ip_packet_len;
 
@@ -33,7 +33,7 @@ use crate::packet_len::ip_packet_len;
 pub async fn run(
     tun_ip: IpAddr,
     tun_mask: IpAddr,
-    args: &Args,
+    args: &ClientArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let identity_path = args
         .identity

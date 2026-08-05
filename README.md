@@ -14,9 +14,11 @@ counter, per-direction nonce accounting, and a single-event-per-call session
 manager with DoS-rate limiting and fail-secure semantics.
 
 > **Status:** The v2 data plane is implemented and tested
-> (`cargo test --workspace`: 279 tests pass). The legacy QUIC/TCP transport
-> in `pq-tunnel-bin` is transitional and will be retired in a future
-> release; it is **not** the security-relevant code path.
+> (`cargo test --workspace`: 296 tests pass). The v0.2.0-alpha CLI
+> (`pq-tunnel` with `keygen`/`server`/`client` subcommands) is under
+> construction: identity provisioning (`keygen`) is complete, the v2 server and
+> client paths run, and the legacy QUIC/TLS transport is transitional and will
+> be retired; it is **not** the security-relevant code path.
 
 ---
 
@@ -51,7 +53,7 @@ Core principles (see [PROJECT_CHARTER.md](PROJECT_CHARTER.md)):
 ├── pq-tunnel-core/         # protocol core: session manager, handshake v2, envelope, codec
 ├── pq-tun/                 # TUN/TAP device integration
 ├── pq-proxy/               # SOCKS5 proxy
-├── pq-tunnel-bin/          # client/server binaries (transitional QUIC path)
+├── pq-tunnel-bin/          # single pq-tunnel binary (keygen/server/client)
 └── fuzz/                   # cargo-fuzz targets (never-panic contract)
 ```
 
@@ -64,12 +66,45 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.1.0-alpha):** 279 unit tests pass (`cargo test --workspace`),
+**Validation (v0.2.0-alpha in progress):** 296 unit tests pass
+(`cargo test --workspace`),
 adversarial design-review campaigns (cryptography, protocol, security) were
 completed and their findings fixed, and the modern-harness cargo-fuzz targets
 compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
 below).
 Detailed validation logs are kept private (not part of the public release).
+
+## Usage
+
+Identity provisioning is the first step; keys are generated on a trusted
+machine and distributed out of band (the secret seed never leaves it):
+
+```sh
+# server: identity + public key, and the public key appended to a roster
+pq-tunnel keygen --identity server-id.pqti \
+                 --public-key server-pub.pqti \
+                 --append-roster roster.pqti
+
+# a separate client identity, plus the server's public key pinned client-side
+pq-tunnel keygen --identity client-id.pqti --public-key server-pub.pqti
+```
+
+Never overwrite a key file without `--force`, and never point two outputs at
+the same path (keygen refuses both). Serving is roster-authenticated:
+
+```sh
+pq-tunnel server --listen 0.0.0.0:4433 \          # v2 UDP (default)
+                 --identity server-id.pqti \
+                 --roster roster.pqti
+
+pq-tunnel client --remote 192.0.2.1:4433 \        # v2 UDP (default)
+                 --identity client-id.pqti \
+                 --server-key server-pub.pqti --tun-addr 10.0.0.1/24
+```
+
+The v2 client is TUN-based and root/admin privileged (a local UDP relay is on
+the roadmap). `--transport quic` selects the transitional v1 path — see Known
+issues.
 
 ## Build
 
@@ -117,7 +152,9 @@ migration. All targets define the never-panic contract.
 
 - `pq-crypto`: 53 unit tests
 - `pq-tunnel-core`: 214 unit tests (incl. session-manager & handshake-v2 tests)
-- `pq-tunnel-bin`: 12 unit tests (identity provisioning + packet length)
+- `pq-tunnel-bin`: 29 unit tests (identity provisioning, keygen, CIDR parsing,
+  packet length) — single `pq-tunnel` binary with `keygen`/`server`/`client`
+  subcommands
 - `pq-proxy`, `pq-tun`: 0 unit tests (library build verified)
 - 7 `cargo-fuzz` targets are defined; the 3 modern (`fuzz_target!`) targets
   compile under the fuzz harness (execution requires an ASan-capable host —
@@ -125,7 +162,7 @@ migration. All targets define the never-panic contract.
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --target x86_64-pc-windows-msvc   # library crates only
+cargo clippy --all-targets --target x86_64-pc-windows-msvc
 cargo test --workspace --target x86_64-pc-windows-msvc
 ```
 
@@ -141,16 +178,17 @@ Tunnel is a security project; responsible disclosure is welcome.
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 [PROJECT_CHARTER.md](PROJECT_CHARTER.md) for the security principles.
 
-### Known issues / limitations (v0.1.0-alpha)
+### Known issues / limitations (v0.2.0-alpha in progress)
 
 - The v2 handshake is validated at the unit/campaign level; **interoperability
   with other implementations is not yet verified** (no independent
   implementation exists yet).
-- The transitional v1 QUIC/TLS path (`pq-tunnel-bin` binaries and the legacy
-  `pq-tunnel-core` modules) performs **no server-certificate validation** (a
-  `SkipServerVerification` verifier). It is a legacy bootstrap/development
-  path and is **not** part of the v2 security model — the v2 raw-UDP data
-  plane with mutual ML-DSA authentication is the security-relevant path.
+- The transitional v1 QUIC/TLS path (the `pq-tunnel --transport quic` legacy
+  paths and the corresponding `pq-tunnel-core` modules) performs **no
+  server-certificate validation** (a `SkipServerVerification` verifier). It is
+  a legacy bootstrap/development path and is **not** part of the v2 security
+  model — the v2 raw-UDP data plane with mutual ML-DSA authentication is the
+  security-relevant path.
   Do not deploy the v1 binaries against untrusted networks.
 - The cover-traffic *scheduler* (fixed-rate pacing) is not implemented;
   only the `cover_packet` hooks exist (see [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)).
@@ -171,9 +209,9 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 See [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) for engineering
 guidance. All submissions must pass `cargo fmt --check` and
 `cargo test --workspace` on `x86_64-pc-windows-msvc`; `cargo clippy
---all-targets` must be clean on the library crates (the `pq-tunnel-bin`
-binaries have a known clippy-driver issue with `#[tokio::main]` under the
-Rust 2024 edition).
+--all-targets` must add **no new warnings** (the legacy `HybridIdentity`
+paths carry tracked deprecation warnings scheduled for removal with the v1
+transport).
 
 ## License
 

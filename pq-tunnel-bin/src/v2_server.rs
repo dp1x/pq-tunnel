@@ -29,13 +29,13 @@ use pq_tunnel_core::{
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::Args;
+use crate::ServerArgs;
 use crate::identity;
 use crate::packet_len::ip_packet_len;
 
 /// Run the v2 server to completion: provision identity + roster (fail closed),
 /// bind the UDP transport, and echo app data back to its own session.
-pub async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let identity_path = args
         .identity
         .as_deref()
@@ -86,9 +86,10 @@ pub async fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let driver = tokio::spawn(async move {
-        run_server_manager(&mut udp, &mut manager, app_tx, cmd_rx).await
-    });
+    let driver =
+        tokio::spawn(
+            async move { run_server_manager(&mut udp, &mut manager, app_tx, cmd_rx).await },
+        );
 
     // Echo application: relay every decrypted Data payload back to the same
     // sid.  The driver's notification channel closing (transport/app error or
