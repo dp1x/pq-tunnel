@@ -777,7 +777,52 @@ history: exposure is bounded by the session lifetime.
 
 ---
 
-# Open Design Decisions
+# D17 — Key Provisioning & Identity File Format
+
+## Status
+
+Accepted (v0.2.0-alpha, `pq-tunnel keygen`)
+
+## Context
+
+v2 authentication (D12) pins the server's ML-DSA-65 public key client-side and
+authenticates clients against a server-held roster. Keys must move between
+machines out of band. A human-inspectable text file was chosen over binary
+keystores; the format must be versioned, strict, and cheap to audit by hand.
+
+## Decision
+
+- Provisioning files are text with a minimal, versioned header — no second
+  key format or protocol:
+  `PQTI` / `version: 1` / `type: identity|public-key|roster` / hex payload.
+- `identity` holds the 32-byte ML-DSA-65 seed (secret); `public-key` holds the
+  1952-byte encoded key; `roster` holds one encoded public key per line
+  (blank lines and `#` comments ignored).
+- Parsing fails closed: wrong magic, version, or type is rejected; no silent
+  downgrade; `identity`/`public-key` payloads must be exactly one line of the
+  expected byte length; an empty roster is rejected.
+- `keygen` refuses to overwrite existing outputs (kernel O_EXCL, not a
+  pre-check) without `--force`, rejects two outputs resolving to the same
+  path, appends to rosters idempotently, and never prints or logs the seed.
+- Fingerprints for out-of-band verification are `SHA-256(encoded_key)[..16]`
+  (32 hex chars, 128-bit binding).
+
+## Consequences
+
+**Advantages:**
+
+- minimal surface: one format, strict grammar, no parser ambiguity
+- out-of-band-friendly: printable, diffable, grep-able, copy-pasteable
+- fail-closed load path is shared by server and client provisioning
+
+**Tradeoffs:**
+
+- text files are not a full PKI: distribution, rotation, and revocation of
+  rosters remain manual operational processes
+- the seed file must be protected at rest by host permissions (out of scope
+  for v1; no encryption-at-rest wrapper)
+
+---
 
 The following areas remain intentionally unresolved.
 
@@ -785,7 +830,7 @@ These require further protocol design before finalization.
 
 Resolved areas are recorded above: Authentication Model (D12), Handshake
 Construction (D13), Key Hierarchy (D14), Key Confirmation Mechanism (D15),
-Rekeying Model (D16).
+Rekeying Model (D16), Key Provisioning (D17).
 
 ---
 

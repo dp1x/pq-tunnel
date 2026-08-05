@@ -5,25 +5,20 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pq-tunnel-client"
-path = "src/client.rs"
-
-[[bin]]
-name = "pq-tunnel-server"
-path = "src/server.rs"
+name = "pq-tunnel"
+path = "src/main.rs"
 
 [dependencies]
 pq-tunnel-core = { path = "../pq-tunnel-core" }
 pq-crypto = { path = "../pq-crypto" }
 tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 thiserror = { workspace = true }
-bytes = "1"
 getrandom = { workspace = true, features = ["std"] }
 zeroize = { workspace = true }
+sha2 = "0.10"
 rustls = { workspace = true }
 quinn = "0.11"
 pq-tun = { path = "../pq-tun" }

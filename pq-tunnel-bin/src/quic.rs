@@ -1,122 +1,121 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
+//! Legacy v1 (QUIC/TLS) runtimes.
+//!
+//! Transitional bootstrap/development paths from the pre-v2 era. The v1
+//! transport performs **no server-certificate validation** and its handshake
+//! authenticates nothing against a pinned roster (self-generated ephemeral
+//! identities). It is **not** part of the v2 security model and is scheduled
+//! for removal; reachable only via `--transport quic`.
+
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
-use pq_tunnel_core::{TunnelConfig, connect};
+use pq_tunnel_core::{TunnelConfig, connect, listen};
 
-#[allow(dead_code)] // server-side + provisioning APIs consume the rest
-mod identity;
-mod packet_len;
-mod v2_client;
+use crate::{ClientArgs, ServerArgs};
 
-#[derive(Parser, Debug)]
-#[command(name = "pq-tunnel-client", about = "Post-quantum tunnel client")]
-struct Args {
-    #[arg(short, long)]
-    remote: SocketAddr,
-    #[arg(short, long, default_value = "10.0.0.1/24")]
-    tun_addr: String,
-    #[arg(long, default_value = "1400")]
-    mtu: u16,
-    #[arg(long, default_value = "10")]
-    handshake_timeout: u64,
-    #[arg(long, default_value_t, value_enum)]
-    transport: TransportKind,
-    #[arg(long)]
-    identity: Option<PathBuf>,
-    #[arg(long)]
-    server_key: Option<PathBuf>,
-    #[arg(short, long)]
-    config: Option<PathBuf>,
-    #[arg(long)]
-    flood: bool,
-    #[arg(long, default_value = "8191")]
-    packet_size: usize,
-    #[arg(long, default_value = "1000")]
-    rate: u64,
-    #[arg(long, default_value = "10")]
-    duration: u64,
-    #[arg(long)]
-    flatline: bool,
-    #[arg(long)]
-    cover: bool,
-}
+/// v1 (QUIC) server: listen, accept, handshake, echo each connection's data
+/// stream back. Kept behind `--transport quic`.
+pub async fn run_server(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(ValueEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
-enum TransportKind {
-    #[default]
-    V2,
-    Quic,
-}
-
-fn parse_tun_addr(s: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), String> {
-    let parts: Vec<&str> = s.split('/').collect();
-    if parts.len() != 2 {
-        return Err("expected IP/CIDR format".into());
-    }
-    let ip: std::net::IpAddr = parts[0]
-        .parse()
-        .map_err(|e: std::net::AddrParseError| e.to_string())?;
-    let prefix: u8 = parts[1]
-        .parse()
-        .map_err(|e: std::num::ParseIntError| e.to_string())?;
-    let mask = match ip {
-        std::net::IpAddr::V4(_) => {
-            let m = if prefix == 0 {
-                0u32
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            let b = m.to_be_bytes();
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))
-        }
-        std::net::IpAddr::V6(_) => {
-            let m = if prefix == 0 {
-                0u128
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            let b = m.to_be_bytes();
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(b))
-        }
-    };
-    Ok((ip, mask))
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
-    let args = Args::parse();
-    match args.transport {
-        TransportKind::V2 => run_v2(&args).await,
-        TransportKind::Quic => run_quic(&args).await,
-    }
-}
-
-/// Datagram-plane client driver (default transport). Fail-closed identity
-/// provisioning, pinned server key, UDP + client session manager.
-async fn run_v2(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    if args.flood || args.flatline || args.cover {
-        tracing::error!("flood/cover/flatline are v1 (QUIC) modes; use --transport quic");
-        return Err("v1-only flags cannot be combined with --transport v2".into());
-    }
-
-    let (tun_ip, tun_mask) = parse_tun_addr(&args.tun_addr)?;
-    v2_client::run(tun_ip, tun_mask, args).await
-}
-
-/// v1 (QUIC) runtime: handshake over QUIC then flood/cover/tunnel modes.
-async fn run_quic(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let identity = pq_crypto::HybridIdentity::generate()
         .map_err(|e| format!("key generation failed: {}", e))?;
-    let (tun_ip, tun_mask) = parse_tun_addr(&args.tun_addr)?;
+
+    let config = TunnelConfig {
+        identity: identity.clone(),
+        listen_addr: Some(args.listen),
+        remote_addr: None,
+        mtu: args.mtu,
+        handshake_timeout: Duration::from_secs(args.handshake_timeout),
+        keepalive_interval: Duration::from_secs(15),
+    };
+
+    tracing::info!("Listening on {}...", args.listen);
+    let listener = listen(config).await?;
+    let endpoint = listener.endpoint.as_ref().expect("no endpoint").clone();
+
+    let total_handshakes = Arc::new(AtomicU64::new(0));
+
+    let stats_hs = total_handshakes.clone();
+    let stats_interval = args.stats_interval;
+    let stats_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(stats_interval)).await;
+            let hs = stats_hs.load(Ordering::Relaxed);
+            tracing::info!("STATS: handshakes={}", hs);
+        }
+    });
+
+    let server_id = identity;
+    let accept_handle = tokio::spawn(async move {
+        loop {
+            match endpoint.accept().await {
+                Some(connecting) => {
+                    let id = server_id.clone();
+                    let ths = total_handshakes.clone();
+                    tokio::spawn(async move {
+                        match connecting.await {
+                            Ok(conn) => {
+                                let (mut send, mut recv) = match conn.accept_bi().await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        tracing::debug!("accept_bi failed: {}", e);
+                                        return;
+                                    }
+                                };
+                                match pq_tunnel_core::server_handshake(&id, &mut send, &mut recv)
+                                    .await
+                                {
+                                    Ok(result) => {
+                                        ths.fetch_add(1, Ordering::Relaxed);
+                                        tracing::info!(
+                                            "Handshake complete: {}ms",
+                                            result.handshake_duration_ms
+                                        );
+                                        run_data_loop(send, recv).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Handshake failed: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!("Connection failed: {}", e);
+                            }
+                        }
+                    });
+                }
+                None => {
+                    tracing::info!("Endpoint closed");
+                    break;
+                }
+            }
+        }
+    });
+
+    tokio::select! { _ = accept_handle => {}, _ = stats_handle => {} }
+    tracing::info!("Server shutting down.");
+    Ok(())
+}
+
+async fn run_data_loop(mut send: quinn::SendStream, mut recv: quinn::RecvStream) {
+    use pq_tunnel_core::handshake::{recv_data_packet, send_data_packet};
+
+    while let Ok(data) = recv_data_packet(&mut recv).await {
+        if send_data_packet(&mut send, &data).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// v1 (QUIC) client: handshake over QUIC then flood/cover/tunnel modes.
+pub async fn run_client(
+    args: &ClientArgs,
+    tun_ip: std::net::IpAddr,
+    tun_mask: std::net::IpAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = pq_crypto::HybridIdentity::generate()
+        .map_err(|e| format!("key generation failed: {}", e))?;
 
     let config = TunnelConfig {
         identity,
@@ -136,17 +135,17 @@ async fn run_quic(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if args.flood {
-        run_flood_mode(&args, session).await?;
+        run_flood_mode(args, session).await?;
     } else if args.cover {
-        run_cover_mode(&args, session).await?;
+        run_cover_mode(args, session).await?;
     } else {
-        run_tunnel_mode(&args, session, tun_ip, tun_mask).await?;
+        run_tunnel_mode(args, session, tun_ip, tun_mask).await?;
     }
     Ok(())
 }
 
 async fn run_flood_mode(
-    args: &Args,
+    args: &ClientArgs,
     session: pq_tunnel_core::Session,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pq_tunnel_core::handshake::{
@@ -244,7 +243,7 @@ async fn run_flood_mode(
 }
 
 async fn run_cover_mode(
-    args: &Args,
+    args: &ClientArgs,
     session: pq_tunnel_core::Session,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pq_tunnel_core::handshake::{
@@ -311,7 +310,7 @@ async fn run_cover_mode(
 }
 
 async fn run_tunnel_mode(
-    args: &Args,
+    args: &ClientArgs,
     session: pq_tunnel_core::Session,
     tun_ip: std::net::IpAddr,
     tun_mask: std::net::IpAddr,
@@ -357,16 +356,9 @@ async fn run_tunnel_mode(
     });
 
     let quic_to_tun = tokio::spawn(async move {
-        loop {
-            match recv_data_packet(&mut recv2).await {
-                Ok(data) => {
-                    if writer.write_packet(&data).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    break;
-                }
+        while let Ok(data) = recv_data_packet(&mut recv2).await {
+            if writer.write_packet(&data).await.is_err() {
+                break;
             }
         }
     });
