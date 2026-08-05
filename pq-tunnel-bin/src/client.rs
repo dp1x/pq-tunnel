@@ -2,11 +2,16 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pq_tunnel_core::{TunnelConfig, connect};
 
+#[allow(dead_code)] // server-side + provisioning APIs consume the rest
+mod identity;
+mod packet_len;
+mod v2_client;
+
 #[derive(Parser, Debug)]
-#[command(name = "pq-tunnel-client", about = "Post-quantum QUIC tunnel client")]
+#[command(name = "pq-tunnel-client", about = "Post-quantum tunnel client")]
 struct Args {
     #[arg(short, long)]
     remote: SocketAddr,
@@ -16,6 +21,12 @@ struct Args {
     mtu: u16,
     #[arg(long, default_value = "10")]
     handshake_timeout: u64,
+    #[arg(long, default_value_t, value_enum)]
+    transport: TransportKind,
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    #[arg(long)]
+    server_key: Option<PathBuf>,
     #[arg(short, long)]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -30,6 +41,13 @@ struct Args {
     flatline: bool,
     #[arg(long)]
     cover: bool,
+}
+
+#[derive(ValueEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    #[default]
+    V2,
+    Quic,
 }
 
 fn parse_tun_addr(s: &str) -> Result<(std::net::IpAddr, std::net::IpAddr), String> {
@@ -76,6 +94,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    match args.transport {
+        TransportKind::V2 => run_v2(&args).await,
+        TransportKind::Quic => run_quic(&args).await,
+    }
+}
+
+/// Datagram-plane client driver (default transport). Fail-closed identity
+/// provisioning, pinned server key, UDP + client session manager.
+async fn run_v2(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.flood || args.flatline || args.cover {
+        tracing::error!("flood/cover/flatline are v1 (QUIC) modes; use --transport quic");
+        return Err("v1-only flags cannot be combined with --transport v2".into());
+    }
+
+    let (tun_ip, tun_mask) = parse_tun_addr(&args.tun_addr)?;
+    v2_client::run(tun_ip, tun_mask, args).await
+}
+
+/// v1 (QUIC) runtime: handshake over QUIC then flood/cover/tunnel modes.
+async fn run_quic(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let identity = pq_crypto::HybridIdentity::generate()
         .map_err(|e| format!("key generation failed: {}", e))?;
     let (tun_ip, tun_mask) = parse_tun_addr(&args.tun_addr)?;
