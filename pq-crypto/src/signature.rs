@@ -1,7 +1,7 @@
 use crate::error::CryptoError;
 use ml_dsa::{
-    EncodedSignature, EncodedVerifyingKey, Generate, Keypair, MlDsa65 as MlDsaParams, Signature,
-    Signer, SigningKey, Verifier, VerifyingKey,
+    EncodedSignature, EncodedVerifyingKey, Generate, Keypair, MlDsa65 as MlDsaParams, Seed,
+    Signature, Signer, SigningKey, Verifier, VerifyingKey,
 };
 use zeroize::ZeroizeOnDrop;
 
@@ -14,6 +14,27 @@ pub struct MlDsaPublicKey(pub(crate) VerifyingKey<MlDsaParams>);
 
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct MlDsaSecretKey(pub(crate) SigningKey<MlDsaParams>);
+
+impl MlDsaSecretKey {
+    /// Export this seed (32 bytes) — the canonical serialization of the
+    /// ML-DSA-65 secret key.
+    ///
+    /// The seed unambiguously reconstructs the signing key (derivation is
+    /// deterministic). Note this is *not* the FIPS-204 expanded encoding
+    /// (4032 bytes); the `ml-dsa` crate stores the compact seed.
+    ///
+    /// The returned buffer is key material.
+    pub fn to_seed(&self) -> [u8; 32] {
+        let seed: Seed = self.0.to_seed();
+        seed.into()
+    }
+
+    /// Reconstruct a signing key from its 32-byte seed.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let seed: Seed = (*seed).into();
+        MlDsaSecretKey(SigningKey::from_seed(&seed))
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub struct MlDsaSignature(pub(crate) ml_dsa::Signature<MlDsaParams>);
@@ -71,6 +92,18 @@ impl MlDsaKeypair {
 
     pub fn public_key(&self) -> MlDsaPublicKey {
         MlDsaPublicKey(self.secret.0.verifying_key())
+    }
+
+    pub fn to_seed(&self) -> [u8; 32] {
+        self.secret.to_seed()
+    }
+
+    /// Reconstruct a keypair from a 32-byte seed. The public key is derived
+    /// deterministically, so a stored seed is sufficient to restore the pair.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let secret = MlDsaSecretKey::from_seed(seed);
+        let public = MlDsaPublicKey(secret.0.verifying_key());
+        MlDsaKeypair { public, secret }
     }
 
     pub fn sign(&self, msg: &[u8]) -> Result<MlDsaSignature, CryptoError> {
@@ -173,6 +206,38 @@ mod tests {
         let sig = kp.sign(msg).expect("sign");
         let valid = verify(&decoded, msg, &sig).expect("verify");
         assert!(valid, "decoded public key must verify original signature");
+    }
+
+    #[test]
+    fn ml_dsa_seed_roundtrip() {
+        let kp = MlDsaKeypair::generate().expect("keygen");
+        let seed = kp.to_seed();
+        assert_eq!(seed.len(), 32, "ML-DSA-65 seed must be 32 bytes");
+
+        let rebuilt = MlDsaKeypair::from_seed(&seed);
+
+        assert_eq!(
+            rebuilt.public_key().encode(),
+            kp.public_key().encode(),
+            "public key must be derivable from seed alone"
+        );
+
+        let msg = b"seed roundtrip message";
+        let sig = rebuilt.sign(msg).expect("sign");
+        let valid = verify(&kp.public, msg, &sig).expect("verify");
+        assert!(valid, "rebuilt keypair must verify");
+    }
+
+    #[test]
+    fn ml_dsa_seed_deterministic() {
+        let seed = [7u8; 32];
+        let a = MlDsaKeypair::from_seed(&seed);
+        let b = MlDsaKeypair::from_seed(&seed);
+        assert_eq!(
+            a.public_key().encode(),
+            b.public_key().encode(),
+            "same seed must produce identical keypair"
+        );
     }
 
     #[test]

@@ -4,11 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pq_tunnel_core::{TunnelConfig, listen};
 
+// Identity provisioning + shared v2 slot helpers.
+#[allow(dead_code)] // server-side only; provisioning APIs not used here
+mod identity;
+mod packet_len;
+mod v2_server;
+
 #[derive(Parser, Debug)]
-#[command(name = "pq-tunnel-server", about = "Post-quantum QUIC tunnel server")]
+#[command(name = "pq-tunnel-server", about = "Post-quantum tunnel server")]
 struct Args {
     #[arg(short, long, default_value = "0.0.0.0:4433")]
     listen: SocketAddr,
@@ -18,10 +24,23 @@ struct Args {
     mtu: u16,
     #[arg(long, default_value = "10")]
     handshake_timeout: u64,
+    #[arg(long, default_value_t, value_enum)]
+    transport: TransportKind,
+    #[arg(long)]
+    identity: Option<PathBuf>,
+    #[arg(long)]
+    roster: Option<PathBuf>,
     #[arg(short, long)]
     config: Option<PathBuf>,
     #[arg(long, default_value = "5")]
     stats_interval: u64,
+}
+
+#[derive(ValueEnum, Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportKind {
+    #[default]
+    V2,
+    Quic,
 }
 
 #[tokio::main]
@@ -35,6 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    match args.transport {
+        TransportKind::V2 => v2_server::run(&args).await,
+        TransportKind::Quic => run_quic(&args).await,
+    }
+}
+
+/// v1 (QUIC) runtime, unchanged: listen, accept, handshake, echo each
+/// connection's data stream back.  Kept behind `--transport quic`.
+async fn run_quic(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let identity = pq_crypto::HybridIdentity::generate()
         .map_err(|e| format!("key generation failed: {}", e))?;
 
