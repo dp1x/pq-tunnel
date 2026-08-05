@@ -14,7 +14,7 @@ counter, per-direction nonce accounting, and a single-event-per-call session
 manager with DoS-rate limiting and fail-secure semantics.
 
 > **Status:** The v2 data plane is implemented and tested
-> (`cargo test --workspace`: 265 tests pass). The legacy QUIC/TCP transport
+> (`cargo test --workspace`: 279 tests pass). The legacy QUIC/TCP transport
 > in `pq-tunnel-bin` is transitional and will be retired in a future
 > release; it is **not** the security-relevant code path.
 
@@ -64,7 +64,7 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.1.0-alpha):** 265 unit tests pass (`cargo test --workspace`),
+**Validation (v0.1.0-alpha):** 279 unit tests pass (`cargo test --workspace`),
 adversarial design-review campaigns (cryptography, protocol, security) were
 completed and their findings fixed, and the modern-harness cargo-fuzz targets
 compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
@@ -115,9 +115,10 @@ migration. All targets define the never-panic contract.
 
 ## Tests
 
-- `pq-crypto`: 51 unit tests
+- `pq-crypto`: 53 unit tests
 - `pq-tunnel-core`: 214 unit tests (incl. session-manager & handshake-v2 tests)
-- `pq-proxy`, `pq-tun`, `pq-tunnel-bin`: 0 unit tests (library/bin build verified)
+- `pq-tunnel-bin`: 12 unit tests (identity provisioning + packet length)
+- `pq-proxy`, `pq-tun`: 0 unit tests (library build verified)
 - 7 `cargo-fuzz` targets are defined; the 3 modern (`fuzz_target!`) targets
   compile under the fuzz harness (execution requires an ASan-capable host —
   see Fuzzing above).
