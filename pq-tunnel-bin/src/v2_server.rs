@@ -52,6 +52,7 @@ pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let roster = identity::load_roster(roster_path)?;
 
     let cfg = HandshakeV2ServerConfig::new(keypair, roster);
+    let cover = crate::cover_policy_from_args(args.no_cover, args.cover_mbps)?;
     let mut manager = ServerSessionManager::new(&cfg, SessionLimits::default())
         .map_err(|e| format!("server session manager init failed: {e}"))?;
     let mut udp = UdpTransport::bind(args.listen)
@@ -87,10 +88,9 @@ pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let driver =
-        tokio::spawn(
-            async move { run_server_manager(&mut udp, &mut manager, app_tx, cmd_rx).await },
-        );
+    let driver = tokio::spawn(async move {
+        run_server_manager(&mut udp, &mut manager, app_tx, cmd_rx, cover).await
+    });
 
     // Forwarding application: dispatch every decrypted relay message to its
     // real destination; replies return through the manager as commands for the
