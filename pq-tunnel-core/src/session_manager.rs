@@ -2958,9 +2958,6 @@ mod tests {
         fn idx(&mut self, n: usize) -> usize {
             (self.next_u64() as usize) % n
         }
-        fn bit(&mut self) -> bool {
-            self.next_u64() & 1 == 1
-        }
     }
 
     /// Establish a server session (SID, CLIENT_ADDR) and *return the handshake
@@ -2972,8 +2969,8 @@ mod tests {
         cc: &ClientConfig,
     ) -> (ServerSessionManager, WireSession, HandshakeOutcome) {
         let mut manager = server_manager(SessionLimits::default());
-        let (mut client, _ws) = established_client_session(&mut manager, &cc, SID);
-        let (ws, outcome) = client_established(&mut client, &cc);
+        let (mut client, _ws) = established_client_session(&mut manager, cc, SID);
+        let (ws, outcome) = client_established(&mut client, cc);
         (manager, ws, outcome)
     }
 
@@ -2983,7 +2980,7 @@ mod tests {
     /// at most one terminal Close per live window, never an orphan.
     #[test]
     fn adv_datapath_sequence_fuzz_10k() {
-        const SEED: u64 = 0x_C0FFEE_00_0000_0001;
+        const SEED: u64 = 0xC0FF_EE00_0000_0001;
         let (cc, mut sc) = shared_configs();
         // Isolate from the per-source handshake rate-limit (D7): each
         // close+reconnect cycle re-handshakes from CLIENT_ADDR and consumes two
@@ -3199,8 +3196,8 @@ mod tests {
                 }
             }
             // re-feed a duplicate M2 to confirm idempotent
-            for idx in 0..seen_m2.len().min(2) {
-                let _ = client.handle_datagram(&seen_m2[idx]).expect("dup m2");
+            for m2 in seen_m2.iter().take(2) {
+                let _ = client.handle_datagram(m2).expect("dup m2");
             }
             let mut completed = false;
             for f in &seen_m3 {
@@ -3307,14 +3304,14 @@ mod tests {
         let (_c, _ws) = established_client_session(&mut sm, &cc, SID); // pre-established
         assert_eq!(sm.session_count(), 1);
 
-        let (mut client_t, mut server_t, _guard) = crate::handshake_v2::tests::wired_transports();
+        let (client_t, mut server_t, _guard) = crate::handshake_v2::tests::wired_transports();
         let (app_tx_cmd, app_rx) = mpsc::channel::<ServerAppCommand>(8);
         let (app_tx_notif, _notif_rx) = mpsc::channel::<ManagerNotification>(16);
 
         // Scope the driver so its pinned future (which holds `&mut sm`) is dropped
         // before we read `sm.session_count()` below (E0502 otherwise).
         {
-            let mut driver =
+            let driver =
                 run_server_manager(&mut server_t, &mut sm, app_tx_notif, app_rx, no_cover());
             tokio::pin!(driver);
 
@@ -3369,7 +3366,7 @@ mod tests {
     #[test]
     fn adv_handshake_flood_then_valid_recovers() {
         let (cc, mut sc) = shared_configs();
-        let mut limits = SessionLimits::default();
+        let limits = SessionLimits::default();
         // Isolate the pending-cap clamp from this campaign's recovery leg: a
         // 100-source full-M1 flood would saturate the default max_pending (64)
         // with AwaitM3 entries that cannot complete (no M3 is sent) and survive
@@ -3389,14 +3386,14 @@ mod tests {
         ));
 
         // 100 distinct-SID M1 fragments from 100 distinct sources.
-        let mut caps = 0usize;
+        let mut caps;
         for i in 0..100usize {
             let sid = {
                 let mut s = SID;
                 s[0] = (i as u8).wrapping_add(1); // distinct sids
                 s
             };
-            let mut client = ClientHandshake::new(&cc, sid).expect("client");
+            let client = ClientHandshake::new(&cc, sid).expect("client");
             for f in client.m1_frags() {
                 let from = format!("10.9.0.1:{}", 41000 + i)
                     .parse::<SocketAddr>()
@@ -3857,7 +3854,7 @@ mod tests {
                 quota_paged: 0,
                 pagefile: 0,
             };
-            let mut cb = mem::size_of::<Pm>() as u32;
+            let cb = mem::size_of::<Pm>() as u32;
             pm.cb = cb;
             let h = unsafe { GetCurrentProcess() };
             let ok = unsafe { get_mem(h, &mut pm, cb) };

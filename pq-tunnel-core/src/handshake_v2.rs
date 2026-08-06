@@ -796,6 +796,14 @@ fn derive_master(
 /// the server replies to each datagram's source.  A wrong-size datagram MUST be
 /// surfaced as [`HandshakeV2Error::DatagramRejected`] so drivers can skip
 /// background noise without aborting.
+///
+/// NOTE: The async-trait style here is intentional — the driver layer awaits
+/// these methods directly and the current transports happen to yield `Send`
+/// futures. The `async_fn_in_trait` lint (a rustc builtin that clippy also
+/// reports) is allowed rather than suppressing the design; if auto-trait
+/// bounds or object safety become a requirement, revisit how to express them
+/// before the 1.0 API freeze.
+#[allow(async_fn_in_trait)]
 pub trait HandshakeTransport {
     /// Send one fixed-size packet to `peer`.
     async fn send_to(
