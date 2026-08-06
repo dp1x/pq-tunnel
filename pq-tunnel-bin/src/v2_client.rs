@@ -47,6 +47,7 @@ pub async fn run(args: &ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
     let server_key = identity::load_public_key(server_key_path)?;
 
     let cfg = HandshakeV2ClientConfig::new(args.remote, keypair, server_key);
+    let cover = crate::cover_policy_from_args(args.no_cover, args.cover_mbps)?;
     let mut manager = ClientSessionManager::new(&cfg, SessionLimits::default())
         .map_err(|e| format!("client session manager init failed: {e}"))?;
     let mut udp = UdpTransport::connect(args.remote)
@@ -59,10 +60,9 @@ pub async fn run(args: &ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
     // The manager driver owns all transport I/O, retransmit timers, and D16
     // re-establishment.  It exits only on a transport/manager error or when
     // the app channel closes.
-    let driver =
-        tokio::spawn(
-            async move { run_client_manager(&mut udp, &mut manager, app_tx, data_rx).await },
-        );
+    let driver = tokio::spawn(async move {
+        run_client_manager(&mut udp, &mut manager, app_tx, data_rx, cover).await
+    });
 
     // The relay is the application endpoint: local apps send relay-framed
     // datagrams here; the relay records destinations and forwards into the

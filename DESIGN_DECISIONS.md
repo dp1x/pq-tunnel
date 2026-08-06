@@ -893,6 +893,74 @@ stays fixed 1280-byte envelopes (D13); everything below is application layer
 
 ---
 
+# D19 — Cover Traffic Scheduling Model
+
+## Status
+
+Accepted (v0.2.0-alpha; implemented in M3)
+
+## Context
+
+PROTOCOL_SPEC §12 commits Tunnel to metadata resistance from traffic
+behaviour: timing, volume, idle periods and bursts are all observable even
+when packet content is sealed (D5/D6). Cover traffic must create a **stable
+observable traffic pattern over time** — a protocol-level constant rate — not
+perfectly timed packets.
+
+## Decision
+
+- **Default policy is fixed and permanent for v0.2 alpha**: cover **enabled**,
+  **fixed-rate**, **2 Mbps** (5.12 ms per 1280-byte slot). The default is not
+  adaptive. Rationale: the purpose of the default is *predictable* metadata
+  resistance — fixed rate is easier to reason about, test, audit, and explain;
+  adaptive behaviour creates observable state changes (rate/timing/pattern
+  changes) that can themselves leak information.
+- **Adaptive modes are future, user-selected policies only** — never the
+  default, never negotiated. When (if) built they require an explicit warning.
+  M3 implements the fixed scheduler only; adaptive code paths are not added
+  now (extra attack surface and test burden for no v0.2 requirement).
+- **Scheduling semantics**: pure-periodic (D5) with *jitter tolerance*. The
+  scheduler tracks a monotonic deadline; when the deadline passes it yields
+  **at most one** emission and reschedules from "now". A delayed driver wake
+  (OS scheduling) therefore produces a single catch-up packet — never a
+  buffered burst, which would itself be a traffic fingerprint. No
+  "only-when-data" behaviour: an established idle session keeps emitting.
+- **Cover traffic is a transport behaviour, not a handshake property.** The
+  policy lives in the session/driver layer (`pq-tunnel-core::scheduler`),
+  never in `ClientConfig`/`ServerConfig`, so it cannot become part of the
+  protocol negotiation surface. Future protocol versions must not negotiate
+  it either.
+- **Emission rules**: cover only while a session is established (no churn
+  during handshake); client emits on its single session, server emits one
+  cover packet per established session per interval; cover rides the exact
+  same encrypted packet path as data (`WireSession::cover` → AEAD slot) and
+  consumes session nonce state like real traffic, so nonce exhaustion closes
+  and re-establishes per D16.
+- **Disabling is explicit and visible**: `--no-cover` is the only way to turn
+  it off (documented reduction, PROTOCOL_SPEC §12.2); `--cover-mbps` tunes the
+  fixed rate.
+
+## Consequences
+
+**Advantages:**
+
+- the wire pattern of an established idle link is a constant, predictable
+  packet stream per direction — no timing/idle/burst leakage from the shaper
+- single-emit-on-stall rescheduling is clock-independent and unit-testable in
+  virtual time
+- the scheduler is a pure module: core owns policy/timing, binary drivers own
+  async execution
+
+**Tradeoffs:**
+
+- fixed 2 Mbps overhead even when the user has nothing to send (the price of
+  the default guarantee; explicitly tunable or disable-able)
+- per-interval wakeups in the driver loops (~195 Hz at the default rate)
+- a single global interval per session — no per-flow differentiation yet
+  (future scheduler work, still user-selected only)
+
+---
+
 # Open Design Decisions
 
 The following areas remain intentionally unresolved.

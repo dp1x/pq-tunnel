@@ -82,6 +82,7 @@ use crate::handshake_v2::{
     HandshakeV2Error, ServerConfig, ServerEvent, ServerHandshake, is_handshake_fragment,
     random_sid,
 };
+use crate::scheduler::{CoverPolicy, CoverScheduler};
 use crate::wire_session::{SessionError, WireSession};
 
 /// Driver tick interval: session eviction / deadline checks.
@@ -518,6 +519,23 @@ impl ServerSessionManager {
             }
             Err(e) => Err(ManagerError::Session(e)),
         }
+    }
+
+    /// Emit one cover packet on **every** established session (cover hook for
+    /// the server driver's periodic arm).  Production order is
+    /// `sid`-sorted for determinism.  Any crypto-level error fails the whole
+    /// batch (fail-secure: a bad cover packet is a session fault).
+    pub fn cover_packet_all(&mut self) -> Result<Vec<ManagerEvent>, ManagerError> {
+        let mut sids: Vec<[u8; SESSION_ID_LEN]> = self.sessions.keys().copied().collect();
+        sids.sort_unstable();
+        let mut out = Vec::with_capacity(sids.len());
+        for sid in sids {
+            match self.cover_packet(&sid)? {
+                ManagerEvent::None => {}
+                ev => out.push(ev),
+            }
+        }
+        Ok(out)
     }
 
     fn send_encrypted(
@@ -980,13 +998,22 @@ impl ClientSessionManager {
 /// Run the server manager: transport I/O, event → notification relay, and
 /// periodic `tick`s.  Returns on transport error (fail-secure), on app
 /// channel closure, or when `app_rx` closes.
+///
+/// `cover` is the per-session cover-traffic schedule (transport policy, D19):
+/// once at least one session is established the driver emits one cover packet
+/// to every established session per interval.  No session → the schedule stays
+/// inert.
 pub async fn run_server_manager<T: HandshakeTransport>(
     transport: &mut T,
     manager: &mut ServerSessionManager,
     app_tx: mpsc::Sender<ManagerNotification>,
     mut app_rx: mpsc::Receiver<ServerAppCommand>,
+    cover: CoverPolicy,
 ) -> Result<(), ManagerError> {
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
+    let mut cover_sched = CoverScheduler::new(cover);
+    let cover_arm = cover_sleep(&cover_sched);
+    tokio::pin!(cover_arm);
     loop {
         tokio::select! {
             r = transport.recv() => match r {
@@ -1003,6 +1030,8 @@ pub async fn run_server_manager<T: HandshakeTransport>(
                         transport.send_to(&packet, peer).await?;
                     }
                     ManagerEvent::Established { sid, peer } => {
+                        cover_sched.start(Instant::now());
+                        cover_arm.set(cover_sleep(&cover_sched));
                         app_tx
                             .send(ManagerNotification::Established { sid, peer })
                             .await
@@ -1059,17 +1088,46 @@ pub async fn run_server_manager<T: HandshakeTransport>(
                     }
                 }
             }
+            _ = &mut cover_arm => {
+                if cover_sched.on_deadline(Instant::now()) {
+                    for ev in manager.cover_packet_all()? {
+                        match ev {
+                            ManagerEvent::SendPacket { packet, peer } => {
+                                transport.send_to(&packet, peer).await?;
+                            }
+                            ManagerEvent::Closed { sid, reason } => {
+                                app_tx
+                                    .send(ManagerNotification::Closed { sid, reason })
+                                    .await
+                                    .map_err(|_| ManagerError::AppClosed)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // No established sessions left → go inert (no idle churn).
+                    if manager.session_count() == 0 {
+                        cover_sched.stop();
+                    }
+                }
+                cover_arm.set(cover_sleep(&cover_sched));
+            }
         }
     }
 }
 
 /// Run the client manager: auto-connect, transport I/O, app data relay,
 /// retransmit timers, and re-establishment after every `Closed` (D16).
+///
+/// `cover` is the cover-traffic schedule for the single client session
+/// (transport policy, D19).  It is armed only while the session is
+/// established (`is_ready`); after any `Closed` it goes inert until
+/// re-established, so a mid-handshake client never emits cover.
 pub async fn run_client_manager<T: HandshakeTransport>(
     transport: &mut T,
     manager: &mut ClientSessionManager,
     app_tx: mpsc::Sender<ManagerNotification>,
     mut app_rx: mpsc::Receiver<Vec<u8>>,
+    cover: CoverPolicy,
 ) -> Result<(), ManagerError> {
     // Auto-connect: the tunnel is always up (Phase 8 may gate this later).
     if let ManagerEvent::Send { packets, peer } = manager.begin_handshake()? {
@@ -1079,6 +1137,9 @@ pub async fn run_client_manager<T: HandshakeTransport>(
     }
     let mut was_ready = false;
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
+    let mut cover_sched = CoverScheduler::new(cover);
+    let cover_arm = cover_sleep(&cover_sched);
+    tokio::pin!(cover_arm);
     // The handshake retransmit timer is created ONCE and advanced only when it
     // fires (or the manager re-arms after a Close). Recomputing it from
     // `next_delay()` on *every* iteration lets continuous application data
@@ -1093,6 +1154,8 @@ pub async fn run_client_manager<T: HandshakeTransport>(
         // gated — see module docs).
         if manager.is_ready() && !was_ready {
             was_ready = true;
+            cover_sched.start(Instant::now());
+            cover_arm.set(cover_sleep(&cover_sched));
             if let Some(sid) = manager.session_id() {
                 app_tx
                     .send(ManagerNotification::Ready { sid })
@@ -1122,6 +1185,7 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                     }
                     ManagerEvent::Closed { sid, reason } => {
                         was_ready = false;
+                        cover_sched.stop();
                         app_tx
                             .send(ManagerNotification::Closed { sid, reason })
                             .await
@@ -1140,6 +1204,7 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                         }
                             Ok(ManagerEvent::Closed { sid, reason }) => {
                                 was_ready = false;
+                                cover_sched.stop();
                                 app_tx
                                     .send(ManagerNotification::Closed { sid, reason })
                                     .await
@@ -1171,6 +1236,7 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                 }
                 ManagerEvent::Closed { sid, reason } => {
                     was_ready = false;
+                    cover_sched.stop();
                     app_tx
                         .send(ManagerNotification::Closed { sid, reason })
                         .await
@@ -1184,6 +1250,7 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                 for ev in manager.tick(Instant::now()) {
                     if let ManagerEvent::Closed { sid, reason } = ev {
                         was_ready = false;
+                        cover_sched.stop();
                         app_tx
                             .send(ManagerNotification::Closed { sid, reason })
                             .await
@@ -1192,6 +1259,32 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                         retransmit.set(client_retransmit_timer(manager));
                     }
                 }
+            }
+            _ = &mut cover_arm => {
+                if cover_sched.on_deadline(Instant::now()) {
+                    match manager.cover_packet() {
+                        Ok(ManagerEvent::SendPacket { packet, peer }) => {
+                            transport.send_to(&packet, peer).await?;
+                        }
+                        Ok(ManagerEvent::Closed { sid, reason }) => {
+                            was_ready = false;
+                            cover_sched.stop();
+                            app_tx
+                                .send(ManagerNotification::Closed { sid, reason })
+                                .await
+                                .map_err(|_| ManagerError::AppClosed)?;
+                            rearm_client(transport, manager).await?;
+                            retransmit.set(client_retransmit_timer(manager));
+                        }
+                        // Session not (yet) established: never churn over it.
+                        Err(ManagerError::NoSession) => {}
+                        // A cover emission is real encrypted traffic: any other
+                        // fault is a session fault and must surface (fail-secure).
+                        Err(e) => return Err(e),
+                        _ => {}
+                    }
+                }
+                cover_arm.set(cover_sleep(&cover_sched));
             }
         }
     }
@@ -1206,6 +1299,18 @@ fn client_retransmit_timer(manager: &ClientSessionManager) -> tokio::time::Sleep
         .next_delay()
         .map(tokio::time::sleep)
         .unwrap_or_else(|| tokio::time::sleep(Duration::MAX))
+}
+
+/// Cover-timer arm for the driver `select!`s: sleep until the next cover
+/// deadline, or effectively forever when nothing is scheduled.  Re-armed on
+/// every wake via `Sleep::set`, the same discipline as `client_retransmit_timer`
+/// — the cover schedule must never be recreated per iteration, or application
+/// traffic would starve it (the M2 timer defect class; D19).
+fn cover_sleep(sched: &CoverScheduler) -> tokio::time::Sleep {
+    match sched.next_deadline() {
+        Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)),
+        None => tokio::time::sleep(Duration::MAX),
+    }
 }
 
 /// Re-establish: start a fresh handshake (fresh sid, D16) after a close.
@@ -1239,6 +1344,16 @@ mod tests {
     use std::net::Ipv4Addr;
 
     const SID: [u8; SESSION_ID_LEN] = [0x42; SESSION_ID_LEN];
+
+    /// Deterministic driver tests: cover disabled so per-packet expectations
+    /// (event flows, exact `recv`s) are unaffected by periodic emissions.  The
+    /// cover cadence itself is exercised by the e2e gate.
+    fn no_cover() -> CoverPolicy {
+        CoverPolicy {
+            enabled: false,
+            interval: CoverPolicy::default().interval,
+        }
+    }
 
     /// One identity pair shared by every test: the server manager's roster
     /// must contain the client key used in each test's handshake.
@@ -2234,7 +2349,7 @@ mod tests {
         let (app_tx, mut app_rx) = mpsc::channel(64);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let driver = tokio::spawn(async move {
-            run_server_manager(&mut server_t, &mut manager, app_tx, cmd_rx).await
+            run_server_manager(&mut server_t, &mut manager, app_tx, cmd_rx, no_cover()).await
         });
 
         // Handshake through the driver.
@@ -2309,7 +2424,7 @@ mod tests {
         let (app_tx, mut app_rx) = mpsc::channel(64);
         let (data_tx, data_rx) = mpsc::channel(64);
         let driver = tokio::spawn(async move {
-            run_client_manager(&mut client_t, &mut manager, app_tx, data_rx).await
+            run_client_manager(&mut client_t, &mut manager, app_tx, data_rx, no_cover()).await
         });
 
         // The driver auto-connects: M1 arrives at the server machine.
@@ -2396,7 +2511,7 @@ mod tests {
         let (app_tx, _app_rx) = mpsc::channel(64);
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
         let driver = tokio::spawn(async move {
-            run_client_manager(&mut client_t, &mut manager, app_tx, data_rx).await
+            run_client_manager(&mut client_t, &mut manager, app_tx, data_rx, no_cover()).await
         });
         // Push app data immediately, while the client is Handshaking (no M2).
         data_tx.send(vec![0x77; 64]).await.unwrap();
@@ -2425,7 +2540,7 @@ mod tests {
         let (app_tx, _app_rx) = mpsc::channel(64);
         let (cmd_tx, cmd_rx) = mpsc::channel::<ServerAppCommand>(64);
         let driver = tokio::spawn(async move {
-            run_server_manager(&mut server_t, &mut manager, app_tx, cmd_rx).await
+            run_server_manager(&mut server_t, &mut manager, app_tx, cmd_rx, no_cover()).await
         });
         // Command for a sid that no session knows.
         cmd_tx
@@ -3199,7 +3314,8 @@ mod tests {
         // Scope the driver so its pinned future (which holds `&mut sm`) is dropped
         // before we read `sm.session_count()` below (E0502 otherwise).
         {
-            let mut driver = run_server_manager(&mut server_t, &mut sm, app_tx_notif, app_rx);
+            let mut driver =
+                run_server_manager(&mut server_t, &mut sm, app_tx_notif, app_rx, no_cover());
             tokio::pin!(driver);
 
             let big = vec![0u8; PAYLOAD_LEN + 1];

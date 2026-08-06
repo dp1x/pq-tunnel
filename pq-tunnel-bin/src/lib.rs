@@ -29,6 +29,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use pq_tunnel_core::{CoverPolicy, interval_from_rate_bps};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -95,6 +96,17 @@ pub struct ServerArgs {
     #[arg(long)]
     pub echo: bool,
 
+    /// Cover-traffic rate in megabits per second (v2; fixed pure-periodic
+    /// shaper, D5/D6).  A visible metadata-resistance knob: lowering it thins
+    /// the wire pattern; disabling it is the explicit reduction below.
+    #[arg(long, default_value_t = 2)]
+    pub cover_mbps: u64,
+
+    /// Disable cover traffic entirely (v2; explicit, documented reduction —
+    /// cover never silently turns off, PROTOCOL_SPEC §12.2).
+    #[arg(long)]
+    pub no_cover: bool,
+
     /// Transport. v1 is deprecated and removed soon; only v2 is supported for
     /// production use.
     #[arg(long, value_enum, default_value_t = TransportKind::V2)]
@@ -144,6 +156,17 @@ pub struct ClientArgs {
     #[arg(long)]
     pub server_key: Option<PathBuf>,
 
+    /// Cover-traffic rate in megabits per second (v2; fixed pure-periodic
+    /// shaper, D5/D6).  A visible metadata-resistance knob: lowering it thins
+    /// the wire pattern; disabling it is the explicit reduction below.
+    #[arg(long, default_value_t = 2)]
+    pub cover_mbps: u64,
+
+    /// Disable cover traffic entirely (v2; explicit, documented reduction —
+    /// cover never silently turns off, PROTOCOL_SPEC §12.2).
+    #[arg(long)]
+    pub no_cover: bool,
+
     /// v1 (QUIC): flood mode — send packets at a fixed rate with no backoff.
     #[arg(long)]
     pub flood: bool,
@@ -176,6 +199,25 @@ pub enum TransportKind {
     #[default]
     V2,
     Quic,
+}
+
+/// Build the cover-traffic policy from CLI flags (transport policy, never a
+/// handshake property — D19).  Fail-closed on nonsensical input: `--no-cover`
+/// is the only supported way to disable.
+pub fn cover_policy_from_args(no_cover: bool, mbps: u64) -> Result<CoverPolicy, String> {
+    if no_cover {
+        return Ok(CoverPolicy {
+            enabled: false,
+            interval: CoverPolicy::default().interval,
+        });
+    }
+    if mbps == 0 {
+        return Err("--cover-mbps must be >= 1; use --no-cover to disable cover traffic".into());
+    }
+    Ok(CoverPolicy {
+        enabled: true,
+        interval: interval_from_rate_bps(mbps * 1_000_000),
+    })
 }
 
 /// Program entry point: tracing init, then dispatch on the subcommand.

@@ -19,6 +19,7 @@ pub use handshake_v2::{
 pub mod metrics;
 pub mod nonce;
 pub mod replay;
+pub mod scheduler;
 pub mod server;
 pub mod session;
 mod session_manager;
@@ -44,6 +45,7 @@ pub use error::CodecError;
 pub use error::TunnelError;
 pub use handshake::{HandshakeError, HandshakeResult, client_handshake, server_handshake};
 pub use metrics::SessionMetrics;
+pub use scheduler::{CoverPolicy, CoverScheduler, DEFAULT_COVER_RATE_BPS, interval_from_rate_bps};
 pub use server::listen;
 pub use session::{Listener, Session};
 pub use state::{InvalidTransition, ProtocolState};
