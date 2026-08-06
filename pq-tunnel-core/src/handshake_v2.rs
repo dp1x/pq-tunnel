@@ -1,8 +1,8 @@
 //! v2 handshake — mutual-ephemeral hybrid ML-KEM-768 + X25519 establishment.
 //!
 //! Implements DESIGN_DECISIONS D12–D15 over the uniform 1280-byte codec
-//! datagram framing (DESIGN_DECISIONS D13).  The legacy `crate::handshake`
-//! module (v1 QUIC transport) is untouched; this module is additive.
+//! datagram framing (DESIGN_DECISIONS D13).  (The pre-v2 QUIC handshake that
+//! this module replaced was removed with the legacy transport.)
 //!
 //! # Wire model (D13)
 //!
@@ -21,9 +21,8 @@
 //! VERSION(1) ‖ SID(8) ‖ hs_type(1) ‖ frag_idx(1) ‖ frag_total(1) ‖ body(≤1268) ‖ zero padding
 //! ```
 //!
-//! `hs_type` is byte-disjoint from the codec `MessageType` (0x00–0x03) and the
-//! legacy `handshake::MsgType` handshake values (0x01–0x03), so a receiver can
-//! dispatch a datagram unambiguously:
+//! `hs_type` is byte-disjoint from the codec `MessageType` (0x00–0x03), so a
+//! receiver can dispatch a datagram unambiguously:
 //!
 //! **Dispatch rule (pinned):** byte 9 of a datagram selects the path.
 //! `0x10`/`0x20`/`0x30` → handshake fragment; anything else → data path
@@ -176,10 +175,6 @@ const _: () = assert!(
 const _: () = assert!(
     crate::codec::MessageType::Close.as_u8() < HS_TYPE_CLIENT_HELLO,
     "hs_type must be byte-disjoint from codec MessageType (0x00-0x03)"
-);
-const _: () = assert!(
-    (crate::handshake::MsgType::Confirm as u8) < HS_TYPE_CLIENT_HELLO,
-    "hs_type must be byte-disjoint from legacy handshake MsgType (0x01-0x03)"
 );
 
 // ---------------------------------------------------------------------------

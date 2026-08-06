@@ -154,7 +154,7 @@ pub fn derive_handshake_init_nonce(kem_ss: &[u8; 32]) -> Result<[u8; 12], Crypto
 /// info = "pq-tunnel-master-v2" ‖ VERSION ‖ SID ‖ TH3)`.
 ///
 /// - Concatenation order is pinned (`ssA ‖ ssB ‖ dh_cs` on both sides); XOR
-///   combination is banned (legacy HybridIdentity bug).
+///   combination is banned (the pre-v2 XOR-combiner derivation bug).
 /// - The transcript digest `TH3` and the session identifier are bound into the
 ///   derivation, so a replayed handshake transcript or a shared-master session
 ///   never re-derives the same keying material.

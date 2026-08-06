@@ -568,7 +568,7 @@ A 3-message client-initiated flow over uniform 1280-byte datagrams.
   decapsulates); `ssB` = share from ct3 (client encapsulates to server
   ephemeral; server decapsulates); `dh_cs` = X25519 shared secret.
 - Concatenation order is pinned (`ssA ‖ ssB ‖ dh_cs` on both sides); XOR
-  combination is banned (legacy HybridIdentity bug).
+  combination is banned (the pre-v2 XOR-combiner derivation bug).
 - The handshake survives compromise of either family: ML-KEM protects
   against CRQC; X25519 protects against a classical break of the lattice
   family.
@@ -958,6 +958,73 @@ perfectly timed packets.
 - per-interval wakeups in the driver loops (~195 Hz at the default rate)
 - a single global interval per session — no per-flow differentiation yet
   (future scheduler work, still user-selected only)
+
+---
+
+# D20 — Removal of the Pre-v2 QUIC/TLS Transport
+
+## Status
+
+Accepted (v0.2.0-alpha; implemented in M4)
+
+## Context
+
+Before the v2 datagram plane, Tunnel shipped a QUIC/TLS-based transport
+(`--transport quic`): a v1 8192-byte handshake framing with its own
+`MsgType` set (0x10/0x11 for data/cover, byte-incompatible with the codec),
+a self-signed-certificate server, a client that performed **no
+server-certificate validation** (`SkipServerVerification`), ephemeral
+self-generated identities with no roster pinning, and a `HybridIdentity`
+XOR-combiner (D14 rationale). The v2 datagram plane (D13-D18) replaced every
+one of these guarantees, and the v1 path was retained only as a transitional
+bootstrap.
+
+## Decision
+
+- **Delete the legacy stack entirely** (M4): `pq-tunnel-bin/src/quic.rs`
+  (flood/cover/flatline/TUN modes, including its hardcoded 100 pkt/s cover
+  loop), the core v1 modules (`client`, `server`, `handshake`, `config`,
+  `session`), the `HybridIdentity` XOR-combiner in `pq-crypto`, the
+  `TunnelError` enum, the v1 CLI surface (`--transport`, `--flood`,
+  `--cover`, `--flatline`, `--packet-size`, `--rate`, `--duration`,
+  `--tun-addr`, `--mtu`, `--handshake-timeout`), and the v1-only workspace
+  members (`pq-tun` deleted; `pq-proxy` excluded from the workspace, parked
+  in-tree for a future v2 rewrite).
+- **The deprecation schedule is superseded**: `HybridIdentity` carried a
+  "scheduled for removal in v2.1" deprecation note. The crate has never
+  shipped 1.0 and the alpha release removes it now, with the whole legacy
+  path, in one breaking change (README already declares pre-1.0 breaking
+  changes).
+- **Removal is a security-positive refactor**: the single largest attack
+  surface (QUIC + rustls + rcgen self-signed certificates + no-certificate
+  validation) and its dependency chain (including `aws-lc-sys`) leave the
+  dependency graph entirely.
+
+## Consequences
+
+**Advantages:**
+
+- one wire format (the 1280-byte codec), one handshake (v2), one identity
+  model (ML-DSA roster pinning) — no dual-framing confusion (the old
+  `MsgType` collision assertions became moot)
+- the unauthenticated v1 path (no cert validation, self-generated identities)
+  can no longer be deployed by mistake
+- dependency graph shrinks by a full TLS stack; the `aws-lc-sys` build
+  constraint disappears (the x86_64 `--target` convention is retained
+  regardless as the tested toolchain)
+- no dead public API: `connect`, `listen`, `Session`, `TunnelConfig`,
+  `HandshakeError`, `TunnelError` are gone
+
+**Tradeoffs / notes:**
+
+- `pq-proxy` (SOCKS5-over-QUIC) is parked, not deleted: it is excluded from
+  the workspace and does not compile against the v2-only core. It is
+  scheduled for a v2 rewrite (SOCKS5 over the relay plane) rather than
+  maintenance.
+- `state.rs` (`ProtocolState`) is retained: it is the live v2 `WireSession`
+  state machine (D16 rekey states), not dead code.
+- Public API removals are intentional and documented as pre-1.0 breaking
+  changes.
 
 ---
 
