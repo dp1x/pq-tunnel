@@ -226,6 +226,47 @@ Before committing:
 
 ---
 
+## Git Milestone Completion Rule
+
+A milestone is **not complete** until **all** of the following are true:
+
+1. Working tree clean.
+2. Validation gates passed.
+3. Commit created.
+4. `git push origin main` succeeds.
+5. Verify:
+
+```bash
+git rev-parse HEAD
+git rev-parse origin/main
+```
+
+They **must match**.
+
+6. Verify live remote:
+
+```bash
+git ls-remote origin refs/heads/main
+```
+
+It **must** point to the same commit.
+
+7. Only then report:
+
+> Milestone complete.
+
+If push fails:
+
+* Stop immediately.
+* Explain why.
+* Do **not** report the milestone as complete.
+
+Never rely solely on `git status` or the local tracking branch for remote
+state. Before claiming a milestone is published, verify against the live
+remote (`git ls-remote`) or by confirming the push succeeded.
+
+---
+
 # Failure Philosophy
 
 Fail securely.
