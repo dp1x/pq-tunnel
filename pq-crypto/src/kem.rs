@@ -154,4 +154,71 @@ mod tests {
         let (ss, _) = encapsulate(&kp.public).expect("encaps");
         assert_eq!(ss.0.len(), ML_KEM_768_SHARED_SECRET_BYTES);
     }
+
+    // -----------------------------------------------------------------------
+    // Known-answer tests (M5.1) — FIPS 203 via Wycheproof `testvectors_v1`
+    // -----------------------------------------------------------------------
+
+    fn wycheproof_keygen_seed() -> ml_kem::Seed {
+        use crate::kat_vectors::{KEM_KEYGEN_SEED, unhex};
+        let bytes: [u8; 64] = <[u8; 64]>::try_from(unhex(KEM_KEYGEN_SEED).as_slice()).unwrap();
+        ml_kem::Seed::from(bytes)
+    }
+
+    #[test]
+    fn ml_kem_768_wycheproof_keygen_kat() {
+        use crate::kat_vectors::{KEM_KEYGEN_EK, unhex};
+        let dk = DecapsulationKey::<MlKem768>::from_seed(wycheproof_keygen_seed());
+        let ek = dk.encapsulation_key();
+        assert_eq!(
+            ek.to_bytes().as_slice(),
+            unhex(KEM_KEYGEN_EK).as_slice(),
+            "FIPS 203 keyGen must reproduce the Wycheproof encapsulation key from the seed"
+        );
+    }
+
+    #[test]
+    fn ml_kem_768_wycheproof_decaps_kat() {
+        use crate::kat_vectors::{KEM_KEYGEN_C, KEM_KEYGEN_K, unhex};
+        let dk = DecapsulationKey::<MlKem768>::from_seed(wycheproof_keygen_seed());
+        let ct = MlKemCiphertext::from_bytes(&unhex(KEM_KEYGEN_C)).expect("ct decode");
+        let ss = decapsulate(&MlKemSecretKey(dk), &ct).expect("decaps");
+        assert_eq!(
+            ss.as_bytes(),
+            <[u8; 32]>::try_from(unhex(KEM_KEYGEN_K).as_slice()).unwrap(),
+            "FIPS 203 decaps must reproduce the Wycheproof shared secret"
+        );
+    }
+
+    #[test]
+    fn ml_kem_768_wycheproof_encaps_kat() {
+        use crate::kat_vectors::{KEM_ENCAPS_C, KEM_ENCAPS_EK, KEM_ENCAPS_K, KEM_ENCAPS_M, unhex};
+        // Deterministic encapsulation with the Wycheproof random bytes m:
+        // (c, K) = Encaps(ek, m). Production `encapsulate` uses OS randomness;
+        // this test pins the underlying primitive (and the wrapper's ek
+        // parsing) against the official vector.
+        let ek_bytes: [u8; ML_KEM_768_PUBLIC_KEY_BYTES] =
+            <[u8; ML_KEM_768_PUBLIC_KEY_BYTES]>::try_from(unhex(KEM_ENCAPS_EK).as_slice()).unwrap();
+        let key_array = hybrid_array::Array::<u8, _>::from(ek_bytes);
+        let ek = EncapsulationKey::<MlKem768>::new(&key_array).expect("ek decode");
+        let m: ml_kem::B32 =
+            ml_kem::B32::from(<[u8; 32]>::try_from(unhex(KEM_ENCAPS_M).as_slice()).unwrap());
+
+        let (ct, ss) = ek.encapsulate_deterministic(&m);
+        assert_eq!(
+            ct.as_slice(),
+            unhex(KEM_ENCAPS_C).as_slice(),
+            "FIPS 203 encaps (fixed m) must reproduce the Wycheproof ciphertext"
+        );
+        assert_eq!(
+            ss.as_slice(),
+            unhex(KEM_ENCAPS_K).as_slice(),
+            "FIPS 203 encaps (fixed m) must reproduce the Wycheproof shared secret"
+        );
+
+        // The wrapper must also accept the same authoritative ek.
+        let wrapper_pk =
+            MlKemPublicKey::from_bytes(&unhex(KEM_ENCAPS_EK)).expect("wrapper ek decode");
+        assert_eq!(wrapper_pk.to_bytes(), unhex(KEM_ENCAPS_EK));
+    }
 }

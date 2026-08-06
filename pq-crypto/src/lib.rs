@@ -5,6 +5,13 @@ pub mod kem;
 pub mod signature;
 pub mod transcript;
 
+/// Known-answer test vectors (M5.1). `#[cfg(test)]`-only: never compiled into
+/// production builds, so no production API exists solely to support the KATs
+/// (D21). Vectors are quoted verbatim from RFC 8439/5869/7748 and from
+/// Wycheproof `testvectors_v1`.
+#[cfg(test)]
+pub mod kat_vectors;
+
 /// Classical X25519 key exchange.
 ///
 /// X25519 is the classical leg of Tunnel's hybrid key-establishment profile

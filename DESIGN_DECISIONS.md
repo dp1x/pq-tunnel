@@ -1028,6 +1028,54 @@ bootstrap.
 
 ---
 
+# D21 - External Known-Answer Anchoring Policy
+
+## Status
+
+Accepted (M5.1)
+
+## Context
+
+Cryptographic primitives need ground truth that is independent of the code
+under test. Self-derived vectors cannot distinguish an implementation error
+from a wrong assumption. Tunnel contracts against canonical external sources
+so a failing test always means the wrapper or the transcription is wrong,
+never the vector.
+
+## Decision
+
+- **Authoritative vector sources**: RFC test vectors (RFC 8439 ChaCha20-Poly1305,
+  RFC 5869 HKDF-SHA256, RFC 7748 X25519) and Google Wycheproof JSON vectors
+  (FIPS 203 ML-KEM-768, FIPS 204 ML-DSA-65). Vectors are transcribed verbatim
+  into `pq-crypto/src/kat_vectors.rs` (a `#[cfg(test)]` module) with a
+  provenance comment naming the exact source and test case.
+- **Vectors are never adjusted** to make a test pass. A failing KAT means the
+  implementation under test, or the transcription, is defective; it is root-
+  caused and fixed, never the vector.
+- **Test-only access**: KATs may use `#[cfg(test)]` internal hooks but must not
+  introduce production API solely to serve them. Deterministic encapsulation
+  use in KATs stays behind a doc-hidden path already compiled in the crate.
+- **Provenance per constant**: every constant carries its source test name so
+  a mismatch can be re-verified against the published source.
+
+## Consequences
+
+**Advantages:**
+
+- defeats self-referential test design; a green KAT is evidence the wrapper
+  boundary is faithful to the published specification
+- deterministic and reproducible (no randomness in KAT inputs)
+- external vectors pin behavior against future dependency upgrades
+
+**Tradeoffs / notes:**
+
+- Wycheproof JSON is large; only the relevant test case is transcribed
+- transcription is itself error-prone; lengths are validated as a smoke check
+- a KAT failure path is unambiguous by construction: fail → fix the wrapper,
+  never the vector
+
+---
+
 # Open Design Decisions
 
 The following areas remain intentionally unresolved.

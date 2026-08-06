@@ -551,4 +551,26 @@ mod tests {
         key2[0] ^= 0x01;
         assert_ne!(f1, compute_client_finished(&key2, &th3));
     }
+
+    // -----------------------------------------------------------------------
+    // Known-answer test (M5.1) — RFC 5869 §A.1 test case 1 (D21)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rfc5869_a1_hkdf_sha256_kat() {
+        use crate::kat_vectors::{RFC5869_IKM, RFC5869_INFO, RFC5869_OKM, RFC5869_SALT, unhex};
+        // KAT1: IKM of 22 octets of 0x0b, salt 0x000102..0c, info 0xf0f1..f9, L=42.
+        let okm = kdf_derive(
+            &unhex(RFC5869_IKM),
+            &unhex(RFC5869_SALT),
+            &unhex(RFC5869_INFO),
+            42,
+        )
+        .expect("HKDF expand must succeed within the 255×HashLen bound");
+        assert_eq!(
+            okm,
+            unhex(RFC5869_OKM),
+            "RFC 5869 §A.1 OKM (42 octets) must match exactly"
+        );
+    }
 }

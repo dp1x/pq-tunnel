@@ -260,4 +260,33 @@ mod tests {
             "signature must not be all zeros"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Known-answer tests (M5.1) — FIPS 204 via Wycheproof `testvectors_v1`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ml_dsa_65_wycheproof_verify_kat() {
+        use crate::kat_vectors::{DSA_MSG, DSA_PK, DSA_SIG, unhex};
+        let pk = MlDsaPublicKey::from_bytes(&unhex(DSA_PK)).expect("pk decode");
+        let sig = MlDsaSignature::from_bytes(&unhex(DSA_SIG)).expect("sig decode");
+        let msg = unhex(DSA_MSG);
+        let valid = verify(&pk, &msg, &sig).expect("verify");
+        assert!(
+            valid,
+            "Wycheproof ML-DSA-65 tcId 1 (valid) signature must verify"
+        );
+    }
+
+    #[test]
+    fn ml_dsa_65_wycheproof_keygen_kat() {
+        use crate::kat_vectors::{DSA_KEYGEN_PK, DSA_SEED, unhex};
+        let seed: [u8; 32] = <[u8; 32]>::try_from(unhex(DSA_SEED).as_slice()).unwrap();
+        let kp = MlDsaKeypair::from_seed(&seed);
+        assert_eq!(
+            kp.public.encode(),
+            unhex(DSA_KEYGEN_PK),
+            "FIPS 204 keyGen must reproduce the Wycheproof public key from the seed"
+        );
+    }
 }

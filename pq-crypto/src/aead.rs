@@ -209,4 +209,37 @@ mod tests {
         let _ = encrypt(&key, &nonce, &pt_copy, b"").expect("encrypt");
         assert_eq!(&pt_copy, &plaintext);
     }
+
+    // -----------------------------------------------------------------------
+    // Known-answer test (M5.1) — RFC 8439 §2.8.2 (D21)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rfc8439_2_8_2_chacha20_poly1305_kat() {
+        use crate::kat_vectors::{
+            RFC8439_AAD, RFC8439_CIPHERTEXT_AND_TAG, RFC8439_KEY, RFC8439_NONCE, RFC8439_PLAINTEXT,
+            unhex,
+        };
+        let key = AeadKey::from_bytes(
+            <[u8; AEAD_KEY_BYTES]>::try_from(unhex(RFC8439_KEY).as_slice()).unwrap(),
+        );
+        let nonce = AeadNonce::from_bytes(
+            <[u8; AEAD_NONCE_BYTES]>::try_from(unhex(RFC8439_NONCE).as_slice()).unwrap(),
+        );
+        let plaintext = unhex(RFC8439_PLAINTEXT);
+        let aad = unhex(RFC8439_AAD);
+
+        let ct = encrypt(&key, &nonce, &plaintext, &aad).expect("encrypt");
+        assert_eq!(
+            ct,
+            unhex(RFC8439_CIPHERTEXT_AND_TAG),
+            "RFC 8439 §2.8.2 ciphertext‖tag must match exactly"
+        );
+
+        let recovered = decrypt(&key, &nonce, &ct, &aad).expect("decrypt");
+        assert_eq!(
+            recovered, plaintext,
+            "RFC 8439 §2.8.2 decrypt must recover the plaintext"
+        );
+    }
 }
