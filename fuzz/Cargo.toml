@@ -10,7 +10,6 @@ cargo-fuzz = true
 [dependencies]
 pq-tunnel-core = { path = "../pq-tunnel-core" }
 pq-crypto = { path = "../pq-crypto" }
-arbitrary = "1"
 libfuzzer-sys = "0.4"
 # cargo-fuzz injects libfuzzer-sys at runtime via RUSTFLAGS; the target file
 # just needs to compile under it. No additional deps required.

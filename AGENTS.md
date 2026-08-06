@@ -320,11 +320,9 @@ cargo test --workspace --target x86_64-pc-windows-msvc
 ## Fuzz targets (x86_64-msvc only; requires `cargo-fuzz`)
 The fuzz crate lives in `fuzz/` (own workspace). `fuzz/Cargo.toml` has
 `[package.metadata] cargo-fuzz = true` and `libfuzzer-sys` as a dependency.
-3 targets use the modern `fuzz_target!` harness; the other 4
-(`wire_packet_from_bytes`, `inner_plaintext_decode`, `envelope_decrypt`,
-`replay_window`) still export the legacy `rust_fuzzer_test_input` symbol and
-must be migrated before cargo-fuzz 0.13+ can link them (it fails with
-LNK1561). Run from the repo root with the cross-target flag:
+All 7 targets use the modern `fuzz_target!` harness (no legacy
+`rust_fuzzer_test_input` exports remain). Run from the repo root with the
+cross-target flag:
 ```sh
 cargo +nightly fuzz run <target_name> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 # Targets: wire_packet_from_bytes, inner_plaintext_decode, envelope_decrypt,

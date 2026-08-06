@@ -10,9 +10,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use pq_tunnel_core::{
-    ClientConfirm, ClientHello, HandshakeFragment, ServerHello, WirePacket, fragment_message,
+    ClientConfirm, ClientHello, HandshakeFragment, M1_BODY_LEN, M2_BODY_LEN, M3_BODY_LEN,
+    PACKET_SIZE, PROTOCOL_VERSION, SESSION_ID_LEN, ServerHello, WirePacket, fragment_message,
     is_handshake_fragment, message_body_len, th1_from_m1, th2_from_m1_m2, th3_from_m1_m2_m3,
-    M1_BODY_LEN, M2_BODY_LEN, M3_BODY_LEN, PACKET_SIZE, PROTOCOL_VERSION, SESSION_ID_LEN,
 };
 
 fuzz_target!(|data: &[u8]| {
