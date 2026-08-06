@@ -69,4 +69,60 @@ mod tests {
             "different keypairs must produce different shared secrets"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Known-answer test (M5.1) — RFC 7748 §6.1 (D21)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn x25519_rfc7748_6_1_kat() {
+        use crate::kat_vectors::{
+            RFC7748_ALICE_PRIVATE, RFC7748_ALICE_PUBLIC, RFC7748_BOB_PRIVATE, RFC7748_BOB_PUBLIC,
+            RFC7748_SHARED, unhex,
+        };
+        let alice_secret = StaticSecret::from(
+            <[u8; 32]>::try_from(unhex(RFC7748_ALICE_PRIVATE).as_slice()).unwrap(),
+        );
+        let bob_secret = StaticSecret::from(
+            <[u8; 32]>::try_from(unhex(RFC7748_BOB_PRIVATE).as_slice()).unwrap(),
+        );
+
+        // Public-key derivation: X25519(scalar, basepoint).
+        let alice_pair = X25519Keypair {
+            public: PublicKey::from(&alice_secret),
+            secret: alice_secret,
+        };
+        let bob_pair = X25519Keypair {
+            public: PublicKey::from(&bob_secret),
+            secret: bob_secret,
+        };
+        let alice_expected: [u8; 32] =
+            <[u8; 32]>::try_from(unhex(RFC7748_ALICE_PUBLIC).as_slice()).unwrap();
+        let bob_expected: [u8; 32] =
+            <[u8; 32]>::try_from(unhex(RFC7748_BOB_PUBLIC).as_slice()).unwrap();
+        assert_eq!(
+            alice_pair.public.to_bytes(),
+            alice_expected,
+            "RFC 7748 §6.1 Alice's public key must match"
+        );
+        assert_eq!(
+            bob_pair.public.to_bytes(),
+            bob_expected,
+            "RFC 7748 §6.1 Bob's public key must match"
+        );
+
+        // Shared-secret computation, both directions.
+        let shared_expected: [u8; 32] =
+            <[u8; 32]>::try_from(unhex(RFC7748_SHARED).as_slice()).unwrap();
+        assert_eq!(
+            alice_pair.diffie_hellman(&bob_pair.public),
+            shared_expected,
+            "RFC 7748 §6.1 shared secret K must match (Alice side)"
+        );
+        assert_eq!(
+            bob_pair.diffie_hellman(&alice_pair.public),
+            shared_expected,
+            "RFC 7748 §6.1 shared secret K must match (Bob side)"
+        );
+    }
 }
