@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "pq_tunnel_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pq-tunnel"
 path = "src/main.rs"

@@ -1079,6 +1079,15 @@ pub async fn run_client_manager<T: HandshakeTransport>(
     }
     let mut was_ready = false;
     let mut ticker = tokio::time::interval(TICK_INTERVAL);
+    // The handshake retransmit timer is created ONCE and advanced only when it
+    // fires (or the manager re-arms after a Close). Recomputing it from
+    // `next_delay()` on *every* iteration lets continuous application data
+    // (which keeps `app_rx` ready) indefinitely postpone the retransmit — and
+    // with a passive server the retransmit budget is the only path to client
+    // establishment (D15). Pinning the deadline preserves the retransmit
+    // schedule under app load.
+    let retransmit = client_retransmit_timer(manager);
+    tokio::pin!(retransmit);
     loop {
         // D15 confirmation signal (informational for the app; outbound is not
         // gated — see module docs).
@@ -1091,11 +1100,6 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                     .map_err(|_| ManagerError::AppClosed)?;
             }
         }
-
-        let retransmit = manager
-            .next_delay()
-            .map(tokio::time::sleep)
-            .unwrap_or_else(|| tokio::time::sleep(Duration::MAX));
 
         tokio::select! {
             r = transport.recv() => match r {
@@ -1123,42 +1127,47 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                             .await
                             .map_err(|_| ManagerError::AppClosed)?;
                         rearm_client(transport, manager).await?;
+                        retransmit.set(client_retransmit_timer(manager));
                     }
                     ManagerEvent::Established { .. } | ManagerEvent::None => {}
                 },
             },
-            cmd = app_rx.recv() => match cmd {
-                Some(payload) => match manager.app_outbound(&payload) {
-                    Ok(ManagerEvent::SendPacket { packet, peer }) => {
-                        transport.send_to(&packet, peer).await?;
-                    }
-                    Ok(ManagerEvent::Closed { sid, reason }) => {
-                        was_ready = false;
-                        app_tx
-                            .send(ManagerNotification::Closed { sid, reason })
-                            .await
-                            .map_err(|_| ManagerError::AppClosed)?;
-                        rearm_client(transport, manager).await?;
-                    }
-                    // Local condition only (app pushed data while the client is
-                    // Handshaking / re-establishing). Do not tear down the tunnel;
-                    // the app can retry once the Ready notification arrives.
-                    Err(ManagerError::NoSession) => {}
-                    // Oversized app payload: benign local over-send into the fixed
-                    // payload slot. Drop silently (tunnel stays up); the app should
-                    // chunk to <= PAYLOAD_LEN. Mirrors D1; only WrongLength is
-                    // demoted — crypto/handshake/transport faults still propagate.
-                    Err(ManagerError::Session(SessionError::Codec(CodecError::WrongLength { .. }))) => {}
-                    Err(e) => return Err(e),
-                    _ => {}
-                },
-                None => return Ok(()),
+            cmd = app_rx.recv() => {
+                match cmd {
+                    Some(payload) => match manager.app_outbound(&payload) {
+                        Ok(ManagerEvent::SendPacket { packet, peer }) => {
+                            transport.send_to(&packet, peer).await?;
+                        }
+                            Ok(ManagerEvent::Closed { sid, reason }) => {
+                                was_ready = false;
+                                app_tx
+                                    .send(ManagerNotification::Closed { sid, reason })
+                                    .await
+                                    .map_err(|_| ManagerError::AppClosed)?;
+                                rearm_client(transport, manager).await?;
+                                retransmit.set(client_retransmit_timer(manager));
+                            }
+                            // Local condition only (app pushed data while the client
+                            // is Handshaking / re-establishing). Do not tear down the
+                            // tunnel; the app can retry once Ready arrives.
+                            Err(ManagerError::NoSession) => {}
+                            // Oversized app payload: benign local over-send into the
+                            // fixed payload slot; drop silently (tunnel stays up).
+                            Err(ManagerError::Session(SessionError::Codec(
+                                CodecError::WrongLength { .. },
+                            ))) => {}
+                            Err(e) => return Err(e),
+                            _ => {}
+                        },
+                    None => return Ok(()),
+                }
             },
-            _ = retransmit => match manager.on_timer()? {
+            _ = &mut retransmit => match manager.on_timer()? {
                 ManagerEvent::Send { packets, peer } => {
                     for p in &packets {
                         transport.send_to(p, peer).await?;
                     }
+                    retransmit.set(client_retransmit_timer(manager));
                 }
                 ManagerEvent::Closed { sid, reason } => {
                     was_ready = false;
@@ -1167,8 +1176,9 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                         .await
                         .map_err(|_| ManagerError::AppClosed)?;
                     rearm_client(transport, manager).await?;
+                    retransmit.set(client_retransmit_timer(manager));
                 }
-                _ => {}
+                _ => retransmit.set(client_retransmit_timer(manager)),
             },
             _ = ticker.tick() => {
                 for ev in manager.tick(Instant::now()) {
@@ -1179,11 +1189,23 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                             .await
                             .map_err(|_| ManagerError::AppClosed)?;
                         rearm_client(transport, manager).await?;
+                        retransmit.set(client_retransmit_timer(manager));
                     }
                 }
             }
         }
     }
+}
+
+/// The handshake retransmit timer, computed once per phase — NOT refreshed on
+/// every driver iteration — so application traffic cannot starve the
+/// retransmit schedule (and silently stall establishment, which a passive
+/// server completes only via the retransmit budget — D15).
+fn client_retransmit_timer(manager: &ClientSessionManager) -> tokio::time::Sleep {
+    manager
+        .next_delay()
+        .map(tokio::time::sleep)
+        .unwrap_or_else(|| tokio::time::sleep(Duration::MAX))
 }
 
 /// Re-establish: start a fresh handshake (fresh sid, D16) after a close.

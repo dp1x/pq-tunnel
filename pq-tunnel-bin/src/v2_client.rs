@@ -1,40 +1,37 @@
 //! v2 (datagram-plane) client driver wiring.
 //!
-//! Owns the UDP transport, the [`ClientSessionManager`], and the two channel
-//! legs that connect them to the tun device:
+//! Owns the UDP transport, the [`ClientSessionManager`], and the relay that
+//! connects them to local applications (D18):
 //!
-//! * TUN read → outbound app channel (zero-padded by the manager into the
-//!   fixed `PAYLOAD_LEN` slot).
-//! * Inbound [`ManagerNotification::Data`] → TUN write.  The slot is
-//!   zero-padded, so the real IP packet length is recovered from the IP
-//!   header (IPv4 total-length / IPv6 payload-length) before writing.
+//! * The **relay socket** (`--relay-listen`) is the application-facing
+//!   endpoint: relay-framed datagrams (destination in the header) arrive from
+//!   any local app, are recorded `destination → app endpoint`, and are passed
+//!   to the manager, which zero-pads them into the fixed `PAYLOAD_LEN` slot.
+//! * Inbound [`ManagerNotification::Data`] (framed replies) are routed back to
+//!   the app endpoint that last spoke to the reply's destination
+//!   (last-writer-wins; D18).
 //!
 //! The driver task returned by [`run_client_manager`] owns retransmit timers,
 //! liveness, and automatic re-establishment (D16): a [`ManagerNotification::Closed`]
-//! does not end the client — the loop keeps the tunnel up while the manager
+//! does not end the client — the loop keeps the relay up while the manager
 //! re-arms.  Manager and task errors are surfaced, never swallowed.
 
-use std::net::IpAddr;
-
 use pq_tunnel_core::{
-    ClientSessionManager, HandshakeV2ClientConfig, InnerPlaintext, ManagerNotification,
-    PAYLOAD_LEN, SessionLimits, UdpTransport, run_client_manager,
+    ClientSessionManager, HandshakeV2ClientConfig, ManagerNotification, SessionLimits,
+    UdpTransport, run_client_manager,
 };
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::ClientArgs;
 use crate::identity;
-use crate::packet_len::ip_packet_len;
+use crate::relay;
 
 /// Run the v2 client to completion: provision identities, establish the UDP
-/// transport + session manager, and pump traffic between the tun and the
-/// manager via the two channel legs.
-pub async fn run(
-    tun_ip: IpAddr,
-    tun_mask: IpAddr,
-    args: &ClientArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// transport + session manager, and pump traffic between the relay socket and
+/// the manager via the two channel legs.
+pub async fn run(args: &ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
     let identity_path = args
         .identity
         .as_deref()
@@ -56,7 +53,7 @@ pub async fn run(
         .await
         .map_err(|e| format!("UDP connect to {} failed: {e}", args.remote))?;
 
-    let (app_tx, mut app_rx) = mpsc::channel::<ManagerNotification>(64);
+    let (app_tx, app_rx) = mpsc::channel::<ManagerNotification>(64);
     let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
 
     // The manager driver owns all transport I/O, retransmit timers, and D16
@@ -67,77 +64,39 @@ pub async fn run(
             async move { run_client_manager(&mut udp, &mut manager, app_tx, data_rx).await },
         );
 
-    // The data plane carries fixed slots; the tun MTU must not exceed one
-    // payload so a single tun read always fits.
-    let tun_mtu = args.mtu.min(u16::try_from(PAYLOAD_LEN).unwrap_or(u16::MAX));
-    let tun = pq_tun::TunDevice::create("pq-tun", tun_ip, tun_mask, tun_mtu)
-        .map_err(|e| format!("TUN creation failed: {e}"))?;
-    let (mut reader, mut writer) = tun.split();
-    info!("Tunnel established. {} is up.", args.tun_addr);
-
-    // TUN → manager outbound channel.
-    let forwarder = tokio::spawn(async move {
-        let mut buf = vec![0u8; PAYLOAD_LEN];
-        loop {
-            match reader.read_packet(&mut buf).await {
-                Ok(n) => {
-                    // Driver gone (channel closed) → stop forwarding.
-                    if data_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("TUN read error: {e}");
-                    break;
-                }
-            }
-        }
-    });
-
-    // Inbound notifications → TUN.
-    loop {
-        match app_rx.recv().await {
-            // App channel closed: the driver has ended (error or shutdown).
-            None => break,
-            Some(ManagerNotification::Ready { sid }) => {
-                info!("Session confirmed (D15), sid={sid:02x?}");
-            }
-            Some(ManagerNotification::Data { inner, .. }) => {
-                forward_inner(&mut writer, &inner).await?;
-            }
-            Some(ManagerNotification::Closed { sid, reason }) => {
-                warn!("Session closed ({reason:?}) sid={sid:02x?}; re-establishing");
-                // D16: the manager re-arms in the background; the tunnel stays up.
-            }
-            Some(ManagerNotification::Established { .. }) => {
-                // Server-only notification; not emitted on the client path.
-            }
-        }
+    // The relay is the application endpoint: local apps send relay-framed
+    // datagrams here; the relay records destinations and forwards into the
+    // tunnel, and routes framed replies back to the right app endpoint.
+    let relay_socket = UdpSocket::bind(args.relay_listen)
+        .await
+        .map_err(|e| format!("relay bind on {} failed: {e}", args.relay_listen))?;
+    let local = relay_socket
+        .local_addr()
+        .map_err(|e| format!("failed to read relay bound address: {e}"))?;
+    // Fail closed on non-loopback relay binds: the relay records unauthenticated
+    // `destination → app endpoint` bindings (last-writer-wins) and would
+    // otherwise act as an open relay / reply-splice for anyone able to reach the
+    // socket.  Loopback-only keeps the app-facing surface local by construction
+    // (D18; revisit with an explicit opt-in if a LAN relay is ever wanted).
+    if !local.ip().is_loopback() {
+        return Err(format!(
+            "refusing to bind the relay on non-loopback address {local}: \
+             relay bindings are unauthenticated and must stay local"
+        )
+        .into());
     }
+    info!("Relay listening on {local} (destination header is app-facing, D18)");
 
-    // Shutdown: stop the TUN forwarder (drops `data_tx`), which lets the
-    // manager driver observe app-channel closure and return.
-    forwarder.abort();
+    // The relay returns when the manager channel closes (driver ended).  It
+    // holds `data_tx`, so dropping it after return lets the driver observe
+    // channel closure too; await it for a clean error report.
+    relay::run(relay_socket, data_tx, app_rx)
+        .await
+        .map_err(|e| format!("relay failed: {e}"))?;
+
     match driver.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(format!("client manager driver failed: {e}").into()),
         Err(join) => Err(format!("client manager task panicked: {join}").into()),
     }
-}
-
-async fn forward_inner(
-    writer: &mut pq_tun::TunWriter,
-    inner: &InnerPlaintext,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let len = ip_packet_len(&inner.payload);
-    if len == 0 {
-        // Not an IP packet in the slot (or malformed length): drop, fail-safe.
-        warn!("dropping non-IP payload (len=0)");
-        return Ok(());
-    }
-    if let Err(e) = writer.write_packet(&inner.payload[..len]).await {
-        // TUN write failure: the interface is gone; stop the client.
-        return Err(format!("TUN write failed: {e}").into());
-    }
-    Ok(())
 }
