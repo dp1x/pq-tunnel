@@ -14,11 +14,11 @@ counter, per-direction nonce accounting, and a single-event-per-call session
 manager with DoS-rate limiting and fail-secure semantics.
 
 > **Status:** The v2 data plane is implemented and tested
-> (`cargo test --workspace`: 296 tests pass). The v0.2.0-alpha CLI
-> (`pq-tunnel` with `keygen`/`server`/`client` subcommands) is under
-> construction: identity provisioning (`keygen`) is complete, the v2 server and
-> client paths run, and the legacy QUIC/TLS transport is transitional and will
-> be retired; it is **not** the security-relevant code path.
+> (`cargo test --workspace`). The v0.2.0-alpha CLI (`pq-tunnel` with
+> `keygen`/`server`/`client` subcommands) provides identity provisioning
+> (`keygen`), a roster-authenticated v2 server with a forwarding backend, a v2
+> client exposing a local UDP relay, and a fixed-rate cover-traffic scheduler.
+> The pre-v2 QUIC/TLS transport has been removed.
 
 ---
 
@@ -99,19 +99,19 @@ pq-tunnel server --listen 0.0.0.0:4433 \          # v2 UDP (default)
 
 pq-tunnel client --remote 192.0.2.1:4433 \        # v2 UDP (default)
                  --identity client-id.pqti \
-                 --server-key server-pub.pqti --tun-addr 10.0.0.1/24
+                 --server-key server-pub.pqti
 ```
 
-The v2 client is TUN-based and root/admin privileged (a local UDP relay is on
-the roadmap). `--transport quic` selects the transitional v1 path — see Known
-issues.
+The v2 client exposes a local UDP relay on `127.0.0.1:51821` (loopback-only)
+that forwards application datagrams into the tunnel; the server is a
+forwarding backend by default (D18).
 
 ## Build
 
 Tunnel is a Rust workspace. The canonical build/test target is
-`x86_64-pc-windows-msvc` (the default host `aarch64-pc-windows-msvc` cannot
-compile the `aws-lc-sys` dependency from `rustls`). On an aarch64 Windows
-host, select the x86_64 **toolchain** as well as the target:
+`x86_64-pc-windows-msvc` (the development host is aarch64 Windows; the
+`--target` flag pins the tested toolchain). On an aarch64 Windows host, select
+the x86_64 **toolchain** as well as the target:
 `cargo +stable-x86_64-pc-windows-msvc test --workspace --target
 x86_64-pc-windows-msvc`. On a non-macOS/ARM host you may drop the `--target`
 flag.
@@ -183,15 +183,9 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 - The v2 handshake is validated at the unit/campaign level; **interoperability
   with other implementations is not yet verified** (no independent
   implementation exists yet).
-- The transitional v1 QUIC/TLS path (the `pq-tunnel --transport quic` legacy
-  paths and the corresponding `pq-tunnel-core` modules) performs **no
-  server-certificate validation** (a `SkipServerVerification` verifier). It is
-  a legacy bootstrap/development path and is **not** part of the v2 security
-  model — the v2 raw-UDP data plane with mutual ML-DSA authentication is the
-  security-relevant path.
-  Do not deploy the v1 binaries against untrusted networks.
-- The cover-traffic *scheduler* (fixed-rate pacing) is not implemented;
-  only the `cover_packet` hooks exist (see [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)).
+- Cover traffic defaults to a fixed 2 Mbps pure-periodic schedule; an
+  operator-chosen adaptive shaper is future work (see
+  [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D19).
 - Rekeying is close-and-re-establish (no in-place key rotation).
 - Fuzz execution is unavailable on Windows/VBS hosts (see Build above), and 4
   legacy fuzz targets still use the pre-cargo-fuzz-0.13 harness style.
@@ -199,19 +193,16 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 
 ## Future work
 
-- Cover-traffic scheduler + pacing (metadata resistance at scale).
+- Adaptive cover-traffic shaper (user-selected policy; never a default).
 - Interoperability testing against a second implementation.
-- crates.io publishing of library crates (`pq-crypto`, `pq-tunnel-core`,
-  `pq-tun`, `pq-proxy`).
+- crates.io publishing of library crates (`pq-crypto`, `pq-tunnel-core`).
 
 ## Contributing
 
 See [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) for engineering
 guidance. All submissions must pass `cargo fmt --check` and
 `cargo test --workspace` on `x86_64-pc-windows-msvc`; `cargo clippy
---all-targets` must add **no new warnings** (the legacy `HybridIdentity`
-paths carry tracked deprecation warnings scheduled for removal with the v1
-transport).
+--all-targets` must add **no new warnings**.
 
 ## License
 

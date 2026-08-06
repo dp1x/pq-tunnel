@@ -8,16 +8,10 @@ pub mod transcript;
 /// Classical X25519 key exchange.
 ///
 /// X25519 is the classical leg of Tunnel's hybrid key-establishment profile
-/// (ML-KEM-768 + X25519, both ephemeral — DESIGN_DECISIONS D13). It is
+/// (ML-KEM-768 + X25519, both ephemeral �?" DESIGN_DECISIONS D13). It is
 /// deprecated as a *sole* mechanism: X25519 alone provides no post-quantum
 /// protection and must never be used as the only key-establishment component.
 pub mod classical;
-
-#[deprecated(
-    since = "0.1.0",
-    note = "HybridIdentity XOR-combiner is legacy; use the pq-crypto kdf module for key derivation. Scheduled for removal in v2.1."
-)]
-pub mod hybrid;
 
 pub use aead::{
     AEAD_KEY_BYTES, AEAD_NONCE_BYTES, AEAD_TAG_BYTES, AeadKey, AeadNonce, decrypt, decrypt_no_aad,
@@ -42,5 +36,3 @@ pub use signature::{
 pub use transcript::{Transcript, sha256};
 
 pub use classical::{X25519Keypair, X25519PublicKey, X25519SecretKey};
-#[allow(deprecated)]
-pub use hybrid::HybridIdentity;

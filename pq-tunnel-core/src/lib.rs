@@ -1,9 +1,6 @@
-pub mod client;
 pub mod codec;
-pub mod config;
 pub mod envelope;
 pub mod error;
-pub mod handshake;
 mod handshake_v2;
 pub use handshake_v2::{
     ClientConfig as HandshakeV2ClientConfig, ClientConfirm, ClientEvent, ClientHandshake,
@@ -20,8 +17,6 @@ pub mod metrics;
 pub mod nonce;
 pub mod replay;
 pub mod scheduler;
-pub mod server;
-pub mod session;
 mod session_manager;
 pub mod state;
 pub mod udp;
@@ -33,21 +28,15 @@ pub use session_manager::{
     run_server_manager,
 };
 
-pub use client::connect;
 pub use codec::{
     AEAD_NONCE_LEN, AEAD_TAG_LEN, Direction, HEADER_LEN, INNER_PLAINTEXT_LEN, InnerPlaintext,
     MessageType, PACKET_NONCE_LEN, PACKET_SIZE, PAYLOAD_LEN, PROTOCOL_VERSION, PacketHeader,
     SESSION_ID_LEN, WirePacket,
 };
-pub use config::TunnelConfig;
 pub use envelope::{CipherSession, Role};
 pub use error::CodecError;
-pub use error::TunnelError;
-pub use handshake::{HandshakeError, HandshakeResult, client_handshake, server_handshake};
 pub use metrics::SessionMetrics;
 pub use scheduler::{CoverPolicy, CoverScheduler, DEFAULT_COVER_RATE_BPS, interval_from_rate_bps};
-pub use server::listen;
-pub use session::{Listener, Session};
 pub use state::{InvalidTransition, ProtocolState};
 pub use udp::{UdpError, UdpTransport};
 pub use wire_session::{SessionError, WireSession};

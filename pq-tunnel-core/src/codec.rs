@@ -98,10 +98,9 @@ pub const VERSION_LEN: usize = 1;
 /// intentionally centralized so it can be tuned per deployment.
 ///
 /// This is the canonical Tunnel on-wire packet size, re-exported as
-/// `pq_tunnel_core::PACKET_SIZE`.  It is **not** interchangeable with
-/// `pq_tunnel_core::handshake::PACKET_SIZE` (8192), the legacy v1 QUIC handshake
-/// framing retained only for the transitional `handshake` path and replaced by
-/// this codec in Phase 5.
+/// `pq_tunnel_core::PACKET_SIZE`.  (The pre-v2 QUIC transport used an 8192-byte
+/// framing that was byte-incompatible with this codec; that transport has been
+/// removed, and 1280 is the only on-wire packet size.)
 pub const PACKET_SIZE: usize = 1280;
 
 // Field widths (all on-wire and inner fields are fixed-size by design).
