@@ -17,8 +17,8 @@ use std::time::Instant;
 use libfuzzer_sys::fuzz_target;
 use pq_tunnel_core::{
     ClientHandshake, ClientSessionManager, HandshakeV2ClientConfig, HandshakeV2ServerConfig,
-    ManagerEvent, ServerSessionManager, SessionLimits, WirePacket, PACKET_SIZE, PROTOCOL_VERSION,
-    SESSION_ID_LEN,
+    ManagerEvent, PACKET_SIZE, PROTOCOL_VERSION, SESSION_ID_LEN, ServerSessionManager,
+    SessionLimits, WirePacket,
 };
 
 struct Configs {

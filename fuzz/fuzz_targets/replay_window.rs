@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![no_main]
 
 //! Fuzz target: `ReplayWindow::accept`.
 //!
@@ -6,12 +6,12 @@
 //! sliding-window replay detector.  Must never panic and must never accept a
 //! counter twice.
 
+use libfuzzer_sys::fuzz_target;
 use pq_tunnel_core::replay::ReplayWindow;
 
-#[no_mangle]
-pub extern "C" fn rust_fuzzer_test_input(data: &[u8]) -> i32 {
+fuzz_target!(|data: &[u8]| {
     if data.len() < 8 {
-        return 0;
+        return;
     }
 
     let counter = u64::from_le_bytes([
@@ -25,12 +25,17 @@ pub extern "C" fn rust_fuzzer_test_input(data: &[u8]) -> i32 {
         let _ = w.accept(counter);
         if idx + 8 <= data.len() {
             let c = u64::from_le_bytes([
-                data[idx], data[idx + 1], data[idx + 2], data[idx + 3],
-                data[idx + 4], data[idx + 5], data[idx + 6], data[idx + 7],
+                data[idx],
+                data[idx + 1],
+                data[idx + 2],
+                data[idx + 3],
+                data[idx + 4],
+                data[idx + 5],
+                data[idx + 6],
+                data[idx + 7],
             ]);
             let _ = w.accept(c);
             idx += 8;
         }
     }
-    0
-}
+});

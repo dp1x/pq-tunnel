@@ -14,8 +14,9 @@ use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
 use pq_tunnel_core::{
-    ClientHandshake, HandshakeV2ClientConfig, HandshakeV2ServerConfig, ServerHandshake, WirePacket,
-    fragment_message, message_body_len, PACKET_SIZE, PROTOCOL_VERSION, SESSION_ID_LEN,
+    ClientHandshake, HandshakeV2ClientConfig, HandshakeV2ServerConfig, PACKET_SIZE,
+    PROTOCOL_VERSION, SESSION_ID_LEN, ServerHandshake, WirePacket, fragment_message,
+    message_body_len,
 };
 
 struct Configs {

@@ -1,14 +1,13 @@
-#![allow(dead_code)]
+#![no_main]
 
 //! Fuzz target: `InnerPlaintext::decode`.
 //!
 //! Feeds arbitrary byte sequences to the inner plaintext decoder.  The decoder
 //! must reject invalid input without panicking.
 
+use libfuzzer_sys::fuzz_target;
 use pq_tunnel_core::InnerPlaintext;
 
-#[no_mangle]
-pub extern "C" fn rust_fuzzer_test_input(data: &[u8]) -> i32 {
+fuzz_target!(|data: &[u8]| {
     let _ = InnerPlaintext::decode(data);
-    0
-}
+});

@@ -143,10 +143,9 @@ cargo +nightly fuzz run <target> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 ```
 
 The `cargo-fuzz` ASan runtime is not supported on this Windows host under VBS;
-fuzz **execution** should be run on a Linux host. 3 of the 7 targets use the
-modern nightly harness (`fuzz_target!`) and compile under it; the other 4 still
-export the legacy `rust_fuzzer_test_input` symbol and are pending harness
-migration. All targets define the never-panic contract.
+fuzz **execution** should be run on a Linux host. All 7 targets use the modern
+nightly harness (`fuzz_target!`) and compile under it. All targets define the
+never-panic contract.
 
 ## Tests
 
@@ -156,9 +155,9 @@ migration. All targets define the never-panic contract.
   packet length) — single `pq-tunnel` binary with `keygen`/`server`/`client`
   subcommands
 - `pq-proxy`, `pq-tun`: 0 unit tests (library build verified)
-- 7 `cargo-fuzz` targets are defined; the 3 modern (`fuzz_target!`) targets
-  compile under the fuzz harness (execution requires an ASan-capable host —
-  see Fuzzing above).
+- 7 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`
+  harness and compile under the fuzz harness (execution requires an
+  ASan-capable host — see Fuzzing above).
 
 ```sh
 cargo fmt --check
@@ -187,8 +186,8 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
   operator-chosen adaptive shaper is future work (see
   [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D19).
 - Rekeying is close-and-re-establish (no in-place key rotation).
-- Fuzz execution is unavailable on Windows/VBS hosts (see Build above), and 4
-  legacy fuzz targets still use the pre-cargo-fuzz-0.13 harness style.
+- Fuzz execution is unavailable on Windows/VBS hosts (see Build above); all 7
+  fuzz targets use the modern `fuzz_target!` harness.
 - v0.1.0-alpha is **not** API- or wire-stable; expect breaking changes before 1.0.
 
 ## Future work
