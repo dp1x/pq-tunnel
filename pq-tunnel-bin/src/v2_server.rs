@@ -1,22 +1,23 @@
 //! v2 (datagram-plane) server driver wiring.
 //!
-//! Owns the UDP transport, the [`ServerSessionManager`], and the two channel
-//! legs that connect them to the application:
+//! Owns the UDP transport, the [`ServerSessionManager`], and two channel legs:
 //!
 //! * Inbound [`ManagerNotification`]s (handshake events, decrypted data,
-//!   closures) → application.
-//! * Outbound [`ServerAppCommand`]s (application data keyed by `sid`) →
+//!   closures) → the forwarding application.
+//! * Outbound [`ServerAppCommand`]s (forwarded replies keyed by `sid`) →
 //!   manager → encrypted packets back to the session's peer.
 //!
-//! The application is a byte-echo relay, mirroring the v1 server's `run_data_loop`
-//! semantics: every decrypted `Data` payload is trimmed to its real IP packet
-//! length (the wire slot is zero-padded) and sent back to the *same session*.
-//! Cover traffic is consumed silently by the manager and never reaches the app.
+//! The application is a **forwarding backend** (D18): each decrypted relay
+//! message is dispatched to the real destination through a per-
+//! `(session, destination)` connected UDP socket; replies are relabeled and
+//! returned to the same session.  Cover traffic is consumed silently by the
+//! manager and never reaches the app.  `--echo` (opt-in) returns the framed
+//! datagram to the same session, preserving the v1-era diagnostics loop.
 //!
 //! The driver task returned by [`run_server_manager`] owns transport I/O and
 //! periodic `tick`s (idle eviction, lifetime cap, D16).  It exits only on a
-//! transport/manager error or when the app channel closes.  Manager and task
-//! errors are surfaced, never swallowed.
+//! transport/manager error or when both [] command channels close.  Manager
+//! and task errors are surfaced, never swallowed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,11 +31,11 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ServerArgs;
+use crate::forward::Forwarder;
 use crate::identity;
-use crate::packet_len::ip_packet_len;
 
 /// Run the v2 server to completion: provision identity + roster (fail closed),
-/// bind the UDP transport, and echo app data back to its own session.
+/// bind the UDP transport, and run the forwarding backend (or echo, opt-in).
 pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     let identity_path = args
         .identity
@@ -91,59 +92,47 @@ pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
             async move { run_server_manager(&mut udp, &mut manager, app_tx, cmd_rx).await },
         );
 
-    // Echo application: relay every decrypted Data payload back to the same
-    // sid.  The driver's notification channel closing (transport/app error or
-    // shutdown) ends this loop.
-    let echo_total = total_handshakes.clone();
-    let echo_active = active_sessions.clone();
-    let echo_handle = tokio::spawn(async move {
+    // Forwarding application: dispatch every decrypted relay message to its
+    // real destination; replies return through the manager as commands for the
+    // same sid.  The driver's notification channel closing (transport/app
+    // error or shutdown) ends this loop.
+    let echo = args.echo;
+    let fwd_total = total_handshakes.clone();
+    let fwd_active = active_sessions.clone();
+    let app_task = tokio::spawn(async move {
+        let mut forwarder = Forwarder::new(echo, cmd_tx);
         loop {
             match app_rx.recv().await {
                 // App channel closed: the driver has ended (error or shutdown).
                 None => break,
                 Some(ManagerNotification::Data { sid, inner }) => {
-                    let len = ip_packet_len(&inner.payload);
-                    if len == 0 {
-                        // Not an IP packet in the slot (or malformed length):
-                        // drop, fail-safe — never relay garbage.
-                        warn!("dropping non-IP payload (len=0) sid={sid:02x?}");
-                        continue;
-                    }
-                    // Echo the real IP packet to the same session.
-                    if cmd_tx
-                        .send(ServerAppCommand {
-                            sid,
-                            payload: inner.payload[..len].to_vec(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
+                    forwarder.handle(sid, &inner.payload).await;
                 }
                 Some(ManagerNotification::Established { sid, peer }) => {
-                    echo_total.fetch_add(1, Ordering::Relaxed);
-                    echo_active.fetch_add(1, Ordering::Relaxed);
+                    fwd_total.fetch_add(1, Ordering::Relaxed);
+                    fwd_active.fetch_add(1, Ordering::Relaxed);
                     info!("Session established (D13) sid={sid:02x?} peer={peer}");
                 }
                 Some(ManagerNotification::Closed { sid, reason }) => {
-                    echo_active.fetch_sub(1, Ordering::Relaxed);
+                    fwd_active.fetch_sub(1, Ordering::Relaxed);
                     warn!("Session closed ({reason:?}) sid={sid:02x?}");
-                    // Server is passive: the manager already removed the
-                    // session; nothing to re-arm.
+                    forwarder.on_session_closed(sid);
                 }
                 Some(ManagerNotification::Ready { .. }) => {
                     // Client-only notification; not emitted on the server path.
                 }
             }
         }
+        // Drop the forwarder's reader tasks + command sender: the manager
+        // driver observes the (now-empty) command channel and returns.
+        forwarder.shutdown();
     });
 
     // Both tasks wind down together: the driver drops app_tx on exit (error or
-    // app-channel close) which unblocks the echo loop; the echo loop dropping
+    // app-channel close) which unblocks the app loop; the app loop dropping
     // cmd_tx closes the driver's command channel.  Drive both to completion so
     // manager errors and task panics are propagated, not swallowed.
-    let (echo_result, driver_result) = tokio::join!(echo_handle, driver);
+    let (app_result, driver_result) = tokio::join!(app_task, driver);
     stats_handle.abort();
 
     match driver_result {
@@ -151,9 +140,9 @@ pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         Ok(Err(e)) => return Err(format!("server manager driver failed: {e}").into()),
         Err(join) => return Err(format!("server manager task panicked: {join}").into()),
     }
-    match echo_result {
+    match app_result {
         Ok(()) => {}
-        Err(join) => return Err(format!("echo app task panicked: {join}").into()),
+        Err(join) => return Err(format!("forward app task panicked: {join}").into()),
     }
 
     info!("Server shutting down (app channel closed).");

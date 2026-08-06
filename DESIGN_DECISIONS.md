@@ -824,13 +824,84 @@ keystores; the format must be versioned, strict, and cheap to audit by hand.
 
 ---
 
+# D18 — Application Model: UDP Relay Client + Forwarding Backend
+
+## Status
+
+Accepted (v0.2.0-alpha)
+
+## Context
+
+The v0.2 product decision is a local **UDP relay** client (no TUN, no admin)
+and a **forwarding backend** server that delivers decrypted datagrams to their
+real destinations and relays replies back to the client. The wire protocol
+stays fixed 1280-byte envelopes (D13); everything below is application layer
+*inside* the encrypted slot.
+
+## Decision
+
+- **Client**: binds an application-facing UDP socket (`--relay-listen`, default
+  `127.0.0.1:51821`). Applications send UDP to any destination; the client
+  prepends a compact destination header and feeds the result into the tunnel.
+  The relay **refuses non-loopback binds** (fail closed): its
+  `destination → app endpoint` record is unauthenticated last-writer-wins, so
+  the socket must not be reachable by anything that cannot already read the
+  local host's traffic.
+- **Relay message format** (inside the encrypted `PAYLOAD_LEN`=1245-byte slot,
+  zero-padded by the session layer):
+
+  `family(1) ‖ address(4|16) ‖ port(2) ‖ len(2) ‖ datagram(len)`
+
+  - `family`: `0x04` (IPv4, 9-byte header) or `0x06` (IPv6, 21-byte header);
+    anything else is dropped (fail closed).
+  - `len` is explicit: the slot is zero-padded, and a UDP datagram may
+    legitimately contain trailing zero bytes, so the length is signaled, not
+    inferred from padding. Maximum relayed datagram: 1236 B (IPv4) / 1224 B
+    (IPv6); oversized datagrams are dropped with a warning (ICMP/error
+    feedback is out of v0.2 scope).
+- **Server**: the default backend parses the header, forwards the datagram to
+  the real destination over UDP, and relays replies back to the client.
+  - Reply routing: the server keeps per-`(session, destination)` connected
+    sockets, so a reply arriving on a socket identifies both the session and
+    the original destination; the server re-labels the reply with that
+    destination header. The client only needs a short-lived
+    `(destination → local app endpoint)` map.
+  - Resource bounds: socket pools are capped (per-session and global) with an
+    idle TTL; exhaustion drops the oldest (fail closed, no unbounded growth).
+    Idle TTLs are enforced on every datagram, not just on new insertions, so a
+    quiet session's descriptors are reclaimed by the next frame rather than
+    lingering until pool pressure.
+- **Echo** remains as an opt-in (`--echo`) test/diagnostic mode; it is not the
+  default product path.
+- **Scope**: UDP only in v0.2. TCP through the relay requires a stream layer
+  and is deferred.
+
+## Consequences
+
+**Advantages:**
+
+- the v0.2 path needs no admin privileges anywhere (relay + backend, no TUN)
+- arbitrary destinations in a single tunnel; the wire format is unchanged
+- the destination header is invisible on the wire (inside AEAD, fixed slots)
+
+**Tradeoffs:**
+
+- per-datagram destination state on server and client; when two local apps
+  share one remote destination, replies follow last-writer-wins (documented)
+- UDP-only: TCP apps need a stream milestone
+- no ICMP / unreachable feedback in v0.2
+
+---
+
+# Open Design Decisions
+
 The following areas remain intentionally unresolved.
 
 These require further protocol design before finalization.
 
 Resolved areas are recorded above: Authentication Model (D12), Handshake
 Construction (D13), Key Hierarchy (D14), Key Confirmation Mechanism (D15),
-Rekeying Model (D16), Key Provisioning (D17).
+Rekeying Model (D16), Key Provisioning (D17), Application Model (D18).
 
 ---
 
