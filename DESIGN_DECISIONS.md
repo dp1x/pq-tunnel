@@ -1084,41 +1084,9 @@ These require further protocol design before finalization.
 
 Resolved areas are recorded above: Authentication Model (D12), Handshake
 Construction (D13), Key Hierarchy (D14), Key Confirmation Mechanism (D15),
-Rekeying Model (D16), Key Provisioning (D17), Application Model (D18).
-
----
-
-# Packet Protection Model
-
-Unresolved:
-
-- header visibility
-- authenticated associated data usage
-- nonce construction
-- packet encoding
-- replay window design
-
----
-
-# Rekeying Model
-
-Unresolved:
-
-- rekey triggers
-- key transition process
-- failure handling
-- session continuity behaviour
-
----
-
-# Traffic Scheduling Model
-
-Unresolved:
-
-- exact scheduler design
-- padding strategy
-- fixed-rate behaviour
-- adaptive mode limitations
+Rekeying Model (D16), Key Provisioning (D17), Application Model (D18), Cover
+Traffic Scheduling Model (D19), Removal of the Pre-v2 QUIC/TLS Transport (D20),
+External Known-Answer Anchoring Policy (D21).
 
 ---
 

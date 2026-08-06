@@ -51,8 +51,7 @@ Core principles (see [PROJECT_CHARTER.md](PROJECT_CHARTER.md)):
 ├── build.ps1               # local convenience build wrapper (portable)
 ├── pq-crypto/              # PQ primitives: ML-KEM, ML-DSA, X25519, KDF/AEAD
 ├── pq-tunnel-core/         # protocol core: session manager, handshake v2, envelope, codec
-├── pq-tun/                 # TUN/TAP device integration
-├── pq-proxy/               # SOCKS5 proxy
+├── pq-proxy/               # SOCKS5 proxy (parked, out of the workspace — v2 rewrite pending)
 ├── pq-tunnel-bin/          # single pq-tunnel binary (keygen/server/client)
 └── fuzz/                   # cargo-fuzz targets (never-panic contract)
 ```
@@ -66,9 +65,13 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.2.0-alpha in progress):** 296 unit tests pass
-(`cargo test --workspace`),
-adversarial design-review campaigns (cryptography, protocol, security) were
+**Validation (v0.2.0-alpha in progress):** 315 tests pass
+(`cargo test --workspace`), including external known-answer vectors (RFC 8439
+ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
+and ML-DSA-65 — D21) and adversarial end-to-end cases (garbage, forged
+handshake, version downgrade, AEAD tamper, replay, reordering) that assert a
+silent drop plus a healthy post-attack round trip.
+Adversarial design-review campaigns (cryptography, protocol, security) were
 completed and their findings fixed, and the modern-harness cargo-fuzz targets
 compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
 below).
@@ -149,12 +152,14 @@ never-panic contract.
 
 ## Tests
 
-- `pq-crypto`: 53 unit tests
-- `pq-tunnel-core`: 214 unit tests (incl. session-manager & handshake-v2 tests)
-- `pq-tunnel-bin`: 29 unit tests (identity provisioning, keygen, CIDR parsing,
-  packet length) — single `pq-tunnel` binary with `keygen`/`server`/`client`
-  subcommands
-- `pq-proxy`, `pq-tun`: 0 unit tests (library build verified)
+- `pq-crypto`: 61 unit tests (incl. external known-answer vectors, D21)
+- `pq-tunnel-core`: 215 unit tests (incl. session-manager & handshake-v2 tests)
+- `pq-tunnel-bin`: 30 unit tests + 9 E2E integration tests (identity
+  provisioning, keygen, CIDR parsing, packet length) — single `pq-tunnel`
+  binary with `keygen`/`server`/`client` subcommands; the E2E suite covers the
+  smoke gate (3) and the adversarial tunnel cases (6)
+- `pq-proxy`: parked (v1 SOCKS5-over-QUIC, excluded from the workspace; v2
+  rewrite planned — see D20); `pq-tun`: removed in M4
 - 7 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`
   harness and compile under the fuzz harness (execution requires an
   ASan-capable host — see Fuzzing above).
@@ -179,7 +184,8 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 
 ### Known issues / limitations (v0.2.0-alpha in progress)
 
-- The v2 handshake is validated at the unit/campaign level; **interoperability
+- The v2 handshake is validated at the unit/campaign level and by the
+  adversarial E2E suite; **interoperability
   with other implementations is not yet verified** (no independent
   implementation exists yet).
 - Cover traffic defaults to a fixed 2 Mbps pure-periodic schedule; an
