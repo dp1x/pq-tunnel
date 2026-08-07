@@ -806,6 +806,7 @@ mod tests {
     /// `decrypt` must never panic on random valid-size packets — it should
     /// always return `Ok` or `Err(CodecError::*)` without crashing (§14:
     /// reject invalid packets, never panic).
+    #[allow(clippy::manual_is_multiple_of)] // is_multiple_of is stable >= 1.87; workspace MSRV is 1.85
     #[test]
     fn fuzz_decrypt_never_panics() {
         let master = test_master();
@@ -828,7 +829,7 @@ mod tests {
             getrandom::fill(&mut bytes).expect("getrandom");
 
             // Occasionally use a real encrypted packet to exercise the accept path.
-            if getrandom::u32().unwrap_or(0).is_multiple_of(3) {
+            if getrandom::u32().unwrap_or(0) % 3 == 0 {
                 let idx = getrandom::u32().unwrap_or(0) as usize % valid_packets.len();
                 let _ = server.decrypt(&valid_packets[idx]);
             } else {

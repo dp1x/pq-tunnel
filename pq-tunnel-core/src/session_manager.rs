@@ -387,18 +387,22 @@ impl ServerSessionManager {
         if self.sessions.contains_key(&sid) {
             return Ok(ManagerEvent::None);
         }
-        if self.sessions.len() >= self.limits.max_sessions
-            && let Some(stale) = self
+        // MSRV 1.85: nested if-let (let chains stabilize in 1.88). Cannot be
+        // collapsed via a `&& let` chain without breaking the MSRV gate.
+        #[allow(clippy::collapsible_if)]
+        if self.sessions.len() >= self.limits.max_sessions {
+            if let Some(stale) = self
                 .sessions
                 .iter()
                 .min_by_key(|(_, e)| e.last_activity)
                 .map(|(k, _)| *k)
-        {
-            self.sessions.remove(&stale); // Drop zeroizes session keys (D14)
-            self.pending_closed.push_back(ManagerEvent::Closed {
-                sid: stale,
-                reason: CloseReason::Capacity,
-            });
+            {
+                self.sessions.remove(&stale); // Drop zeroizes session keys (D14)
+                self.pending_closed.push_back(ManagerEvent::Closed {
+                    sid: stale,
+                    reason: CloseReason::Capacity,
+                });
+            }
         }
         let session = WireSession::established(Role::Server, &outcome)?;
         let now = Instant::now();
@@ -617,14 +621,18 @@ impl ServerSessionManager {
             self.fail_buckets
                 .retain(|_, b| now.duration_since(b.last_refill) < self.limits.fail_window);
         }
-        if self.fail_buckets.len() >= self.limits.max_fail_buckets
-            && let Some(stale) = self
+        // MSRV 1.85: nested if-let (let chains stabilize in 1.88). Cannot be
+        // collapsed via a `&& let` chain without breaking the MSRV gate.
+        #[allow(clippy::collapsible_if)]
+        if self.fail_buckets.len() >= self.limits.max_fail_buckets {
+            if let Some(stale) = self
                 .fail_buckets
                 .iter()
                 .min_by_key(|(_, b)| b.last_refill)
                 .map(|(k, _)| *k)
-        {
-            self.fail_buckets.remove(&stale);
+            {
+                self.fail_buckets.remove(&stale);
+            }
         }
         let bucket = self.fail_buckets.entry(from).or_insert_with(|| RateBucket {
             tokens: self.limits.fail_burst,

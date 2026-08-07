@@ -93,19 +93,24 @@ impl Forwarder {
             }
         };
 
-        if self.echo
-            && let Ok(reply) = encode_relay(dest, datagram)
-            && self
-                .commands
-                .send(ServerAppCommand {
-                    sid,
-                    payload: reply,
-                })
-                .await
-                .is_err()
-        {
-            // App channel gone; the driver is winding down.
-            return;
+        // MSRV 1.85: nested if-let (let chains stabilize in 1.88). Cannot be
+        // collapsed via a `&& let` chain without breaking the MSRV gate.
+        #[allow(clippy::collapsible_if)]
+        if self.echo {
+            if let Ok(reply) = encode_relay(dest, datagram) {
+                if self
+                    .commands
+                    .send(ServerAppCommand {
+                        sid,
+                        payload: reply,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // App channel gone; the driver is winding down.
+                    return;
+                }
+            }
         }
         if self.echo {
             return;
@@ -151,10 +156,13 @@ impl Forwarder {
         self.prune_idle(Instant::now());
         let (sid, dest) = key;
 
-        if self.sockets.len() >= GLOBAL_CAP
-            && let Some((older, _)) = self.oldest()
-        {
-            self.drop_entry(older);
+        // MSRV 1.85: nested if-let (let chains stabilize in 1.88). Cannot be
+        // collapsed via a `&& let` chain without breaking the MSRV gate.
+        #[allow(clippy::collapsible_if)]
+        if self.sockets.len() >= GLOBAL_CAP {
+            if let Some((older, _)) = self.oldest() {
+                self.drop_entry(older);
+            }
         }
         // Per-session cap: drop that session's oldest.
         let mut sid_entries = self
