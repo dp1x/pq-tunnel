@@ -6,7 +6,8 @@ reference implementation. It is designed to keep traffic confidential against
 computers) while limiting the information leaked by traffic patterns
 (metadata resistance).
 
-This is the **first public release (v0.1.0-alpha)**. It ships the
+This is a **pre-release** build being prepared for the first public release. It
+ships the
 validated `pq-tunnel-core` data plane: a 1.5-RTT, mutual-authentication,
 hybrid (ML-KEM-768 + X25519) handshake, fixed 1280-byte wire datagrams,
 AEAD envelope with a sliding 1024-bit replay window over a 64-bit sequence
@@ -14,7 +15,7 @@ counter, per-direction nonce accounting, and a single-event-per-call session
 manager with DoS-rate limiting and fail-secure semantics.
 
 > **Status:** The v2 data plane is implemented and tested
-> (`cargo test --workspace`). The v0.2.0-alpha CLI (`pq-tunnel` with
+> (`cargo test --workspace`). The unified `pq-tunnel` CLI (`pq-tunnel` with
 > `keygen`/`server`/`client` subcommands) provides identity provisioning
 > (`keygen`), a roster-authenticated v2 server with a forwarding backend, a v2
 > client exposing a local UDP relay, and a fixed-rate cover-traffic scheduler.
@@ -65,7 +66,7 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.2.0-alpha in progress):** 315 tests pass
+**Validation (release preparation):** 316 tests pass
 (`cargo test --workspace`), including external known-answer vectors (RFC 8439
 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
 and ML-DSA-65 — D21) and adversarial end-to-end cases (garbage, forged
@@ -80,18 +81,23 @@ Detailed validation logs are kept private (not part of the public release).
 ## Usage
 
 Identity provisioning is the first step; keys are generated on a trusted
-machine and distributed out of band (the secret seed never leaves it):
+machine and distributed out of band (the secret seed never leaves it). The
+client pins the server's **public** key; the server's **roster** holds the
+client's public keys (mutual authentication, D12), so `--append-roster` must
+be used on the **client** keygen, not the server's:
 
 ```sh
-# server: identity + public key, and the public key appended to a roster
+# server: identity + public key
 pq-tunnel keygen --identity server-id.pqti \
-                 --public-key server-pub.pqti \
-                 --append-roster roster.pqti
+                 --public-key server-pub.pqti
 
-# a separate client identity, plus the server's public key pinned client-side
-pq-tunnel keygen --identity client-id.pqti --public-key server-pub.pqti
+# client: identity + public key, appended to the server's roster
+pq-tunnel keygen --identity client-id.pqti \
+                 --public-key client-pub.pqti \
+                 --append-roster roster.pqti
 ```
 
+Distribute `roster.pqti` to the server and `server-pub.pqti` to the client.
 Never overwrite a key file without `--force`, and never point two outputs at
 the same path (keygen refuses both). Serving is roster-authenticated:
 
@@ -153,7 +159,7 @@ never-panic contract.
 ## Tests
 
 - `pq-crypto`: 61 unit tests (incl. external known-answer vectors, D21)
-- `pq-tunnel-core`: 215 unit tests (incl. session-manager & handshake-v2 tests)
+- `pq-tunnel-core`: 216 unit tests (incl. session-manager & handshake-v2 tests)
 - `pq-tunnel-bin`: 30 unit tests + 9 E2E integration tests (identity
   provisioning, keygen, CIDR parsing, packet length) — single `pq-tunnel`
   binary with `keygen`/`server`/`client` subcommands; the E2E suite covers the
@@ -166,9 +172,12 @@ never-panic contract.
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --target x86_64-pc-windows-msvc
+cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 cargo test --workspace --target x86_64-pc-windows-msvc
 ```
+
+(On Linux CI, 2 `pq-tunnel-core` tests that measure Windows-specific working-set
+memory are skipped; the remaining 214 core tests run.)
 
 ## Security
 
@@ -182,7 +191,7 @@ Tunnel is a security project; responsible disclosure is welcome.
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 [PROJECT_CHARTER.md](PROJECT_CHARTER.md) for the security principles.
 
-### Known issues / limitations (v0.2.0-alpha in progress)
+### Known issues / limitations
 
 - The v2 handshake is validated at the unit/campaign level and by the
   adversarial E2E suite; **interoperability
@@ -194,7 +203,7 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 - Rekeying is close-and-re-establish (no in-place key rotation).
 - Fuzz execution is unavailable on Windows/VBS hosts (see Build above); all 7
   fuzz targets use the modern `fuzz_target!` harness.
-- v0.1.0-alpha is **not** API- or wire-stable; expect breaking changes before 1.0.
+- This build is **not** API- or wire-stable; expect breaking changes before 1.0.
 
 ## Future work
 
@@ -206,8 +215,9 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 
 See [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) for engineering
 guidance. All submissions must pass `cargo fmt --check` and
-`cargo test --workspace` on `x86_64-pc-windows-msvc`; `cargo clippy
---all-targets` must add **no new warnings**.
+`cargo test --workspace` on `x86_64-pc-windows-msvc`, and
+`cargo clippy --all-targets -- -D warnings` must produce **zero warnings**
+(CI enforces this on both Windows and Linux).
 
 ## License
 
