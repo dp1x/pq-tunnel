@@ -24,6 +24,8 @@ on:
           - handshake_message_decode
           - handshake_driver_receive
           - session_manager_receive
+          - cover_scheduler
+          - relay_overlay
       runs:
         description: "libFuzzer -runs per target"
         required: false
@@ -42,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJson(github.event.inputs.target == 'ALL' && '["wire_packet_from_bytes","inner_plaintext_decode","envelope_decrypt","replay_window","handshake_message_decode","handshake_driver_receive","session_manager_receive"]' || format('["{0}"]', github.event.inputs.target)) }}
+        target: ${{ fromJson(github.event.inputs.target == 'ALL' && '["wire_packet_from_bytes","inner_plaintext_decode","envelope_decrypt","replay_window","handshake_message_decode","handshake_driver_receive","session_manager_receive","cover_scheduler","relay_overlay"]' || format('["{0}"]', github.event.inputs.target)) }}
     steps:
       - uses: actions/checkout@v4
 

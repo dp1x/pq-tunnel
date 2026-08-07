@@ -10,9 +10,8 @@ cargo-fuzz = true
 [dependencies]
 pq-tunnel-core = { path = "../pq-tunnel-core" }
 pq-crypto = { path = "../pq-crypto" }
+pq-tunnel-bin = { path = "../pq-tunnel-bin" }
 libfuzzer-sys = "0.4"
-# cargo-fuzz injects libfuzzer-sys at runtime via RUSTFLAGS; the target file
-# just needs to compile under it. No additional deps required.
 
 [[bin]]
 name = "wire_packet_from_bytes"
@@ -41,6 +40,14 @@ path = "fuzz_targets/handshake_driver_receive.rs"
 [[bin]]
 name = "session_manager_receive"
 path = "fuzz_targets/session_manager_receive.rs"
+
+[[bin]]
+name = "cover_scheduler"
+path = "fuzz_targets/cover_scheduler.rs"
+
+[[bin]]
+name = "relay_overlay"
+path = "fuzz_targets/relay_overlay.rs"
 
 [workspace]
 resolver = "2"
