@@ -224,6 +224,28 @@ Before committing:
 * verify ignored files
 * ensure documentation matches implementation
 
+## Commit Messages
+
+Write Conventional Commits tailored for human readers:
+
+* Format: `type(scope): description` — e.g. `fix(handshake): prevent
+  default client timeout during M3 retries`, `test(e2e): add recovery
+  checks after adversarial packets`, `ci: verify the workspace on
+  Windows, Linux, and MSRV`.
+* The title must clearly describe the actual change and its outcome in
+  natural language.
+* Prefer concrete verbs: `fix`, `prevent`, `add`, `remove`, `align`,
+  `verify`, `document`.
+* A title should explain itself — no need to read the diff.
+* Avoid unnecessary internal implementation details in the title.
+* Use the body for the reason, impact, constraints, and verification.
+* Keep titles concise and readable.
+* Put unrelated changes in separate commits.
+* Never include private machine details, local filesystem paths,
+  credentials, personal information, or environment-specific details in
+  commits.
+* This applies to future commits. Do not rewrite already-pushed history.
+
 ---
 
 ## Git Milestone Completion Rule
