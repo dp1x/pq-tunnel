@@ -2245,6 +2245,34 @@ mod tests {
         );
     }
 
+    // Regression (M6): the client's M3 retransmit budget (the only path to
+    // `Established`, since a passive server sends no M4) must complete
+    // strictly inside the session manager's default handshake deadline.  With
+    // the earlier 8-attempt default the worst case was ~38s against a 30s
+    // deadline, so a default-configured client could never establish — the
+    // manager always closed it as HandshakeTimeout first.
+    #[test]
+    fn default_client_m3_budget_fits_handshake_deadline() {
+        let (cc, _sc) = shared_configs();
+        let deadline = SessionLimits::default()
+            .handshake_timeout
+            .expect("default handshake deadline");
+        let base_ms = cc.m1_retransmit_base.as_millis();
+        // Worst-case M3 phase wall time: the initial delay plus one backoff
+        // delay per retransmit (×2^min(attempt,5)), each with the maximum
+        // ±20% jitter.
+        let mut mult = 1u128;
+        for a in 1..=cc.m3_max_attempts {
+            mult += 1u128 << a.min(5);
+        }
+        let worst_ms = (mult * base_ms * 120) / 100;
+        assert!(
+            Duration::from_millis(worst_ms as u64) < deadline,
+            "default M3 budget (≥{worst_ms}ms worst case) must fit the default \
+             handshake deadline ({deadline:?})"
+        );
+    }
+
     #[test]
     fn client_close_sends_close_message() {
         let mut manager = client_manager();

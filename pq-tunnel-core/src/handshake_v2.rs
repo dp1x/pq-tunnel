@@ -914,7 +914,13 @@ impl ClientConfig {
             server_identity,
             m1_retransmit_base: Duration::from_millis(250),
             m1_max_attempts: 8,
-            m3_max_attempts: 8,
+            // M3 budget must stay strictly inside the session manager's
+            // default handshake_timeout (30s): 4 attempts with ±20% jitter
+            // cap at ~9.3s worst case, so a default-configured client always
+            // establishes before the deadline (the earlier 8-attempt default
+            // budgeted ~31.75-38s — past the deadline, so the client could
+            // never become ready against a passive server).
+            m3_max_attempts: 4,
         }
     }
 }

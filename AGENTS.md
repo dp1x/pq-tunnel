@@ -343,6 +343,24 @@ Notes (verified 2026-08 on this machine):
 
 ## Linting
 ```sh
-cargo clippy --all-targets --target x86_64-pc-windows-msvc
+cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 cargo fmt --check
 ```
+`-D warnings` is mandatory: the workspace is clippy-clean under it, and CI
+denies warnings. Do not add new `#[allow(...)]` unless behaviour-preserving
+and documented (see the `async_fn_in_trait` rationale on
+`HandshakeTransport`).
+
+## CI (verification only)
+
+`.github/workflows/ci.yml` is the authoritative gate:
+
+- Windows job: fmt, clippy `-D warnings`, workspace tests, serialized E2E
+  smoke — all `--locked` with `--target x86_64-pc-windows-msvc`.
+- Linux job: clippy `-D warnings`, workspace tests, fuzz build + short
+  `-runs=1000` smoke per target.
+- MSRV job: `cargo check --workspace --locked --all-targets` on 1.85.0.
+
+CI never pushes, publishes, or creates releases — it is verification-only.
+Always invoke cargo with `--locked` on CI. Real long-running fuzzing runs
+out of band (M7), never in CI.

@@ -613,6 +613,12 @@ A 3-message client-initiated flow over uniform 1280-byte datagrams.
 - Retransmission is client-driven: M1 and M3 retransmitted byte-identical
   with jittered backoff and bounded budgets; the server caches M2 per sid
   (duplicate M1 → resend cached M2).
+- Default timing invariant (fixed M6): the client's M3 retransmit budget —
+  the only path to client establishment (passive server, no M4) — must
+  complete strictly inside the session manager's default handshake deadline.
+  Defaults: `m3_max_attempts = 4` (≈9.3s worst case incl. ±20% jitter) vs
+  `handshake_timeout = 30s`. The earlier 8-attempt default budgeted ~38s
+  worst case, so a default-configured client could never establish.
 - DoS posture (D7 defaults): per-source M1 rate limit; bounded pending-state
   table with TTL; no session state before verified client signature; no
   ESTABLISHED before verified M3 Finished MAC.
