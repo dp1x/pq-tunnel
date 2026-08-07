@@ -58,17 +58,21 @@ impl Default for CoverPolicy {
     }
 }
 
-/// Convert a bit-rate to the per-`PACKET_SIZE` emission interval.
+/// Convert a bitrate to the per-`PACKET_SIZE` emission interval.
 ///
 /// Exact integer math (no float multiplication in the timed path):
 /// `interval_ns = PACKET_SIZE_bits * 1_000_000_000 / rate_bps`.
-/// Zero guards against a pathological `rate_bps = 0` (clamped to 1 bps).
+/// Rate guards: a pathological `rate_bps = 0` is clamped to 1 bps, and the
+/// result is clamped to a nonzero interval (the exact math saturates to 0 ns
+/// for rates above ~10 Tbps — a zero interval would turn the driver's
+/// `sleep_until(now)` into a busy loop).  The clamp only affects rates that
+/// would already saturate the scheduling arithmetic; sane rates are exact.
 pub fn interval_from_rate_bps(rate_bps: u64) -> Duration {
     let bits_per_packet = PACKET_SIZE as u64 * 8;
     let nanos = bits_per_packet
         .saturating_mul(1_000_000_000)
         .saturating_div(rate_bps.max(1));
-    Duration::from_nanos(nanos)
+    Duration::from_nanos(nanos.max(1))
 }
 
 /// A pure-periodic cover schedule for one direction of one session.
@@ -254,5 +258,28 @@ mod tests {
         // A 0 bps request clamps to 1 bps: enormous but well-defined interval.
         let d = interval_from_rate_bps(0);
         assert!(!d.is_zero());
+    }
+
+    #[test]
+    fn absurd_rate_is_clamped_to_nonzero_interval() {
+        // The exact integer math saturates to 0 ns for huge rates; the 1 ns
+        // floor keeps the driver's sleep_until from busy-looping.
+        assert!(!interval_from_rate_bps(u64::MAX).is_zero());
+        // Monotonicity: a higher rate never yields a longer interval
+        // (quotients of positive integers are non-increasing in the rate).
+        let pairs = [
+            (1u64, 2u64),
+            (2, 4),
+            (1_000, 1_000_000),
+            (1_000_000, 1_000_000_000),
+            (1_000_000_000, u64::MAX),
+            (u64::MAX / 2, u64::MAX),
+        ];
+        for (lo, hi) in pairs {
+            assert!(
+                interval_from_rate_bps(lo) >= interval_from_rate_bps(hi),
+                "rate {lo} must not give a shorter interval than rate {hi}"
+            );
+        }
     }
 }
