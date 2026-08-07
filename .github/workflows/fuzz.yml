@@ -51,6 +51,9 @@ jobs:
       - name: Install Rust (nightly)
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Install cargo-fuzz runner
+        run: cargo install cargo-fuzz --locked
+
       - name: Build fuzz target
         run: cargo +nightly fuzz build --fuzz-dir fuzz ${{ matrix.target }}
         timeout-minutes: 30
