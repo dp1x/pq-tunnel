@@ -1,0 +1,73 @@
+name: fuzz
+
+# Manual fuzz campaign (M7).  Intentionally NOT part of CI: long-running
+# coverage fuzzing happens out of band, on demand, per target.
+#
+# Toggles are inputs so the depth of a campaign can be chosen per dispatch:
+# `runs` and `max_total_time` guard each target invocation.  Defaults:
+# 1_000_000 runs per target with a hard 1-hour wall-clock guard.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target to fuzz (ALL = every target)"
+        required: false
+        default: "ALL"
+        type: choice
+        options:
+          - ALL
+          - wire_packet_from_bytes
+          - inner_plaintext_decode
+          - envelope_decrypt
+          - replay_window
+          - handshake_message_decode
+          - handshake_driver_receive
+          - session_manager_receive
+      runs:
+        description: "libFuzzer -runs per target"
+        required: false
+        default: "1000000"
+        type: string
+      max_total_time:
+        description: "libFuzzer -max_total_time guard in seconds (0 = default 3600)"
+        required: false
+        default: "3600"
+        type: string
+
+jobs:
+  fuzz:
+    name: fuzz-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(github.event.inputs.target == 'ALL' && '["wire_packet_from_bytes","inner_plaintext_decode","envelope_decrypt","replay_window","handshake_message_decode","handshake_driver_receive","session_manager_receive"]' || format('["{0}"]', github.event.inputs.target)) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build --fuzz-dir fuzz ${{ matrix.target }}
+        timeout-minutes: 30
+
+      - name: Run fuzz target
+        run: |
+          RUNS="${{ github.event.inputs.runs }}"
+          MAX_T="${{ github.event.inputs.max_total_time }}"
+          [ "$MAX_T" = "0" ] && MAX_T=3600
+          cargo +nightly fuzz run --fuzz-dir fuzz ${{ matrix.target }} \
+            -- -runs="$RUNS" -max_total_time="$MAX_T"
+        timeout-minutes: 75
+
+      - name: Upload interesting cases
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/*
+            fuzz/corpus/${{ matrix.target }}/*
+          if-no-files-found: ignore
