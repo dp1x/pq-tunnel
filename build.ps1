@@ -6,9 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Tunnel builds/test target the x86_64-pc-windows-msvc toolchain. The host may
-# differ (aarch64-pc-windows-msvc cannot compile aws-lc-sys); pass --target when
-# invoking cargo directly if needed. This script intentionally carries no
-# machine-specific PATH overrides.
+# Tunnel's canonical build/test target is x86_64-pc-windows-msvc. The host
+# toolchain may differ (e.g. aarch64-pc-windows-msvc); pass --target when
+# invoking cargo directly to stay on the canonical target. This script
+# intentionally carries no machine-specific PATH overrides.
 
 cargo $Command -p $Package --target x86_64-pc-windows-msvc @args
