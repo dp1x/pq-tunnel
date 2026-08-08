@@ -4,7 +4,11 @@ name: fuzz
 # coverage fuzzing happens out of band, on demand, per target.
 #
 # Toggles are inputs so the depth of a campaign can be chosen per dispatch:
-# `runs` and `max_total_time` guard each target invocation.  Defaults:
+# `runs` and `max_total_time` guard each target invocation; `sanitizer`
+# selects the sanitizer (the cargo-fuzz binary on the runner decides which
+# are supported — verify with the probe before claiming a class was run);
+# `rustflags` injects extra RUSTFLAGS for experiments (e.g. UBSan via
+# `-Zsanitizer=undefined` with `sanitizer=none`).  Defaults:
 # 1_000_000 runs per target with a hard 1-hour wall-clock guard.
 
 on:
@@ -36,6 +40,22 @@ on:
         required: false
         default: "3600"
         type: string
+      sanitizer:
+        description: "cargo-fuzz -s sanitizer (address | leak | memory | thread | none)"
+        required: false
+        default: "address"
+        type: choice
+        options:
+          - address
+          - leak
+          - memory
+          - thread
+          - none
+      rustflags:
+        description: "Extra RUSTFLAGS for the build+run (e.g. -Zsanitizer=undefined)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   fuzz:
@@ -55,16 +75,20 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Build fuzz target
-        run: cargo +nightly fuzz build --fuzz-dir fuzz ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ github.event.inputs.rustflags }}
+        run: cargo +nightly fuzz build --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} ${{ matrix.target }}
         timeout-minutes: 30
 
       - name: Run fuzz target
+        env:
+          RUSTFLAGS: ${{ github.event.inputs.rustflags }}
         run: |
           RUNS="${{ github.event.inputs.runs }}"
           MAX_T="${{ github.event.inputs.max_total_time }}"
           [ "$MAX_T" = "0" ] && MAX_T=3600
-          cargo +nightly fuzz run --fuzz-dir fuzz ${{ matrix.target }} \
-            -- -runs="$RUNS" -max_total_time="$MAX_T"
+          cargo +nightly fuzz run --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} \
+            ${{ matrix.target }} -- -runs="$RUNS" -max_total_time="$MAX_T"
         timeout-minutes: 75
 
       - name: Upload interesting cases
