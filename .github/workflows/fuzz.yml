@@ -89,7 +89,10 @@ jobs:
           [ "$MAX_T" = "0" ] && MAX_T=3600
           cargo +nightly fuzz run --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} \
             ${{ matrix.target }} -- -runs="$RUNS" -max_total_time="$MAX_T"
-        timeout-minutes: 75
+        # The fuzz budget is governed by the `max_total_time` input (up to 4 h
+        # for the B1 soak), not by this step timeout, which only guards against
+        # a hung runner (e.g. 8 h >> the 4 h budget).
+        timeout-minutes: 480
 
       - name: Upload interesting cases
         if: always()
