@@ -49,5 +49,9 @@ path = "fuzz_targets/cover_scheduler.rs"
 name = "relay_overlay"
 path = "fuzz_targets/relay_overlay.rs"
 
+[[bin]]
+name = "manager_churn"
+path = "fuzz_targets/manager_churn.rs"
+
 [workspace]
 resolver = "2"
