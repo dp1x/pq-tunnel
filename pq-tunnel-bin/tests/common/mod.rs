@@ -93,6 +93,37 @@ impl Gate {
         }
     }
 
+    /// Abort one task by the index in the task list (B3 teardown-race
+    /// harness): [0]=echo, [1]=proxy, [2]=server driver, [3]=app/forwarder,
+    /// [4]=client driver, [5]=relay.
+    pub fn abort_idx(&self, idx: usize) {
+        if let Some(t) = self.tasks.get(idx) {
+            t.abort();
+        }
+    }
+
+    /// Take ownership of every task and join them. `Cancelled` outcomes are
+    /// expected after `stop()`/`abort_idx`; a task result is a **panic** only
+    /// if the join errors with `is_panic()`, and a **hang** if it does not
+    /// settle within `within` (reported as the second tuple element).
+    pub async fn await_shutdown(
+        &mut self,
+        within: Duration,
+    ) -> (Vec<(usize, Result<(), tokio::task::JoinError>)>, Vec<usize>) {
+        let tasks = std::mem::take(&mut self.tasks);
+        let mut out = Vec::with_capacity(tasks.len());
+        let mut hung = Vec::new();
+        for (i, t) in tasks.into_iter().enumerate() {
+            match tokio::time::timeout(within, t).await {
+                Ok(r) => out.push((i, r)),
+                // The handle was consumed by the timeout; the task is dropped
+                // with our test anyway. A hang is evidence, not a cleanup job.
+                Err(_) => hung.push(i),
+            }
+        }
+        (out, hung)
+    }
+
     /// Order the MITM proxy to send `data` toward the server.
     pub fn inject_to_server(&self, data: Vec<u8>) {
         let _ = self.cmd.send(ProxyCmd::Send {
