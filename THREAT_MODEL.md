@@ -415,3 +415,54 @@ The core objectives remain:
 Implementation details may change.
 
 Security objectives remain stable.
+
+---
+
+# 13. M7 Adversarial Reassessment (2026-08-09)
+
+Record of the M7 verification milestone against this threat model.
+Evidence ledger: `R:\pq-tunnel-lab` (dossiers W1..W15, gap ledger,
+campaign summary). This section is a dated assessment, not a promise.
+
+## 13.1 Claims re-verified
+
+- **§2.2 authenticity** (replay, tamper, injection): replay-window
+  bit-slice semantics property-tested (1M runs); adversarial E2E covers
+  forged/fragmented handshake and envelope tampering; envelope decrypt
+  fuzz (1M runs) — no path to acceptance of unauthenticated data found.
+- **§2.3 metadata resistance** (timing/size/shape): cover-driver oracle
+  (interval monotonic, never 0, clamp regression pinned by unit test);
+  size invariants fuzzed per frame type; no channel found that lets an
+  unauthenticated peer distort scheduling state.
+- **§7 active attacks**: session/handshake driver fuzz (≈1.9 M combined
+  runs) plus scripted churn over both managers (105,350 runs) exercised
+  retry loops, DoS caps, rearm/reset/teardown races without fault.
+- **§10 fail-secure requirements** (clients): all adversarial E2E cases
+  fail by disconnection, never by acceptance; teardown-race stress
+  validates the "reject, don't guess" rule under concurrency.
+
+## 13.2 Residual assumptions (still open, by design)
+
+1. **RQ2 traffic-analysis proof** (§§ 6, 10): timing/cover guarantees are
+   empirically exercised, not formally proven. This is a proof problem,
+   parked outside M7 (G6 in ledger).
+2. **Nonce-exhaustion E2E (D16)** (§2.1, HNDL/key life): rekey nonce
+   hygiene is unit-proven at the envelope layer; the full-loop E2E test
+   is explicitly user-gated for post-M7.
+3. **Sanitizer classes**: LSan sweeps green across the 9-target matrix
+   (2026-08-08, W12); MSan/UBSan unavailable on the current toolchain
+   (`rust-src` missing, `-Zsanitizer=undefined` invalid) — outstanding,
+   not silent; see W12 dossier.
+4. **Harness-only defects found, zero product defects**: two fuzz-harness
+   panics (input-buffer framing; selector consumption) were fixed in the
+   harnesses; no protocol or implementation defect was discovered across
+   the ≈6.9 M executed units. Absence of defects in fuzzed paths does not
+   imply a proof of correctness elsewhere.
+
+## 13.3 Sinks, no model change
+
+M7 produced no change to claims, assumptions, or adversary classes:
+all findings were harness defects or clamp/correctness fixes with
+behavioral-equivalent unit tests. The guarantees in §11 remain as
+stated; the residual list above is the honest boundary of what a
+fuzzing campaign can and cannot establish.
