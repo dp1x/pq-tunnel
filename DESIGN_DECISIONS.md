@@ -1034,6 +1034,54 @@ bootstrap.
 
 ---
 
+# D22 — Metadata Resistance Target: Reduction, Not Anonymity (RQ2 outcome)
+
+## Status
+
+Accepted (2026-08-09, M8)
+
+## Context
+
+M7/M8 (RQ2 dossiers 01–02 in `R:\pq-tunnel-lab\`; THREAT_MODEL §13.4)
+proved where the cover design (D19) stops protecting: application traffic
+is emitted **additively on top of** the per-session cover grid, so a
+passive observer's detection bound is λ·W ≥ 1 — any sustained positive
+application rate is separable from the deterministic floor, and **raising
+the cover rate cannot close that channel** (the floor is a constant, the
+excess is exact). Also observable by construction: server session count
+(exactly N packets per 5.12 ms tick), session liveness, and
+establish/rekey/close lifecycle events (plaintext fragment markers,
+burst structure, sid churn, cleartext per-sid counters).
+
+## Decision
+
+- For v1-alpha, Tunnel's metadata target is **metadata-leakage
+  reduction, not traffic-flow anonymity** — matching the Charter §2.2 /
+  PROTOCOL_SPEC §2.2 wording ("reduce", not "eliminate").
+- Observable residuals are accepted by design: activity above the floor,
+  volume, server session count, session liveness, lifecycle events.
+- The **absorbing emission model** (app data riding the existing slot to
+  the per-tick cap, overflow = queue/loss) is **NOT adopted now**: it is
+  a different protocol architecture trading throughput/latency/
+  buffering semantics for stronger traffic-flow privacy, not a small
+  security patch.
+- If hiding activity/volume ever becomes a core requirement, it opens a
+  **new architectural milestone** with its own threat model, capacity
+  model, protocol design, implementation and validation — never a
+  bolt-on to M7/M8.
+
+## Consequences
+
+**Advantages:** the privacy claim is exactly as strong as the
+implementation; no hidden promise; cheap, usable default preserved; the
+mathematical boundary of the current design is on record.
+
+**Tradeoffs:** traffic-flow anonymity is explicitly out of scope; an
+operator who needs it must wait for the future milestone and pay its
+bandwidth/latency/backpressure costs themselves.
+
+---
+
 # D21 - External Known-Answer Anchoring Policy
 
 ## Status

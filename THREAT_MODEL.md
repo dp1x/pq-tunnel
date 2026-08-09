@@ -489,8 +489,10 @@ The design that would silence the application-activity channel is
 **slot-absorbing emission capped at one packet per tick** — the wire
 then equals the grid for all loads up to ≈1.94 Mbps usable per
 direction per session (defaults) and beyond (overflow becomes loss, not
-signal). That is an architecture change, explicitly deferred for user
-decision; it is not a parameter table toggling "more cover".
+signal). That is an architecture change, recorded and **rejected for
+v1-alpha in DESIGN_DECISIONS D22** (2026-08-09): the adopted target is
+metadata-leakage reduction, not traffic-flow anonymity; hiding activity/
+volume would be a new architectural milestone with its own costs.
 
 The claim in §11 ("reduced metadata leakage compared with conventional
 encrypted tunnels") remains valid as written; §13.4 states precisely
