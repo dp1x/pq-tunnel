@@ -51,7 +51,7 @@ fn configs() -> &'static Configs {
 
 const N_SIDS: usize = 4;
 
-fn sids() -> [[u8; SESSION_ID_LEN]; N_SIDS] {
+fn sids_array() -> [[u8; SESSION_ID_LEN]; N_SIDS] {
     let mut out = [[0u8; SESSION_ID_LEN]; N_SIDS];
     for (i, s) in out.iter_mut().enumerate() {
         s.fill(0x40 + i as u8);
@@ -71,6 +71,14 @@ fn consume<'a>(d: &mut &'a [u8]) -> &'a [u8] {
     a
 }
 
+/// Consume one selector byte and map it to a script sid, or `None` when the
+/// stream is exhausted (the op then gets skipped, never panics).
+fn take_sid(d: &mut &[u8]) -> Option<[u8; SESSION_ID_LEN]> {
+    let (&sel, rest) = d.split_first()?;
+    *d = rest;
+    Some(sids_array()[(sel as usize) % N_SIDS])
+}
+
 /// Craft a `Data`-typed datagram from stream bytes for a given sid: the deep
 /// decrypt/replay path into a (possibly live) session.
 fn data_fragment(d: &mut &[u8], sid: &[u8; SESSION_ID_LEN]) -> Vec<u8> {
@@ -87,7 +95,7 @@ fn data_fragment(d: &mut &[u8], sid: &[u8; SESSION_ID_LEN]) -> Vec<u8> {
 fuzz_target!(|data: &[u8]| {
     let cfg = configs();
     let from: SocketAddr = "127.0.0.1:40011".parse().expect("valid addr");
-    let sids = sids();
+    let sids = sids_array();
 
     let mut server = match ServerSessionManager::new(&cfg.server_cfg, SessionLimits::default()) {
         Ok(m) => m,
@@ -133,9 +141,11 @@ fuzz_target!(|data: &[u8]| {
             }
             // Server close of a script sid.
             0x0A => {
-                let sid = &sids[(d.first().copied().unwrap_or(0) as usize) % N_SIDS];
-                d = &d[1..];
-                let _ = server.close_session(sid);
+                let sid = match take_sid(&mut d) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let _ = server.close_session(&sid);
             }
             // Re-arm the client handshake (always allowed from Idle).
             0x0B => {
@@ -143,9 +153,11 @@ fuzz_target!(|data: &[u8]| {
             }
             // Server cover / client cover.
             0x0C => {
-                let sid = &sids[(d.first().copied().unwrap_or(0) as usize) % N_SIDS];
-                d = &d[1..];
-                let _ = server.cover_packet(sid);
+                let sid = match take_sid(&mut d) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let _ = server.cover_packet(&sid);
                 let _ = client.cover_packet();
             }
             // Feed arbitrary transport bytes to both managers.
@@ -163,9 +175,11 @@ fuzz_target!(|data: &[u8]| {
             }
             // Crafted Data fragment at a live session (deep decrypt/replay).
             0x0E => {
-                let sid = &sids[(d.first().copied().unwrap_or(0) as usize) % N_SIDS];
-                d = &d[1..];
-                let dg = data_fragment(&mut d, sid);
+                let sid = match take_sid(&mut d) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let dg = data_fragment(&mut d, &sid);
                 if let Ok(pkt) = WirePacket::from_bytes(&dg) {
                     let _ = server.handle_datagram(&pkt, from);
                     let _ = client.handle_datagram(&pkt, from);
