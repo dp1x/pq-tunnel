@@ -466,3 +466,32 @@ all findings were harness defects or clamp/correctness fixes with
 behavioral-equivalent unit tests. The guarantees in §11 remain as
 stated; the residual list above is the honest boundary of what a
 fuzzing campaign can and cannot establish.
+
+---
+
+## 13.4 RQ2 precision — bounds of the cover floor (2026-08-09)
+
+Derived in M8 Step 3 analysis (`R:\pq-tunnel-lab\RQ2-0*.md`, no code).
+
+The cover floor (D19) makes the idle session wire a deterministic
+195.3 pkt/s grid per direction (one 1280-byte packet per 5.12 ms tick
+per session). It does **not** hide activity above the floor: the
+additive emission of application packets is detectable as extra
+packets per observation window — bound λ·W ≥ 1 (a 1 pkt/s source is
+separated in ≈2–3 s, a 100-packet burst in one window, under lossless
+capture). **Raising the cover rate does not change this bound.**
+Session count on a server is observable per tick (one cover packet per
+established session; batch size is exact), and session liveness,
+handshake/rekey/close events are visible by construction (fragment
+markers, bursts, sid churn, per-sid cleartext counters).
+
+The design that would silence the application-activity channel is
+**slot-absorbing emission capped at one packet per tick** — the wire
+then equals the grid for all loads up to ≈1.94 Mbps usable per
+direction per session (defaults) and beyond (overflow becomes loss, not
+signal). That is an architecture change, explicitly deferred for user
+decision; it is not a parameter table toggling "more cover".
+
+The claim in §11 ("reduced metadata leakage compared with conventional
+encrypted tunnels") remains valid as written; §13.4 states precisely
+what "reduced" means before and after any such change.
