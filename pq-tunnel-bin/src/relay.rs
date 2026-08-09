@@ -356,4 +356,56 @@ mod tests {
             Err(RelayError::TooLarge { .. })
         ));
     }
+
+    fn addr_for(i: usize) -> SocketAddr {
+        format!("203.0.113.{}:{}", i % 250, 1000 + i)
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn prune_bindings_ttl_sweeps_stale_even_under_cap() {
+        let now = Instant::now();
+        let mut b = Bindings::new();
+        for i in 0..10 {
+            // Strictly older than TTL (the expiry check is `>`; an entry
+            // exactly TTL old survives — that boundary is documented here).
+            let age = MAP_TTL + Duration::from_millis(1 + i as u64);
+            b.insert(addr_for(i), (addr_for(900 + i), now - age));
+        }
+        for i in 10..15 {
+            b.insert(
+                addr_for(i),
+                (addr_for(900 + i), now - Duration::from_millis(i as u64)),
+            );
+        }
+        prune_bindings(&mut b, now);
+        // TTL is a real bound even before the map approaches MAP_MAX (B4):
+        // all stale entries must be gone; fresh ones survive.
+        assert_eq!(b.len(), 5);
+        for i in 0..10 {
+            assert!(!b.contains_key(&addr_for(i)));
+        }
+    }
+
+    #[test]
+    fn prune_bindings_evicts_oldest_when_over_map_max() {
+        let now = Instant::now();
+        let mut b = Bindings::new();
+        for i in 0..300 {
+            // Age grows with i: i == 299 is the *oldest* entry (its
+            // last_use is furthest in the past).
+            let age = Duration::from_millis(i as u64);
+            b.insert(addr_for(i), (addr_for(900 + i % 250), now - age));
+        }
+        prune_bindings(&mut b, now);
+        assert_eq!(b.len(), MAP_MAX);
+        // The 44 oldest (i >= 256) were evicted; the newest 256 survived.
+        for i in 0..256 {
+            assert!(b.contains_key(&addr_for(i)), "i={i} should be kept");
+        }
+        for i in 256..300 {
+            assert!(!b.contains_key(&addr_for(i)), "i={i} should be evicted");
+        }
+    }
 }
