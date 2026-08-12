@@ -79,7 +79,8 @@ pub fn interval_from_rate_bps(rate_bps: u64) -> Duration {
 ///
 /// This is deliberately clock-agnostic (uses `Instant` as an abstract
 /// timeline) and has no `tokio` dependency; the driver converts its deadline
-/// into `tokio::time::Sleep`.
+/// into a platform cover-timer arm (high-resolution waitable timer on
+/// Windows, tokio elsewhere — M9A).
 #[derive(Debug, Clone)]
 pub struct CoverScheduler {
     policy: CoverPolicy,

@@ -46,11 +46,34 @@ progress toward 1.0.
   changed 8 → 4 (≈9.3s worst case) and a regression test now asserts the
   budget fits the deadline.
 
+### Added (M9)
+
+- **Windows high-resolution cover clock (M9A)**: `cover_sleep` on Windows
+  drives the D19 grid deadline on a raw waitable timer created with
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` instead of the tokio timer driver
+  (which quantizes to the system timer resolution ≈15.6 ms, stretching the
+  5.12 ms grid to ~64 pkt/s). The scheduler stays clock-agnostic;
+  non-Windows platforms keep the tokio arm. Measured steady-state cadence:
+  ~182 pkt/s (93.5% of nominal), period p50 5.5 ms / p99 6.0 ms, uniform,
+  no fallback runs (see THREAT_MODEL §13.5 — no material privacy impact).
+- **Recoverable transport-reset isolation (M9B)**: ICMP port-unreachable
+  (Windows `WSAECONNRESET` / connection-refused) is classified as
+  `is_recoverable_reset()` and surfaces as `HandshakeV2Error::TransportReset`.
+  The relay socket (R1) and the server driver (R2) treat it as session-local
+  `continue` with one throttled warn per episode: one dead client can no
+  longer kill unrelated sessions or the server; the vanished session is
+  reaped by idle eviction.
+
 ### Known limitations (pre-release)
 
 - No independent implementation exists yet; interoperability is unverified.
 - Cover traffic defaults to a fixed 2 Mbps pure-periodic schedule (adaptive
   shaping is future work).
+- On Windows the cover grid lands at ~93.5% of the nominal rate (per-tick
+  wakeup skew; measured non-material against THREAT_MODEL §13.4).
+- The client emits no cover during connection establishment (D13 M3
+  retransmit budget sweep, ≈9.3s worst case); establishment-phase metadata
+  is the subject of milestone M10.
 - Rekeying is close-and-re-establish.
 - Fuzz execution is unavailable on Windows/VBS hosts (targets compile;
   execution requires an ASan-capable host).

@@ -73,6 +73,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::codec::{InnerPlaintext, MessageType, PAYLOAD_LEN, SESSION_ID_LEN, WirePacket};
 use crate::envelope::Role;
@@ -1022,13 +1023,32 @@ pub async fn run_server_manager<T: HandshakeTransport>(
     let mut cover_sched = CoverScheduler::new(cover);
     let cover_arm = cover_sleep(&cover_sched);
     tokio::pin!(cover_arm);
+    // One warn per reset episode (an ICMP storm from a vanished peer would
+    // otherwise spam at cover cadence until idle eviction reaps it).
+    let mut reset_noticed = false;
     loop {
         tokio::select! {
             r = transport.recv() => match r {
                 // Wrong-size / background noise: skip, not fatal.
                 Err(HandshakeV2Error::DatagramRejected) => {}
+                // ICMP port-unreachable / WSAECONNRESET: some peer's port
+                // vanished (it closed, crashed, or its network path reset).
+                // Informational in UDP, with no source address attached, so
+                // no specific session can be attributed; the dead session is
+                // left to the normal idle-eviction tick (D16).  Session-local
+                // by construction: one vanished client must never terminate
+                // unrelated sessions or the server process (M9B).
+                Err(HandshakeV2Error::TransportReset) => {
+                    if !reset_noticed {
+                        reset_noticed = true;
+                        warn!("transport reset by peer (recoverable: session eviction handles the dead peer)");
+                    }
+                    continue;
+                }
                 Err(e) => return Err(ManagerError::Handshake(e)),
-                Ok((pkt, from)) => match manager.handle_datagram(&pkt, from)? {
+                Ok((pkt, from)) => {
+                    reset_noticed = false;
+                    match manager.handle_datagram(&pkt, from)? {
                     ManagerEvent::Send { packets, peer } => {
                         for p in &packets {
                             transport.send_to(p, peer).await?;
@@ -1058,6 +1078,7 @@ pub async fn run_server_manager<T: HandshakeTransport>(
                             .map_err(|_| ManagerError::AppClosed)?;
                     }
                     ManagerEvent::None => {}
+                    }
                 },
             },
             cmd = app_rx.recv() => match cmd {
@@ -1311,13 +1332,157 @@ fn client_retransmit_timer(manager: &ClientSessionManager) -> tokio::time::Sleep
 
 /// Cover-timer arm for the driver `select!`s: sleep until the next cover
 /// deadline, or effectively forever when nothing is scheduled.  Re-armed on
-/// every wake via `Sleep::set`, the same discipline as `client_retransmit_timer`
+/// every wake via `Pin::set`, the same discipline as `client_retransmit_timer`
 /// — the cover schedule must never be recreated per iteration, or application
 /// traffic would starve it (the M2 timer defect class; D19).
+///
+/// The scheduler stays clock-agnostic; only this conversion differs per
+/// platform.  Windows uses a high-resolution waitable timer (M9A): tokio's
+/// timer driver quantizes to the system timer resolution (~15.6 ms at the
+/// default), which would stretch the 5.12 ms cover grid to ~64 pkt/s.
+/// Other platforms keep the tokio timer.
+#[cfg(windows)]
+fn cover_sleep(sched: &CoverScheduler) -> cover_clock::CoverSleep {
+    match sched.next_deadline() {
+        Some(d) => cover_clock::CoverSleep::deadline(d),
+        None => cover_clock::CoverSleep::inert(),
+    }
+}
+
+#[cfg(not(windows))]
 fn cover_sleep(sched: &CoverScheduler) -> tokio::time::Sleep {
     match sched.next_deadline() {
         Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)),
         None => tokio::time::sleep(Duration::MAX),
+    }
+}
+
+/// Windows high-resolution cover clock (M9A).
+///
+/// Drives the absolute deadline on a raw waitable timer created with
+/// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (the only mechanism measured to
+/// land near the 5.12 ms grid: p50 5.31 ms vs 15.60 ms for tokio
+/// `sleep_until`).  The wait runs on the blocking pool so the async worker
+/// is never stalled; the async arm is a `JoinHandle` future so re-arming
+/// via `Pin::set` (dropping the previous arm) cancels cleanly — the
+/// superseded wait simply completes its remaining ms in the pool.
+#[cfg(windows)]
+mod cover_clock {
+    use std::ffi::{c_int, c_void};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use tokio::task::JoinHandle;
+
+    /// Waitable timer flag: use the high-resolution timer (no dependence on
+    /// the system timer resolution).
+    const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0002;
+    const TIMER_ALL_ACCESS: u32 = 0x001F_0003;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+    /// Seconds from the Windows FILETIME epoch (1601-01-01) to the Unix
+    /// epoch (1970-01-01); FILETIME is 100 ns ticks since 1601.
+    const FILETIME_UNIX_OFFSET: u64 = 11_644_473_600;
+
+    unsafe extern "system" {
+        fn CreateWaitableTimerExW(
+            lpTimerAttributes: *mut c_void,
+            lpTimerName: *const u16,
+            dwFlags: u32,
+            dwDesiredAccess: u32,
+        ) -> *mut c_void;
+        fn SetWaitableTimer(
+            hTimer: *mut c_void,
+            lpDueTime: *const i64,
+            lPeriod: c_int,
+            pfnCompletionRoutine: *mut c_void,
+            lpArgToCompletionRoutine: *mut c_void,
+            fResume: c_int,
+        ) -> c_int;
+        fn WaitForSingleObject(hHandle: *mut c_void, dwMilliseconds: u32) -> u32;
+        fn CloseHandle(hObject: *mut c_void) -> c_int;
+    }
+
+    /// A re-armable cover-clock arm (see `cover_sleep`).
+    pub struct CoverSleep {
+        inner: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    }
+
+    impl CoverSleep {
+        /// Wait until the absolute `target` deadline.
+        pub fn deadline(target: Instant) -> Self {
+            let wait: JoinHandle<()> = tokio::task::spawn_blocking(move || wait_until(target));
+            Self {
+                inner: Box::pin(async move {
+                    let _ = wait.await;
+                }),
+            }
+        }
+
+        /// Never fire (no cover scheduled).
+        pub fn inert() -> Self {
+            Self {
+                inner: Box::pin(tokio::time::sleep(Duration::MAX)),
+            }
+        }
+    }
+
+    impl Future for CoverSleep {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            self.get_mut().inner.as_mut().poll(cx)
+        }
+    }
+
+    fn wait_until(target: Instant) {
+        let remaining = target.saturating_duration_since(Instant::now());
+        let timer = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        if timer.is_null() {
+            // Unreachable on supported Windows; a plain sleep is the honest
+            // fallback (degraded to system resolution, like pre-M9A).
+            std::thread::sleep(remaining);
+            return;
+        }
+        let due = due_time(remaining);
+        let armed = unsafe {
+            SetWaitableTimer(
+                timer,
+                &due,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0;
+        if !armed {
+            unsafe { CloseHandle(timer) };
+            std::thread::sleep(remaining);
+            return;
+        }
+        unsafe {
+            WaitForSingleObject(timer, INFINITE);
+            CloseHandle(timer);
+        }
+    }
+
+    /// Absolute FILETIME (100 ns ticks since 1601) for a wall-clock moment
+    /// `remaining` from now — absolute due times keep the grid locked to the
+    /// scheduler's deadlines rather than drifting with set latency.
+    fn due_time(remaining: Duration) -> i64 {
+        let unix = SystemTime::now() + remaining;
+        let since_epoch = unix.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        let ticks = (since_epoch.as_secs().saturating_add(FILETIME_UNIX_OFFSET)) * 10_000_000
+            + u64::from(since_epoch.subsec_nanos()) / 100;
+        ticks as i64
     }
 }
 
@@ -3899,5 +4064,130 @@ mod tests {
             }
             Some(pm.working_set as u64)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // M9B R2: transport peer-reset must be session-local to the server driver
+    // -----------------------------------------------------------------------
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::handshake_v2::tests::MemoryTransport;
+
+    /// A transport that surfaces exactly one [`HandshakeV2Error::TransportReset`]
+    /// once armed, then behaves like the inner transport (an ICMP
+    /// port-unreachable is a one-shot socket signal per reset episode).
+    struct ResetOnce {
+        inner: MemoryTransport,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl HandshakeTransport for ResetOnce {
+        async fn send_to(
+            &mut self,
+            packet: &WirePacket,
+            peer: SocketAddr,
+        ) -> Result<(), HandshakeV2Error> {
+            self.inner.send_to(packet, peer).await
+        }
+
+        async fn recv(&mut self) -> Result<(WirePacket, SocketAddr), HandshakeV2Error> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                return Err(HandshakeV2Error::TransportReset);
+            }
+            self.inner.recv().await
+        }
+    }
+
+    /// R2 regression: a peer reset (ICMP port-unreachable / WSAECONNRESET)
+    /// surfaced by the transport must NOT terminate the server manager.
+    /// The vanished peer's session is reaped by idle eviction; the driver
+    /// (and any unrelated sessions) stay up (M9B).
+    #[tokio::test]
+    async fn server_driver_survives_transport_reset() {
+        let (cc, sc) = shared_configs();
+        let mut manager = ServerSessionManager::new(&sc, SessionLimits::default()).unwrap();
+        let (mut client_t, server_t, _guard) = wired_transports();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+        let arm = Arc::new(AtomicBool::new(false));
+        let mut srv = ResetOnce {
+            inner: server_t,
+            armed: arm.clone(),
+        };
+        let mut driver = tokio::spawn(async move {
+            run_server_manager(&mut srv, &mut manager, app_tx, cmd_rx, no_cover()).await
+        });
+
+        // Establish a session through the driver (mirrors server_driver_end_to_end).
+        let sid = [0x42; SESSION_ID_LEN];
+        let mut client = ClientHandshake::new(&cc, sid).unwrap();
+        for f in client.m1_frags() {
+            client_t.send_to(f, SERVER_ADDR).await.unwrap();
+        }
+        let mut m3 = Vec::new();
+        for _ in 0..M2_FRAG_COUNT {
+            let (pkt, from) = client_t.recv().await.unwrap();
+            assert_eq!(from, SERVER_ADDR);
+            if let ClientEvent::Emit(pkts) = client.handle_datagram(&pkt).unwrap() {
+                m3 = pkts;
+            }
+        }
+        for f in &m3 {
+            client_t.send_to(f, SERVER_ADDR).await.unwrap();
+        }
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Established { .. } => {}
+            other => panic!("expected Established, got {other:?}"),
+        }
+
+        // The peer's port vanishes (client transport closed): the transport
+        // surfaces one TransportReset on the next receive.
+        arm.store(true, Ordering::SeqCst);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), &mut driver).await;
+        assert!(
+            outcome.is_err(),
+            "server driver must survive a transport reset; got {outcome:?}"
+        );
+        driver.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // M9A: Windows high-resolution cover clock
+    // -----------------------------------------------------------------------
+
+    #[cfg(windows)]
+    fn cover_sleep_from_deadline(target: Option<Instant>) -> cover_clock::CoverSleep {
+        match target {
+            Some(d) => cover_clock::CoverSleep::deadline(d),
+            None => cover_clock::CoverSleep::inert(),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cover_arm_fires_around_deadline() {
+        let start = Instant::now();
+        let arm = cover_sleep_from_deadline(Some(start + Duration::from_millis(30)));
+        tokio::pin!(arm);
+        tokio::time::timeout(Duration::from_secs(1), &mut arm)
+            .await
+            .expect("cover arm must fire near its deadline");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(25) && elapsed < Duration::from_millis(500),
+            "cover arm fired at {elapsed:?}, expected ~30 ms"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cover_arm_inert_never_fires() {
+        let arm = cover_sleep_from_deadline(None);
+        tokio::pin!(arm);
+        let fired = tokio::time::timeout(Duration::from_millis(60), &mut arm).await;
+        assert!(fired.is_err(), "inert cover arm must not fire");
     }
 }
