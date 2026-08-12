@@ -5,11 +5,19 @@ All notable changes to Tunnel are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Tunnel is in **pre-release** status: no release has been tagged yet. Nothing in
-this changelog represents a published release; treat every entry as work in
-progress toward 1.0.
+Tunnel is in **pre-release** status. `v0.1.0-alpha` was tagged as an early
+snapshot (2026-08-04); this changelog documents `v0.2.0-alpha`, the first
+release with the full documented decision set. Nothing here represents a
+stable 1.0 release.
 
 ## [Unreleased]
+
+## [0.2.0-alpha] - 2026-08-12
+
+First release of the v2 data plane under the accepted D18–D21 decision set:
+UDP relay client + forwarding backend, fixed-rate cover traffic, pre-v2
+QUIC/TLS removed, and external known-answer anchoring. Wire format and API
+are not stable before 1.0.
 
 ### Added (M1 — M5)
 
@@ -63,6 +71,15 @@ progress toward 1.0.
   `continue` with one throttled warn per episode: one dead client can no
   longer kill unrelated sessions or the server; the vanished session is
   reaped by idle eviction.
+
+### Tested (release gate)
+
+- **D16 nonce-exhaustion full-loop driver E2E**: a running driver is hit by
+  an authentic packet at `MAX_PACKET_NONCE` — the client driver closes the
+  session with `Closed{NonceExhausted}`, auto-arms a fresh handshake, reaches
+  Ready on the new session, and continues carrying application data in both
+  directions; the server driver closes, survives, and accepts a fresh
+  handshake. Closes the THREAT_MODEL §13.2 full-loop validation gap.
 
 ### Known limitations (pre-release)
 

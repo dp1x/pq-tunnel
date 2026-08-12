@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "pq-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "curve25519-dalek",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "pq-tunnel-bin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "pq-crypto",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "pq-tunnel-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.3.4",
  "pq-crypto",

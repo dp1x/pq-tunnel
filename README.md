@@ -6,20 +6,23 @@ reference implementation. It is designed to keep traffic confidential against
 computers) while limiting the information leaked by traffic patterns
 (metadata resistance).
 
-This is a **pre-release** build being prepared for the first public release. It
-ships the
+This is a **pre-release** build. It ships the
 validated `pq-tunnel-core` data plane: a 1.5-RTT, mutual-authentication,
 hybrid (ML-KEM-768 + X25519) handshake, fixed 1280-byte wire datagrams,
 AEAD envelope with a sliding 1024-bit replay window over a 64-bit sequence
 counter, per-direction nonce accounting, and a single-event-per-call session
 manager with DoS-rate limiting and fail-secure semantics.
 
-> **Status:** The v2 data plane is implemented and tested
-> (`cargo test --workspace`). The unified `pq-tunnel` CLI (`pq-tunnel` with
-> `keygen`/`server`/`client` subcommands) provides identity provisioning
-> (`keygen`), a roster-authenticated v2 server with a forwarding backend, a v2
-> client exposing a local UDP relay, and a fixed-rate cover-traffic scheduler.
-> The pre-v2 QUIC/TLS transport has been removed.
+> **Status:** `v0.2.0-alpha` (pre-release). The v2 data plane is implemented
+> and tested (`cargo test --workspace`). The unified `pq-tunnel` CLI
+> (`pq-tunnel` with `keygen`/`server`/`client` subcommands) provides identity
+> provisioning (`keygen`), a roster-authenticated v2 server with a forwarding
+> backend, a v2 client exposing a local UDP relay, and a fixed-rate
+> cover-traffic scheduler. Recoverable transport resets are isolated
+> (M9B), the Windows cover clock runs on a high-resolution waitable timer
+> (M9A), and the D16 nonce-exhaustion boundary is proven end-to-end at the
+> driver level (close → auto re-establish → continue). The pre-v2 QUIC/TLS
+> transport has been removed.
 
 ---
 
@@ -66,12 +69,13 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (release preparation):** 316 tests pass
+**Validation (release preparation):** 330 tests pass
 (`cargo test --workspace`), including external known-answer vectors (RFC 8439
 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
-and ML-DSA-65 — D21) and adversarial end-to-end cases (garbage, forged
+and ML-DSA-65 — D21), adversarial end-to-end cases (garbage, forged
 handshake, version downgrade, AEAD tamper, replay, reordering) that assert a
-silent drop plus a healthy post-attack round trip.
+silent drop plus a healthy post-attack round trip, and the D16
+nonce-exhaustion full-loop driver E2E (close → auto re-establish → continue).
 Adversarial design-review campaigns (cryptography, protocol, security) were
 completed and their findings fixed, and the modern-harness cargo-fuzz targets
 compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
@@ -159,11 +163,12 @@ never-panic contract.
 ## Tests
 
 - `pq-crypto`: 61 unit tests (incl. external known-answer vectors, D21)
-- `pq-tunnel-core`: 216 unit tests (incl. session-manager & handshake-v2 tests)
-- `pq-tunnel-bin`: 30 unit tests + 9 E2E integration tests (identity
+- `pq-tunnel-core`: 223 unit tests (incl. session-manager & handshake-v2 tests
+  and the D16 nonce-exhaustion full-loop driver E2E)
+- `pq-tunnel-bin`: 34 unit tests + 12 E2E integration tests (identity
   provisioning, keygen, CIDR parsing, packet length) — single `pq-tunnel`
   binary with `keygen`/`server`/`client` subcommands; the E2E suite covers the
-  smoke gate (3) and the adversarial tunnel cases (6)
+  smoke gate (3), the adversarial tunnel cases (6), and the stress suite (3)
 - `pq-proxy`: parked (v1 SOCKS5-over-QUIC, excluded from the workspace; v2
   rewrite planned — see D20); `pq-tun`: removed in M4
 - 7 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`
@@ -177,7 +182,7 @@ cargo test --workspace --target x86_64-pc-windows-msvc
 ```
 
 (On Linux CI, 2 `pq-tunnel-core` tests that measure Windows-specific working-set
-memory are skipped; the remaining 214 core tests run.)
+memory are skipped; the remaining 221 core tests run.)
 
 ## Security
 
