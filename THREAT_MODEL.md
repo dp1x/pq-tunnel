@@ -531,6 +531,81 @@ match backoff_delay(250 ms, 1..4) +-20% exactly), while the server
 covers immediately at its own establishment - asymmetric, observable
 cover onset.  This is D13/D15 design (cover is encrypted traffic on an
 established session; M9 changed only the sleep clock, not the gate),
-not an M9 regression.  M10 will quantify what an observer learns in
-this window and decide whether any change (e.g. M3-budget tuning,
-jitter widening, or documenting the window as accepted) is warranted.
+not an M9 regression.  M10 (2026-08-12) quantified the window; the
+outcome and the decision are recorded in §13.6: the establishment-phase
+metadata profile is accepted as residual leakage under D22
+(disposition C), and randomized-establishment behaviour is deferred as
+a future research question, not implemented.
+
+---
+
+## 13.6 M10 establishment-window quantification (2026-08-12)
+
+Empirical campaign on the lab wirelog instruments (R: harness copy,
+loopback runs 2026-08-12, post-reboot, debug build; raw CSVs volatile —
+this section is the durable record).  Cells: e1 default x30, e2a M3-budget=1 x15, e2b
+M3-budget=0 x15, e3a server delay 500 ms x5, e3b server delay
+2000 ms x5, e4 fresh-process x20, e5 steady x5.  Gap math uses
+process-relative microseconds exclusively.
+
+**Establishment window (H1) — disposition C, accepted residual.**
+Client cover onset (first steady ~5.5 ms cadence): default config
+min 6.86 / p10 7.01 / p50 7.78 / p90 8.43 / max 8.86 s,
+p90-p10 = 1.42 s, observed min-max range 2.00 s.  Theoretical support
+(jittered(250) + sum(jittered(500..4000)) at factors .8/1.19) =
+[6.25, 9.22] s, ~2.9 s wide.  The window is RTT-independent below
+~250 ms (the client's handshake retransmit timer is armed once at phase
+start and never re-armed at M3 emission), so release builds (M2 RTT
+~ ms) show the same distribution over real links.
+Establishment-phase metadata is intentionally observable under the
+current D13 handshake design.  The measured window and M3-budget
+distinguishability are accepted residual leakage under D22's
+metadata-reduction objective, pending future research.
+Randomized-establishment behaviour stays a future research question —
+"Can randomized establishment behaviour materially reduce observer
+inference without unacceptable handshake cost?" — recorded only, not
+implemented.
+
+**M3-budget distinguishability (H2-adjacent) — externally observable.**
+Median window 7.78 s (budget 4) vs 0.76 s (1) vs 0.27 s (0);
+correct classification 60/60 with disjoint populations (e2a max
+0.86 s < e1 min 6.86 s).  The retransmit budget is an implementation
+fingerprint visible through establishment duration alone.
+
+**Session linkability (H2) — INCONCLUSIVE.**  The E-series dataset is
+single-identity (one process spawn configuration), so no
+identity-vs-identity contrast exists; an earlier "0/30 NN match" figure
+was an analysis-script stub and is withdrawn.  Descriptive only:
+same-identity gap fingerprints (M2 RTT + 5 retransmit slots) are not
+self-similar (pairwise log-distance p50 0.625).  Tunnel does not claim
+that establishment patterns prevent session linkability; an
+identity-vs-identity cell (two or more identities, interleaved,
+30+ runs each) is required before any claim in either direction.
+
+**Establishment onset (H3) — inherent / expected.**  Every session
+opens with a 4-datagram (<1 ms gaps) M1 fragment burst at t = 0; a
+passive observer at the source vantage detects establishment 30/30
+(Wilson 95% CI [0.886, 1.000]) and steady cover cannot produce false
+positives (min cover gap 5.1 ms).  This is D13 framing (M1 = 4 uniform
+1280-byte datagrams), already listed among §13.4's accepted residuals
+("burst structure"); burst survival across real links is untested
+(loopback vantage).
+
+**Retransmit schedule (H4) — verified.**  Post-M3 gaps match
+jittered(500, 1000, 2000, 4000) x [0.80, 1.19] (code factors
+80..119/100): 9/220 = 4.1% outside the band (Wilson 95% upper
+0.076 < 10%); excluding the one race-corrupted run (M1-retransmit
+timer fired before M2 arrived; single occurrence, requires M2 RTT
+> ~200 ms, debug-build-only) leaves 5/216 = 2.3%, all high-edge
+overshoots <= 11.7 ms attributable to the Windows 15.6 ms tokio sleep
+quantum (retransmits sleep on tokio; only cover uses the HR waitable
+timer).  Slot-0 model verified against the code's once-armed semantics:
+(slot0 + M2 RTT) = jittered(250) in 50/55.  The M9A backoff rows
+(549.8 / 1021.8 / 1842.4 / 4471 ms) are confirmed as slots 1-4.
+
+**Cell-integrity notes.**  e2a/e2b ran 12 s windows (not 18 s) —
+irrelevant to the duration-independent window metrics; e4 exercised no
+intra-run reconnection (20 extra default-config samples); server.csv
+is echo-mixed in e1-e5 and was not used beyond the e0 clean
+single-session capture (M2 5-fragment burst + immediate cover,
+confirming the §13.5 asymmetry).

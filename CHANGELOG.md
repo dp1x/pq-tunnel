@@ -12,6 +12,16 @@ stable 1.0 release.
 
 ## [Unreleased]
 
+### Added (M10)
+
+- Establishment-window measurement campaign recorded in THREAT_MODEL
+  §13.6: the client establishment window (default config p50 7.78 s,
+  p90-p10 1.42 s) and M3-budget distinguishability are accepted residual
+  leakage under D22 (disposition C); the retransmit backoff schedule is
+  empirically verified; session linkability remains undetermined
+  (single-identity dataset, no claim made).  Documentation only — no
+  protocol, code, or config change.
+
 ## [0.2.0-alpha] - 2026-08-12
 
 First release of the v2 data plane under the accepted D18–D21 decision set:
