@@ -1082,6 +1082,86 @@ bandwidth/latency/backpressure costs themselves.
 
 ---
 
+# D23 - M9: Recoverable Transport Reset Isolation + Windows Cover Clock
+
+## Status
+
+Accepted (2026-08-11/12, M9A + M9B)
+
+## Context
+
+Two M8.5 measurements surfaced engineering surprises in an otherwise
+validated v2 data plane:
+
+- **M9B (server isolation)**: a client that disappears without a Close
+  message triggers ICMP port-unreachable feedback on the peer's UDP
+  socket. On Windows this surfaces as `WSAECONNRESET` (and
+  connection-refused on other platforms) on a *later* recv, and the
+  pre-M9 server and relay drivers treated any transport error as fatal:
+  one dead client could kill unrelated sessions or the whole server.
+- **M9A (cover grid on Windows)**: the D19 5.12 ms cover grid depends on
+  the driver's timer arm. tokio's timer driver quantizes to the system
+  timer resolution (~15.6 ms at the Windows default), which would stretch
+  the grid to ~64 pkt/s — far below the 195.3 pkt/s D19 floor.
+
+## Decision
+
+- **Recoverable reset classification**: `UdpError::is_recoverable_reset()`
+  recognizes `ConnectionReset`/`ConnectionRefused` as *informational* UDP
+  signals (the peer or its port vanished), never protocol failures.
+  `HandshakeV2Error::TransportReset` is added so drivers can distinguish
+  it from a fatal transport fault.
+- **R1 (relay)**: the client's relay socket treats a recoverable reset as
+  `continue` with one throttled warn per episode — a dead server must not
+  kill the local relay.
+- **R2 (server manager)**: the server driver maps a recoverable reset to
+  a session-local `continue` (one throttled warn per reset episode); the
+  vanished peer's session is reaped by the existing idle-eviction path
+  (D16). Unrelated sessions and the server process stay up.
+- **M9A (Windows cover clock)**: `cover_sleep` on Windows drives the
+  scheduler's absolute deadline on a raw waitable timer created with
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` (spawn-blocking wait, so the
+  async worker never stalls). The scheduler itself stays clock-agnostic;
+  non-Windows platforms keep the tokio timer arm. No protocol change.
+- **No protocol, crypto, or broad error-handling changes**: the wire
+  format, D13 handshake, D19 scheduler semantics and the fail-secure rule
+  ("a security failure closes the session") are untouched.
+
+## Consequences
+
+**Advantages:**
+
+- one client's disappearance/reset can no longer kill unrelated sessions
+  or the server process; the reset WARN is throttled to one per episode
+- the D19 grid is realized on Windows at the measured cadence (p50 5.31
+  ms in the pre-release bench; ~5.5 ms steady-state on the wire — the
+  residual is per-tick wakeup skew, absorbed by the D19 relative re-arm)
+
+**Tradeoffs:**
+
+- a vanished peer is not actively torn down — it lingers until idle
+  eviction reaps it (documented D16 behaviour)
+- the Windows cover clock is an extra platform-specific surface (~100
+  lines, cfg-windows, unit-tested); other platforms keep the tokio arm
+
+**Validation (M9):** gates green (check, fmt, clippy `-D warnings`, 221
+workspace tests incl. 7 new: reset classification, driver-survives-reset
+via `ResetOnce` transport, cover-arm deadline/inert tests, real
+`WSAECONNRESET` recv loop, recoverable-classification).  Live evidence:
+R1 2/2 (500-pkt inject, close-delay 0/200 ms — client survives, one
+throttled WARN); R2 4/4 server survival (client force-kill, runs up to
+3.9 min / 42,798 cover sends) with reset WARN in 2/4 (Windows loopback
+ICMP delivery is non-deterministic); post-reboot 5/5 stall diagnostic
+ALIVE-OK.  M9A wire validation: server p50 5.595 / p90 6.196 / p99
+7.009 ms (n=2358), client p50 5.696 / p90 6.155 / p99 7.156 (n=1013);
+post-reboot 30 s confirmation: server 182.6 pkt/s (93.5% of nominal),
+period p50 5.5 / p90 5.8 / p99 6.0 ms, per-sec counts uniform, one
+≥15 ms gap total — no material impact on the THREAT_MODEL §13.4 bounds
+(M9A-residual, see THREAT_MODEL §13.5).  One unreproduced server-stall
+episode recorded as a watch item (r2b, 2026-08-11), no redesign.
+
+---
+
 # D21 - External Known-Answer Anchoring Policy
 
 ## Status

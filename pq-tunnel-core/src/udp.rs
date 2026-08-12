@@ -50,6 +50,25 @@ pub enum UdpError {
     WrongSize { expected: usize, got: usize },
 }
 
+impl UdpError {
+    /// Whether this is the *recoverable* peer-reset signal: an ICMP
+    /// port-unreachable (Windows WSAECONNRESET) or connection-refused
+    /// surfacing on the socket.  In UDP this is informational — the peer
+    /// (or its port) is gone — not a protocol failure.  It must not be
+    /// treated as fatal: one vanished peer must never terminate a
+    /// multi-session server (M9B).
+    pub fn is_recoverable_reset(&self) -> bool {
+        matches!(
+            self,
+            UdpError::Io(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+                )
+        )
+    }
+}
+
 /// A raw UDP endpoint carrying exactly one [`WirePacket`] per datagram.
 #[derive(Debug)]
 pub struct UdpTransport {
@@ -290,6 +309,33 @@ mod tests {
         let addr2 = "127.0.0.1:0".parse::<SocketAddr>().unwrap();
         server.set_peer(addr2);
         assert_eq!(server.peer(), Some(addr2));
+    }
+
+    #[test]
+    fn recoverable_reset_classification() {
+        // M9B: ICMP port-unreachable (Windows WSAECONNRESET) and
+        // connection-refused are informational UDP signals — recoverable;
+        // anything else (or a non-Io error) is not.
+        assert!(
+            UdpError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "reset"))
+                .is_recoverable_reset()
+        );
+        assert!(
+            UdpError::Io(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+                .is_recoverable_reset()
+        );
+        assert!(
+            !UdpError::Io(io::Error::new(io::ErrorKind::WouldBlock, "block"))
+                .is_recoverable_reset()
+        );
+        assert!(
+            !UdpError::WrongSize {
+                expected: 1,
+                got: 2
+            }
+            .is_recoverable_reset()
+        );
+        assert!(!UdpError::NoPeer.is_recoverable_reset());
     }
 
     #[tokio::test]

@@ -497,3 +497,40 @@ volume would be a new architectural milestone with its own costs.
 The claim in §11 ("reduced metadata leakage compared with conventional
 encrypted tunnels") remains valid as written; §13.4 states precisely
 what "reduced" means before and after any such change.
+---
+
+## 13.5 M9 empirical closure - cadence shortfall and the establishment window (2026-08-12)
+
+Empirical results of M9 (D23) and the M9A-residual measurement campaign
+(lab wirelog instrumentation on the R: harness copy, loopback runs
+2026-08-12, post-reboot; raw CSVs volatile, this section is the durable
+record).
+
+**Cadence shortfall is not material.** Steady-state cover (30 s run,
+both endpoints): server 182.6 pkt/s = 93.5% of the nominal 195.3 grid,
+period p50 5.5 ms / p90 5.8 / p99 6.0 ms; client identical once
+covering.  Per-second counts are uniform (178-185) and the full run
+contains exactly one gap >= 15 ms (a single 29.3 ms stall at startup;
+no 15.6 ms fallback runs, no burst accumulation).  The 5.12 -> ~5.5 ms
+inflation is the per-tick wakeup skew of the D19 relative re-arm
+(scheduler semantics: `next = now + interval`), constant and
+stationary.  The 13.4 additive-detection bound (lambda*W >= 1) is
+independent of the floor rate - 13.4 itself states raising the rate
+does not change the bound, so a constant ~7% shortfall cannot either.
+The grid remains deterministic, uniform and stationary: no new
+metadata channel opens because of the shortfall.
+
+**Establishment window (recorded for M10, pre-existing design).**  The
+client emits **no cover during connection establishment**: it reaches
+D15 ready only after the D13 M3-retransmit budget sweep (~8-9.3 s worst
+case with defaults; 4 attempts at jittered exponential backoff from a
+250 ms base, M6.2-documented in CHANGELOG).  During that window the
+client sends only handshake retransmits at wire-visible exponential
+intervals (measured backoff rows 549.8 / 1021.8 / 1842.4 / 4471 ms
+match backoff_delay(250 ms, 1..4) +-20% exactly), while the server
+covers immediately at its own establishment - asymmetric, observable
+cover onset.  This is D13/D15 design (cover is encrypted traffic on an
+established session; M9 changed only the sleep clock, not the gate),
+not an M9 regression.  M10 will quantify what an observer learns in
+this window and decide whether any change (e.g. M3-budget tuning,
+jitter widening, or documenting the window as accepted) is warranted.

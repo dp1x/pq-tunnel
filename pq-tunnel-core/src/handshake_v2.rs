@@ -193,6 +193,13 @@ pub enum HandshakeV2Error {
     /// Transport-level failure (socket error etc.).  Fatal for the handshake.
     #[error("transport: {0}")]
     Transport(String),
+    /// A peer reset surfaced by the transport (ICMP port-unreachable —
+    /// Windows WSAECONNRESET / ECONNREFUSED).  *Informational* in UDP: the
+    /// peer or its port vanished.  Session-local — drivers MUST NOT treat it
+    /// as fatal to a multi-session manager; the vanished session is reaped
+    /// by the normal idle-eviction path (M9B).
+    #[error("transport reset by peer")]
+    TransportReset,
     /// A datagram was rejected at the transport layer (wrong size) — skip and
     /// continue; not fatal.  Drivers MUST treat this as a silent drop.
     #[error("datagram rejected by transport (skipped)")]
@@ -830,6 +837,9 @@ impl HandshakeTransport for UdpTransport {
         match UdpTransport::recv(self).await {
             Ok(v) => Ok(v),
             Err(crate::udp::UdpError::WrongSize { .. }) => Err(HandshakeV2Error::DatagramRejected),
+            // ICMP port-unreachable: the peer's port vanished.  Distinct from
+            // a transport fault so drivers can recover (M9B).
+            Err(e) if e.is_recoverable_reset() => Err(HandshakeV2Error::TransportReset),
             Err(e) => Err(HandshakeV2Error::Transport(e.to_string())),
         }
     }

@@ -163,6 +163,19 @@ pub async fn run(
     Ok(())
 }
 
+/// Whether a relay-socket receive error is *informational* rather than
+/// fatal: an ICMP port-unreachable (Windows WSAECONNRESET) or
+/// connection-refused for one of our recent replies — the app endpoint
+/// simply closed its socket, which is ordinary UDP behavior.  Treating it
+/// as fatal would let any app disconnect kill the whole relay (M9B).  All
+/// other receive errors remain fatal (fail-secure).
+fn is_recoverable_reset(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
 /// App socket → tunnel: relay-framed datagrams from any app endpoint are
 /// validated, recorded (`destination → source`), and passed to the manager.
 async fn app_to_tunnel_loop(
@@ -171,9 +184,13 @@ async fn app_to_tunnel_loop(
     data_tx: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; PAYLOAD_LEN];
+    // One warn per reset episode; a burst of replies to a vanished app
+    // endpoint otherwise spams at reply rate until the binding is reaped.
+    let mut resets_since_data = false;
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((n, src)) => {
+                resets_since_data = false;
                 match decode_relay(&buf[..n]) {
                     Ok((dest, _)) => {
                         let now = Instant::now();
@@ -190,6 +207,15 @@ async fn app_to_tunnel_loop(
                 }
                 if data_tx.send(buf[..n].to_vec()).await.is_err() {
                     break;
+                }
+            }
+            // ICMP port-unreachable: the app endpoint we last replied to is
+            // gone (it closed its socket).  Drop the stale signal and keep
+            // the relay up; the TTL sweep reaps the dead binding (M9B).
+            Err(e) if is_recoverable_reset(&e) => {
+                if !resets_since_data {
+                    resets_since_data = true;
+                    warn!("relay socket reset by peer ICMP (recoverable, ignoring): {e}");
                 }
             }
             Err(e) => {
@@ -407,5 +433,78 @@ mod tests {
         for i in 256..300 {
             assert!(!b.contains_key(&addr_for(i)), "i={i} should be evicted");
         }
+    }
+
+    #[test]
+    fn recoverable_reset_classification() {
+        // M9B: ICMP port-unreachable (WSAECONNRESET) and connection-refused
+        // are informational UDP signals — recoverable, never fatal.
+        assert!(is_recoverable_reset(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        )));
+        assert!(is_recoverable_reset(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused"
+        )));
+        assert!(!is_recoverable_reset(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "block"
+        )));
+    }
+
+    /// Real-socket regression test for the M9B relay fix: a reply sent to a
+    /// port whose socket just closed produces WSAECONNRESET (ICMP
+    /// port-unreachable) on the relay socket's next receive.  The loop must
+    /// survive the reset and keep forwarding — only a genuine (non-reset)
+    /// error may end it.  Windows-only: the OS must surface the ICMP as a
+    /// receive error on an unconnected socket, which Windows does and
+    /// Linux does not.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn recv_loop_survives_app_socket_reset() {
+        use tokio::net::UdpSocket;
+
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let (data_tx, mut data_rx) = mpsc::channel(64);
+        let bindings = Arc::new(Mutex::new(Bindings::new()));
+        let loop_handle = tokio::spawn({
+            let s = sock.clone();
+            let b = bindings.clone();
+            async move { app_to_tunnel_loop(s, b, data_tx).await }
+        });
+
+        let dest = "127.0.0.1:9".parse::<SocketAddr>().unwrap();
+        let frame = encode_relay(dest, b"hello").unwrap();
+
+        // Prime the loop while the app socket is alive.
+        peer.send_to(&frame, sock.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(data_rx.recv().await.unwrap(), frame);
+
+        // The relay "replies" to the app socket, which then vanishes: the
+        // next send lands on a closed port and the ICMP arrives as
+        // WSAECONNRESET on the relay socket's next receive.
+        sock.send_to(&frame, peer_addr).await.unwrap();
+        drop(peer);
+        sock.send_to(&frame, peer_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // The loop must still be alive and forwarding.
+        let new_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        new_peer
+            .send_to(&frame, sock.local_addr().unwrap())
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), data_rx.recv())
+            .await
+            .expect("relay loop must survive a peer reset and keep forwarding")
+            .expect("data channel closed: relay loop died on the reset");
+        assert_eq!(got, frame);
+        loop_handle.abort();
     }
 }
