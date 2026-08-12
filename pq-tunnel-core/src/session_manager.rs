@@ -4155,6 +4155,247 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // D16: nonce-exhaustion full-loop re-establishment (driver level)
+    // -----------------------------------------------------------------------
+
+    /// D16 full loop (client side): the client driver, running against a live
+    /// transport, must survive an authentic packet at the nonce-exhaustion
+    /// boundary.  The session is closed with `NonceExhausted`, the driver
+    /// auto-arms a fresh handshake (rearm_client), the new session reaches
+    /// Ready, and application data continues to flow in both directions —
+    /// all without restarting the driver.  The test drives the server machine
+    /// (as in client_driver_end_to_end), so the session master is known and
+    /// the boundary packet can be crafted with the public KDF + AEAD
+    /// primitives.
+    #[tokio::test]
+    async fn client_driver_nonce_exhaustion_reestablishes() {
+        let (mut cc, sc) = shared_configs();
+        cc.m1_retransmit_base = Duration::from_millis(50);
+        cc.m3_max_attempts = 1;
+        let mut manager = ClientSessionManager::new(&cc, SessionLimits::default()).unwrap();
+        let (mut client_t, mut server_t, srv_tx) = wired_transports();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let (data_tx, data_rx) = mpsc::channel(64);
+        let driver = tokio::spawn(async move {
+            run_client_manager(&mut client_t, &mut manager, app_tx, data_rx, no_cover()).await
+        });
+
+        // Leg 1: the driver auto-connects; the test answers as the server.
+        let (first_sid, outcome, mut srv_ws) = {
+            let mut server = ServerHandshake::new(&sc);
+            let mut m2 = Vec::new();
+            for _ in 0..M1_FRAG_COUNT {
+                let (pkt, from) = server_t.recv().await.unwrap();
+                assert_eq!(from, CLIENT_ADDR);
+                if let ServerEvent::Emit(frags, peer) = server.handle_datagram(&pkt, from).unwrap()
+                {
+                    assert_eq!(peer, CLIENT_ADDR);
+                    m2 = frags;
+                }
+            }
+            assert_eq!(m2.len(), M2_FRAG_COUNT as usize);
+            for f in &m2 {
+                srv_tx.send((f.clone(), SERVER_ADDR)).unwrap();
+            }
+            let mut server_outcome = None;
+            for _ in 0..M3_FRAG_COUNT * 2 {
+                let (pkt, from) = server_t.recv().await.unwrap();
+                assert_eq!(from, CLIENT_ADDR);
+                if let ServerEvent::Complete(out) = server.handle_datagram(&pkt, from).unwrap() {
+                    server_outcome = Some(out);
+                }
+            }
+            let outcome = server_outcome.expect("server completes");
+            // Client reaches Established on its retransmit budget (last backoff
+            // ≈ 200ms; grace covers jitter).
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let ws = WireSession::established(Role::Server, &outcome).unwrap();
+            (outcome.session_id, outcome, ws)
+        };
+
+        // Open the D15 gate → Ready.
+        srv_tx.send((srv_ws.cover().unwrap(), SERVER_ADDR)).unwrap();
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Ready { sid } => assert_eq!(sid, first_sid),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+
+        // Exhaustion boundary: an authentic packet at MAX_PACKET_NONCE.  The
+        // driver must close the session and report it, not terminate.
+        let boundary = exhaustion_packet_s2c(&outcome.master, first_sid);
+        srv_tx.send((boundary, SERVER_ADDR)).unwrap();
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Closed { sid, reason } => {
+                assert_eq!(sid, first_sid);
+                assert_eq!(reason, CloseReason::NonceExhausted);
+            }
+            other => panic!("expected Closed(NonceExhausted), got {other:?}"),
+        }
+
+        // Leg 2: the driver must have auto-armed a fresh handshake.
+        let (second_sid, _outcome2, mut srv_ws2) = {
+            let mut server = ServerHandshake::new(&sc);
+            let mut m2 = Vec::new();
+            for _ in 0..M1_FRAG_COUNT {
+                let (pkt, from) = server_t.recv().await.unwrap();
+                assert_eq!(from, CLIENT_ADDR);
+                if let ServerEvent::Emit(frags, peer) = server.handle_datagram(&pkt, from).unwrap()
+                {
+                    assert_eq!(peer, CLIENT_ADDR);
+                    m2 = frags;
+                }
+            }
+            assert_eq!(m2.len(), M2_FRAG_COUNT as usize);
+            for f in &m2 {
+                srv_tx.send((f.clone(), SERVER_ADDR)).unwrap();
+            }
+            let mut server_outcome = None;
+            for _ in 0..M3_FRAG_COUNT * 2 {
+                let (pkt, from) = server_t.recv().await.unwrap();
+                assert_eq!(from, CLIENT_ADDR);
+                if let ServerEvent::Complete(out) = server.handle_datagram(&pkt, from).unwrap() {
+                    server_outcome = Some(out);
+                }
+            }
+            let outcome = server_outcome.expect("server completes leg 2");
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let ws = WireSession::established(Role::Server, &outcome).unwrap();
+            (outcome.session_id, outcome, ws)
+        };
+        assert_ne!(
+            second_sid, first_sid,
+            "re-establishment uses a fresh session"
+        );
+
+        // Ready again on the fresh session.
+        srv_tx
+            .send((srv_ws2.cover().unwrap(), SERVER_ADDR))
+            .unwrap();
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Ready { sid } => assert_eq!(sid, second_sid),
+            other => panic!("expected Ready (leg 2), got {other:?}"),
+        }
+
+        // Application data continues, both directions.
+        data_tx.send(vec![0x77; 64]).await.unwrap();
+        let (pkt, from) = server_t.recv().await.unwrap();
+        assert_eq!(from, CLIENT_ADDR);
+        let inner = srv_ws2.decrypt(&pkt).unwrap();
+        assert_eq!(&inner.payload[..64], &[0x77; 64][..]);
+
+        let reply = srv_ws2
+            .encrypt(MessageType::Data, &[0x22; PAYLOAD_LEN])
+            .unwrap();
+        srv_tx.send((reply, SERVER_ADDR)).unwrap();
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Data { inner, .. } => {
+                assert_eq!(inner.msg_type, MessageType::Data);
+                assert_eq!(&inner.payload[..], &[0x22; PAYLOAD_LEN][..]);
+            }
+            other => panic!("expected Data (leg 2), got {other:?}"),
+        }
+
+        // Closing the app channel ends the driver cleanly.
+        drop(data_tx);
+        assert!(driver.await.unwrap().is_ok());
+    }
+
+    /// D16 full loop (server side): the server driver must survive an
+    /// authentic packet at the nonce-exhaustion boundary — it reports
+    /// `Closed{NonceExhausted}` and keeps running; a fresh handshake then
+    /// establishes a new session and data flows again (mirrors
+    /// server_driver_end_to_end with the client machine driven by the test,
+    /// so the master is known).
+    #[tokio::test]
+    async fn server_driver_nonce_exhaustion_recovers() {
+        let (mut cc, sc) = shared_configs();
+        // Fast client retransmit budget so the test-driven machine completes
+        // in milliseconds instead of sweeping the default M3 budget.
+        cc.m1_retransmit_base = Duration::from_millis(50);
+        cc.m3_max_attempts = 1;
+        let mut manager = ServerSessionManager::new(&sc, SessionLimits::default()).unwrap();
+        let (mut client_t, mut server_t, _guard) = wired_transports();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let driver = tokio::spawn(async move {
+            run_server_manager(&mut server_t, &mut manager, app_tx, cmd_rx, no_cover()).await
+        });
+
+        // Leg 1: establish a session through the driver.
+        let sid = [0x42; SESSION_ID_LEN];
+        let mut client = ClientHandshake::new(&cc, sid).unwrap();
+        for f in client.m1_frags() {
+            client_t.send_to(f, SERVER_ADDR).await.unwrap();
+        }
+        let mut m3 = Vec::new();
+        for _ in 0..M2_FRAG_COUNT {
+            let (pkt, from) = client_t.recv().await.unwrap();
+            assert_eq!(from, SERVER_ADDR);
+            if let ClientEvent::Emit(pkts) = client.handle_datagram(&pkt).unwrap() {
+                m3 = pkts;
+            }
+        }
+        for f in &m3 {
+            client_t.send_to(f, SERVER_ADDR).await.unwrap();
+        }
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Established { sid: es, .. } => assert_eq!(es, sid),
+            other => panic!("expected Established, got {other:?}"),
+        }
+        let (_, out) = client_established(&mut client, &cc);
+
+        // Exhaustion boundary (c2s): the server must close the session and
+        // keep the driver running.
+        let boundary = exhaustion_packet_c2s(&out.master, sid);
+        client_t.send_to(&boundary, SERVER_ADDR).await.unwrap();
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Closed { sid: cs, reason } => {
+                assert_eq!(cs, sid);
+                assert_eq!(reason, CloseReason::NonceExhausted);
+            }
+            other => panic!("expected Closed(NonceExhausted), got {other:?}"),
+        }
+
+        // Leg 2: a fresh handshake recovers; data flows again.
+        let sid2 = [0x24; SESSION_ID_LEN];
+        let mut client2 = ClientHandshake::new(&cc, sid2).unwrap();
+        for f in client2.m1_frags() {
+            client_t.send_to(f, SERVER_ADDR).await.unwrap();
+        }
+        let mut m3 = Vec::new();
+        for _ in 0..M2_FRAG_COUNT {
+            let (pkt, from) = client_t.recv().await.unwrap();
+            assert_eq!(from, SERVER_ADDR);
+            if let ClientEvent::Emit(pkts) = client2.handle_datagram(&pkt).unwrap() {
+                m3 = pkts;
+            }
+        }
+        for f in &m3 {
+            client_t.send_to(f, SERVER_ADDR).await.unwrap();
+        }
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Established { sid: es, .. } => assert_eq!(es, sid2),
+            other => panic!("expected Established (leg 2), got {other:?}"),
+        }
+        let (mut cws2, _out2) = client_established(&mut client2, &cc);
+        let pkt = cws2
+            .encrypt(MessageType::Data, &[0x5A; PAYLOAD_LEN])
+            .unwrap();
+        client_t.send_to(&pkt, SERVER_ADDR).await.unwrap();
+        match app_rx.recv().await.unwrap() {
+            ManagerNotification::Data { sid: ds, inner } => {
+                assert_eq!(ds, sid2);
+                assert_eq!(&inner.payload[..], &[0x5A; PAYLOAD_LEN][..]);
+            }
+            other => panic!("expected Data (leg 2), got {other:?}"),
+        }
+
+        // Closing the command channel ends the driver cleanly.
+        drop(cmd_tx);
+        assert!(driver.await.unwrap().is_ok());
+    }
+
+    // -----------------------------------------------------------------------
     // M9A: Windows high-resolution cover clock
     // -----------------------------------------------------------------------
 
