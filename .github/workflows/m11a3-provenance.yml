@@ -1,0 +1,216 @@
+name: m11a3-provenance
+
+# M11-a.3 Stage 1 ONLY -- build the 2x2 (arch x profile) matrix at f868d91,
+# record provenance (SHA-256, PE machine type, toolchain, Cargo.lock, logs),
+# and verify WITHIN-CELL reproducibility of the EXECUTABLE CODE (.text section).
+#
+# Reproducibility model (validated locally: see CP-1 report):
+#   - raw PE SHA-256 is NOT reproducible across rebuilds: link.exe embeds a
+#     per-link COFF TimeDateStamp + ~25 bytes of .rdata build-ident metadata.
+#     These are linker-emitted, not source-level (no build.rs, no env! timestamps).
+#   - the .text (instruction) section IS byte-identical across rebuilds within
+#     a cell -> the timing-relevant code is reproducible. That is the gate.
+# NO timing capture (Stage 2). NO edits to ci.yml. NO main/CHANGELOG/tag changes.
+
+on:
+  push:
+    branches: [m11a3-arm-crossover]
+  workflow_dispatch:
+
+concurrency:
+  group: m11a3-provenance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x64-debug
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            profile: dev
+          - name: x64-release
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            profile: release
+          - name: arm64-debug
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            profile: dev
+          - name: arm64-release
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            profile: release
+    steps:
+      - name: Checkout (standalone workflow; ci.yml untouched)
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned 1.97.1, matrix target)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+
+      - name: Build x2 + measure + assert (.text reproducibility)
+        id: provenance
+        shell: pwsh
+        run: |
+          $CfgProfile = "${{ matrix.profile }}"
+          $BaseArgs = @("build","--locked","-p","pq-tunnel-bin")
+          if ($CfgProfile -eq "release") { $BaseArgs += "--release" }
+          function cargo_build([string[]]$a, [string]$logf) {
+            Write-Host "## cargo $($a -join ' ')"
+            $Out = & cargo @a 2>&1
+            $Out | Out-File -FilePath $logf -Encoding utf8
+            $Out | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
+          }
+          function Find-Bin {
+            $f = Get-ChildItem -Path target -Recurse -Filter pq-tunnel.exe -File |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $f) { throw "pq-tunnel.exe not found under target/" }
+            return $f
+          }
+          function ToHex([byte[]]$bytes) { if ($null -eq $bytes) { "" } else { ($bytes | ForEach-Object { $_.ToString("x2") }) -join "" } }
+          function SectionHash($b, $rawptr, $rawsz) {
+            if ($rawsz -le 0 -or $rawptr -le 0 -or ($rawptr + $rawsz) -gt $b.Length) { return "" }
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try { return ToHex($sha.ComputeHash($b, $rawptr, $rawsz)) } finally { $sha.Dispose() }
+          }
+          function Get-PeInfo {
+            param([string]$p)
+            $b = [System.IO.File]::ReadAllBytes($p)
+            if ($b.Length -lt 64 -or $b[0] -ne 0x4d -or $b[1] -ne 0x5a) { throw "not-PE: $p" }
+            $e = [BitConverter]::ToUInt32($b, 0x3C)
+            $pe = $e + 4
+            $Machine = [BitConverter]::ToUInt16($b, $pe + 0)
+            $NumSec = [BitConverter]::ToUInt16($b, $pe + 2)
+            $Tds = [BitConverter]::ToUInt32($b, $pe + 4)
+            $SizeOpt = [BitConverter]::ToUInt16($b, $pe + 16)
+            $mname = switch ($Machine) { 0x8664 {"AMD64(x64)"}; 0xAA64 {"ARM64"}; 0x014C {"x86"}; default {"0x{0:x4}"-f $Machine} }
+            $raw = (Get-FileHash -Path $p -Algorithm SHA256).Hash
+            $secOff = $pe + 20 + $SizeOpt
+            $cols = @{}
+            for ($i = 0; $i -lt $NumSec; $i++) {
+              $sh = $secOff + $i * 40
+              $name = [Text.Encoding]::ASCII.GetString($b, $sh, 8).Trim([char]0)
+              $rawsz = [BitConverter]::ToUInt32($b, $sh + 16)
+              $rawptr = [BitConverter]::ToUInt32($b, $sh + 20)
+              $cols[$name] = SectionHash $b $rawptr $rawsz
+            }
+            return [PSCustomObject]@{
+              path = $p; raw_sha256 = $raw; pe_machine = $mname
+              coff_timedatestamp = $Tds; num_sections = $NumSec
+              text_sha256 = $cols[".text"]
+              rdata_sha256 = $cols[".rdata"]
+              data_sha256 = $cols[".data"]
+              pdata_sha256 = $cols[".pdata"]
+              reloc_sha256 = $cols[".reloc"]
+            }
+          }
+          # --- pass 1 ---
+          cargo_build $BaseArgs "cargo-build-1.log"
+          $bin1 = Find-Bin
+          Copy-Item -Path $bin1 -Destination ".\pq-tunnel-build1.exe" -Force
+          $i1 = Get-PeInfo ".\pq-tunnel-build1.exe"
+          Write-Host "build1 raw=$($i1.raw_sha256) machine=$($i1.pe_machine) tds=$($i1.coff_timedatestamp) text=$($i1.text_sha256)"
+          # --- clean + pass 2 ---
+          cargo clean
+          cargo_build $BaseArgs "cargo-build-2.log"
+          $bin2 = Find-Bin
+          Copy-Item -Path $bin2 -Destination ".\pq-tunnel-build2.exe" -Force
+          $i2 = Get-PeInfo ".\pq-tunnel-build2.exe"
+          Write-Host "build2 raw=$($i2.raw_sha256) machine=$($i2.pe_machine) tds=$($i2.coff_timedatestamp) text=$($i2.text_sha256)"
+          # --- reproducibility ---
+          $rawEq = $i1.raw_sha256 -eq $i2.raw_sha256
+          $textEq = $i1.text_sha256 -eq $i2.text_sha256
+          Write-Host "REPRODUCIBLE_RAW=$rawEq  REPRODUCIBLE_CODE(=text)=$textEq"
+          if (-not $textEq) {
+            throw "WITHIN-CELL CODE NON-REPRODUCIBLE: .text differs build1=$($i1.text_sha256) build2=$($i2.text_sha256)"
+          }
+          $LockHash = (Get-FileHash -Path Cargo.lock -Algorithm SHA256).Hash
+          cargo tree --locked --prefix=none > cargo-tree.txt 2>&1
+          $TreeHash = (Get-FileHash -Path cargo-tree.txt -Algorithm SHA256).Hash
+          $HostTriple = (rustc -vV | Select-String -Pattern "^host:").Line -replace "host:\s*",""
+          $Prov = [ordered]@{
+            m11a3_stage = "1-artifact-production"
+            cell = "${{ matrix.name }}"
+            commit_sha = "$env:GITHUB_SHA"
+            ref = "$env:GITHUB_REF"
+            run_id = "$env:GITHUB_RUN_ID"
+            runner_label = "${{ matrix.runner }}"
+            runner_os = "$env:RUNNER_OS"
+            profile = $CfgProfile
+            target_triple = "${{ matrix.target }}"
+            host_triple = $HostTriple
+            rustc = (rustc --version).Trim()
+            cargo = (cargo --version).Trim()
+            rustup = (rustup --version).Trim()
+            cargolock_sha256 = $LockHash
+            cargotree_sha256 = $TreeHash
+            pe_machine = $i1.pe_machine
+            coff_timedatestamp_build1 = $i1.coff_timedatestamp
+            coff_timedatestamp_build2 = $i2.coff_timedatestamp
+            raw_sha256_build1 = $i1.raw_sha256
+            raw_sha256_build2 = $i2.raw_sha256
+            text_sha256_build1 = $i1.text_sha256
+            text_sha256_build2 = $i2.text_sha256
+            rdata_sha256_build1 = $i1.rdata_sha256
+            rdata_sha256_build2 = $i2.rdata_sha256
+            reproducible_raw = $rawEq
+            reproducible_code = $textEq
+            reproducibility_note = "raw PE differs by link.exe COFF TimeDateStamp + ~25 .rdata build-ident bytes (linker-emitted, not source-level); .text (code) byte-identical -> timing-relevant code reproducible"
+          }
+          $Prov | ConvertTo-Json | Out-File -FilePath provenance.json -Encoding utf8
+          Get-Content provenance.json
+
+      - name: Upload cell artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: m11a3-${{ matrix.name }}
+          path: |
+            provenance.json
+            pq-tunnel-build1.exe
+            pq-tunnel-build2.exe
+            cargo-build-1.log
+            cargo-build-2.log
+            Cargo.lock
+            cargo-tree.txt
+          if-no-files-found: error
+
+  collect:
+    name: Assemble Stage-1 report
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Summarize
+        shell: bash
+        run: |
+          {
+            echo "## M11-a.3 Stage 1 provenance (f868d91)"
+            echo "Branch: m11a3-arm-crossover | commit: $(git rev-parse --short HEAD 2>/dev/null || echo n/a) | run: $GITHUB_RUN_ID"
+            echo ""
+            echo "| cell | pe_machine | toolchain | text_sha256 | reproducible_code | reproducible_raw | raw_sha256(build1) |"
+            echo "|---|---|---|---|---|---|---|"
+            for d in artifacts/m11a3-x64-debug artifacts/m11a3-x64-release artifacts/m11a3-arm64-debug artifacts/m11a3-arm64-release; do
+              p=$d/provenance.json
+              [ -f "$p" ] || continue
+              jq -r '[.cell,.pe_machine,(.rustc|@sh),.text_sha256,.reproducible_code,.reproducible_raw,.raw_sha256_build1]|@tsv' "$p" | awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5,$6,$7}'
+            done
+          } > m11a3-stage1-summary.md
+          cat m11a3-stage1-summary.md
+      - name: Upload Stage-1 summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: m11a3-stage1-summary
+          path: m11a3-stage1-summary.md
