@@ -152,11 +152,11 @@ cargo +nightly fuzz build --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 cargo +nightly fuzz run <target> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 # targets: wire_packet_from_bytes, inner_plaintext_decode, envelope_decrypt,
 #          replay_window, handshake_message_decode, handshake_driver_receive,
-#          session_manager_receive
+#          session_manager_receive, cover_scheduler, relay_overlay, manager_churn
 ```
 
 The `cargo-fuzz` ASan runtime is not supported on this Windows host under VBS;
-fuzz **execution** should be run on a Linux host. All 7 targets use the modern
+fuzz **execution** should be run on a Linux host. All 10 targets use the modern
 nightly harness (`fuzz_target!`) and compile under it. All targets define the
 never-panic contract.
 
@@ -171,7 +171,7 @@ never-panic contract.
   smoke gate (3), the adversarial tunnel cases (6), and the stress suite (3)
 - `pq-proxy`: parked (v1 SOCKS5-over-QUIC, excluded from the workspace; v2
   rewrite planned — see D20); `pq-tun`: removed in M4
-- 7 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`
+- 10 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`
   harness and compile under the fuzz harness (execution requires an
   ASan-capable host — see Fuzzing above).
 
@@ -206,7 +206,7 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
   operator-chosen adaptive shaper is future work (see
   [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D19).
 - Rekeying is close-and-re-establish (no in-place key rotation).
-- Fuzz execution is unavailable on Windows/VBS hosts (see Build above); all 7
+- Fuzz execution is unavailable on Windows/VBS hosts (see Build above); all 10
   fuzz targets use the modern `fuzz_target!` harness.
 - This build is **not** API- or wire-stable; expect breaking changes before 1.0.
 
