@@ -12,6 +12,24 @@ stable 1.0 release.
 
 ## [Unreleased]
 
+### Added (M7)
+
+- Adversarial validation campaign: ~6.9M fuzz input units across 7 targets
+  (2 × 1M + 594,738 + 597,681 + 207,895 + 105,350), zero product defects.
+  Two fuzz-harness-only panics fixed; no protocol or implementation defects
+  found. LSan green across the 9-target matrix; MSan/UBSan remain
+  toolchain-blocked (rust-src missing). See THREAT_MODEL §13.1–13.3.
+
+### Added (M8)
+
+- RQ2 claim-vs-adversary analysis: mathematical bounds on the cover-floor
+  design (Lemma 1 deterministic grid; Lemma 2 additive leak λ·W ≥ 1 — no
+  cover-rate mitigation; Lemma 3 cleartext counters make the leak
+  integer-exact; Lemma 4 session count = N per tick). Decision D22:
+  metadata target is **reduction, not traffic-flow anonymity** — activity,
+  volume, session count, and lifecycle events remain observable residuals.
+  Absorbing-emission redesign rejected for v1. See THREAT_MODEL §13.4.
+
 ### Added (M10)
 
 - Establishment-window measurement campaign recorded in THREAT_MODEL
@@ -38,7 +56,7 @@ are not stable before 1.0.
   (M2), including the fixed-rate cover-traffic scheduler (M3).
 - External known-answer vectors: RFC 8439 ChaCha20-Poly1305, RFC 5869
   HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768 and ML-DSA-65.
-- Modern `fuzz_target!` harness for all 7 cargo-fuzz targets (replacing the
+- Modern `fuzz_target!` harness for all 10 cargo-fuzz targets (replacing the
   legacy exported-harness style).
 - Adversarial end-to-end tunnel test suite (garbage, forged handshake,
   version downgrade, AEAD tamper, replay, reordering) asserting silent drops
