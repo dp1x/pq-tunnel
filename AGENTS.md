@@ -342,14 +342,14 @@ cargo test --workspace --target x86_64-pc-windows-msvc
 ## Fuzz targets (x86_64-msvc only; requires `cargo-fuzz`)
 The fuzz crate lives in `fuzz/` (own workspace). `fuzz/Cargo.toml` has
 `[package.metadata] cargo-fuzz = true` and `libfuzzer-sys` as a dependency.
-All 7 targets use the modern `fuzz_target!` harness (no legacy
+All 10 targets use the modern `fuzz_target!` harness (no legacy
 `rust_fuzzer_test_input` exports remain). Run from the repo root with the
 cross-target flag:
 ```sh
 cargo +nightly fuzz run <target_name> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 # Targets: wire_packet_from_bytes, inner_plaintext_decode, envelope_decrypt,
 #          replay_window, handshake_message_decode, handshake_driver_receive,
-#          session_manager_receive
+#          session_manager_receive, cover_scheduler, relay_overlay, manager_churn
 ```
 Notes (verified 2026-08 on this machine):
 - cargo-fuzz defaults to the aarch64 host target — the sanitizer is not

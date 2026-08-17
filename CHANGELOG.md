@@ -51,7 +51,7 @@ are not stable before 1.0.
 ### Changed (M5 — M6)
 
 - Validation counts and design-decision record refreshed for the current
-  workspace state (316 tests; D19–D21 resolved).
+  workspace state (330 tests; D19–D21 resolved).
 - Workspace is clippy-clean under `-- -D warnings`; CI enforces fmt, clippy,
   tests, fuzz build + smoke on Windows, Linux, and MSRV 1.85.
 
