@@ -66,7 +66,8 @@ jobs:
         run: |
           for target in wire_packet_from_bytes inner_plaintext_decode \
                         envelope_decrypt replay_window handshake_message_decode \
-                        handshake_driver_receive session_manager_receive; do
+                        handshake_driver_receive session_manager_receive \
+                        cover_scheduler relay_overlay manager_churn; do
             cargo +nightly fuzz run "$target" --fuzz-dir fuzz -- -runs=1000
           done
 
