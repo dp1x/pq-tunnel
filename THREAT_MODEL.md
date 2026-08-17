@@ -448,7 +448,11 @@ campaign summary). This section is a dated assessment, not a promise.
    parked outside M7 (G6 in ledger).
 2. **Nonce-exhaustion E2E (D16)** (§2.1, HNDL/key life): rekey nonce
    hygiene is unit-proven at the envelope layer; the full-loop E2E test
-   is explicitly user-gated for post-M7.
+   is implemented and merged (commit `9db71df`, "test(transport): prove
+   D16 nonce-exhaustion full-loop re-establishment at the driver level") —
+   the driver closes the session, auto-rearms a fresh handshake, reaches
+   Ready on the new session, and continues carrying application data in
+   both directions. See CHANGELOG "Tested (release gate)".
 3. **Sanitizer classes**: LSan sweeps green across the 9-target matrix
    (2026-08-08, W12); MSan/UBSan unavailable on the current toolchain
    (`rust-src` missing, `-Zsanitizer=undefined` invalid) — outstanding,

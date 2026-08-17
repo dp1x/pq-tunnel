@@ -1220,7 +1220,9 @@ Resolved areas are recorded above: Authentication Model (D12), Handshake
 Construction (D13), Key Hierarchy (D14), Key Confirmation Mechanism (D15),
 Rekeying Model (D16), Key Provisioning (D17), Application Model (D18), Cover
 Traffic Scheduling Model (D19), Removal of the Pre-v2 QUIC/TLS Transport (D20),
-External Known-Answer Anchoring Policy (D21).
+External Known-Answer Anchoring Policy (D21), Metadata Resistance Target:
+Reduction, Not Anonymity (D22), Recoverable Transport Reset Isolation +
+Windows Cover Clock (D23).
 
 ---
 
