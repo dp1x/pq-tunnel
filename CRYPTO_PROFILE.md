@@ -420,13 +420,18 @@ However, replacement should not require redesigning Tunnel's security model.
 
 # 14. Tunnel v1 Cryptographic Profile
 
-The final Tunnel v1 cryptographic suite will define:
+> **v0.2.0-alpha pinned suite (current implementation).** The placeholders below
+> were resolved for v0.2.0-alpha and are pinned in code; they remain
+> *replaceable* (§13) without redesigning the security model. Selection is
+> anchored to external known-answer vectors per D21 (RFC 8439, RFC 5869,
+> RFC 7748, Wycheproof ML-KEM-768/ML-DSA-65) and to D13–D15/D19. Future
+> algorithm replacement may require a protocol version change (D13).
 
 ```text
-Key Establishment: [Selected mechanism]
-Authentication:     [Selected mechanism]
-AEAD:               [Selected mechanism]
-KDF:                [Selected mechanism]
+Key Establishment: ML-KEM-768 + X25519 hybrid (HKDF-SHA256 shared-secret merge)
+Authentication:     ML-DSA-65, roster-pinned mutual authentication (no anon mode)
+AEAD:               ChaCha20-Poly1305 (192-bit nonce = 4-byte KDF prefix ‖ 8-byte u64 counter)
+KDF:                HKDF-SHA256 with per-purpose domain-separation labels (-v1/-v2)
 ```
 
 The final selection must satisfy:

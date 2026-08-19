@@ -69,7 +69,7 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (release preparation):** 330 tests pass
+**Validation (v0.2.0-alpha released):** 330 tests pass
 (`cargo test --workspace`), including external known-answer vectors (RFC 8439
 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
 and ML-DSA-65 — D21), adversarial end-to-end cases (garbage, forged
@@ -81,6 +81,8 @@ completed and their findings fixed, and the modern-harness cargo-fuzz targets
 compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
 below).
 Detailed validation logs are kept private (not part of the public release).
+`v0.2.0-alpha` is tagged and signed (see `CHANGELOG.md`); wire format and API
+are not stable before 1.0.
 
 ## Usage
 

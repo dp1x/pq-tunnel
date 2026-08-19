@@ -12,24 +12,6 @@ stable 1.0 release.
 
 ## [Unreleased]
 
-### Added (M7)
-
-- Adversarial validation campaign: ~6.9M fuzz input units across 7 targets
-  (2 × 1M + 594,738 + 597,681 + 207,895 + 105,350), zero product defects.
-  Two fuzz-harness-only panics fixed; no protocol or implementation defects
-  found. LSan green across the 9-target matrix; MSan/UBSan remain
-  toolchain-blocked (rust-src missing). See THREAT_MODEL §13.1–13.3.
-
-### Added (M8)
-
-- RQ2 claim-vs-adversary analysis: mathematical bounds on the cover-floor
-  design (Lemma 1 deterministic grid; Lemma 2 additive leak λ·W ≥ 1 — no
-  cover-rate mitigation; Lemma 3 cleartext counters make the leak
-  integer-exact; Lemma 4 session count = N per tick). Decision D22:
-  metadata target is **reduction, not traffic-flow anonymity** — activity,
-  volume, session count, and lifecycle events remain observable residuals.
-  Absorbing-emission redesign rejected for v1. See THREAT_MODEL §13.4.
-
 ### Added (M10)
 
 - Establishment-window measurement campaign recorded in THREAT_MODEL
@@ -99,6 +81,21 @@ are not stable before 1.0.
   `continue` with one throttled warn per episode: one dead client can no
   longer kill unrelated sessions or the server; the vanished session is
   reaped by idle eviction.
+
+### Added (M7–M8)
+
+- Adversarial validation campaign: ~6.9M fuzz input units across 7 targets
+  (2 × 1M + 594,738 + 597,681 + 207,895 + 105,350), zero product defects.
+  Two fuzz-harness-only panics fixed; no protocol or implementation defects
+  found. LSan green across the 9-target matrix; MSan/UBSan remain
+  toolchain-blocked (rust-src missing). See THREAT_MODEL §13.1–13.3.
+- RQ2 claim-vs-adversary analysis: mathematical bounds on the cover-floor
+  design (Lemma 1 deterministic grid; Lemma 2 additive leak λ·W ≥ 1 — no
+  cover-rate mitigation; Lemma 3 cleartext counters make the leak
+  integer-exact; Lemma 4 session count = N per tick). Decision D22:
+  metadata target is **reduction, not traffic-flow anonymity** — activity,
+  volume, session count, and lifecycle events remain observable residuals.
+  Absorbing-emission redesign rejected for v1. See THREAT_MODEL §13.4.
 
 ### Tested (release gate)
 
