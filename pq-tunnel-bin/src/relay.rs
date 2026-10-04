@@ -92,19 +92,28 @@ pub fn encode_relay(dest: SocketAddr, payload: &[u8]) -> Result<Vec<u8>, RelayEr
 
 /// Strictly decode a relay message into the destination and the datagram.
 ///
-/// Returns an error for an unknown family, a truncated header, or a declared
-/// length past the end of the buffer. Bytes after the declared datagram (slot
-/// padding) are ignored.
+/// Returns an error for an unknown family, a truncated header, a declared
+/// length past the end of the buffer, or a declared length past the family's
+/// slot capacity. Bytes after the declared datagram (slot padding) are ignored.
+///
+/// Capacity is checked **before** the truncation check: a frame declaring more
+/// than the family's slot capacity is a protocol violation that no datagram
+/// could satisfy, so it is reported as `TooLarge` even when the buffer is also
+/// short of the declared length.
 pub fn decode_relay(msg: &[u8]) -> Result<(SocketAddr, &[u8]), RelayError> {
     let family = *msg.first().ok_or(RelayError::Truncated(0))?;
-    let (addr, hdr_len) = match family {
+    let (addr, hdr_len, max) = match family {
         FAMILY_IPV4 => {
             if msg.len() < HDR_LEN_V4 {
                 return Err(RelayError::Truncated(msg.len()));
             }
             let octets = [msg[1], msg[2], msg[3], msg[4]];
             let port = u16::from_be_bytes([msg[5], msg[6]]);
-            (SocketAddr::from((octets, port)), HDR_LEN_V4)
+            (
+                SocketAddr::from((octets, port)),
+                HDR_LEN_V4,
+                MAX_DATAGRAM_V4,
+            )
         }
         FAMILY_IPV6 => {
             if msg.len() < HDR_LEN_V6 {
@@ -116,12 +125,19 @@ pub fn decode_relay(msg: &[u8]) -> Result<(SocketAddr, &[u8]), RelayError> {
             (
                 SocketAddr::from((std::net::Ipv6Addr::from(octets), port)),
                 HDR_LEN_V6,
+                MAX_DATAGRAM_V6,
             )
         }
         other => return Err(RelayError::BadFamily(other)),
     };
 
     let len = u16::from_be_bytes([msg[hdr_len - 2], msg[hdr_len - 1]]) as usize;
+    // Bound the accepted range by the family capacity, exactly as
+    // `encode_relay` does, so no datagram can decode that the encoder could
+    // never produce (such a datagram cannot be re-framed for the reply path).
+    if len > max {
+        return Err(RelayError::TooLarge { max, got: len });
+    }
     if msg.len() < hdr_len + len {
         return Err(RelayError::Truncated(msg.len()));
     }
@@ -380,6 +396,115 @@ mod tests {
         assert!(matches!(
             encode_relay(dest, &vec![0u8; MAX_DATAGRAM_V4 + 1]),
             Err(RelayError::TooLarge { .. })
+        ));
+    }
+
+    /// Build a *complete* frame by hand: exactly `header + declared_len`
+    /// bytes, so the declared datagram is fully present.  The encoder refuses
+    /// to emit one past the family capacity, so forging the `len` field is
+    /// the only way to exercise the over-capacity decode path.
+    fn forge_frame(dest: SocketAddr, declared_len: usize) -> Vec<u8> {
+        let hdr = hdr_for(dest);
+        let mut frame = vec![0u8; hdr + declared_len];
+        match dest {
+            SocketAddr::V4(a) => {
+                frame[0] = FAMILY_IPV4;
+                frame[1..5].copy_from_slice(&a.ip().octets());
+                frame[5..7].copy_from_slice(&dest.port().to_be_bytes());
+            }
+            SocketAddr::V6(a) => {
+                frame[0] = FAMILY_IPV6;
+                frame[1..17].copy_from_slice(&a.ip().octets());
+                frame[17..19].copy_from_slice(&dest.port().to_be_bytes());
+            }
+        }
+        frame[hdr - 2..hdr].copy_from_slice(&(declared_len as u16).to_be_bytes());
+        frame
+    }
+
+    fn hdr_for(dest: SocketAddr) -> usize {
+        if dest.is_ipv4() {
+            HDR_LEN_V4
+        } else {
+            HDR_LEN_V6
+        }
+    }
+
+    /// The largest datagram the encoder can produce must decode: the decoder
+    /// must not be stricter than `encode_relay` (both family edges).
+    #[test]
+    fn decode_accepts_max_capacity_both_families() {
+        for (dest, max) in [
+            (
+                "192.0.2.1:1".parse::<SocketAddr>().unwrap(),
+                MAX_DATAGRAM_V4,
+            ),
+            (
+                "[2001:db8::1]:1".parse::<SocketAddr>().unwrap(),
+                MAX_DATAGRAM_V6,
+            ),
+        ] {
+            let frame = encode_relay(dest, &vec![0x5Au8; max]).expect("max must encode");
+            assert_eq!(frame.len(), PAYLOAD_LEN, "a max frame fills the slot");
+            let (got_dest, datagram) = decode_relay(&frame).expect("max must decode");
+            assert_eq!(got_dest, dest);
+            assert_eq!(datagram.len(), max);
+        }
+    }
+
+    /// A complete frame declaring more than the family capacity decodes to a
+    /// datagram `encode_relay` refuses to produce.  Today that accepted
+    /// datagram is forwarded by `forward.rs` and then re-encoded on the reply
+    /// path as `Err(TooLarge)`, so the reply is silently lost (N-6).  The
+    /// decoder must reject the frame at the first byte past the cap.
+    #[test]
+    fn decode_rejects_over_capacity_both_families() {
+        for (dest, max) in [
+            (
+                "192.0.2.1:1".parse::<SocketAddr>().unwrap(),
+                MAX_DATAGRAM_V4,
+            ),
+            (
+                "[2001:db8::1]:1".parse::<SocketAddr>().unwrap(),
+                MAX_DATAGRAM_V6,
+            ),
+        ] {
+            // One byte below the cap still decodes, so only the overflow
+            // separates the two cases.
+            let at_max = forge_frame(dest, max);
+            let (got_dest, datagram) = decode_relay(&at_max).expect("max must decode");
+            assert_eq!(got_dest, dest);
+            assert_eq!(datagram.len(), max);
+
+            for over in [max + 1, max + 2, u16::MAX as usize] {
+                assert!(
+                    matches!(
+                        decode_relay(&forge_frame(dest, over)),
+                        Err(RelayError::TooLarge { .. })
+                    ),
+                    "declared len {over} exceeds the {max}-byte cap and must be rejected"
+                );
+            }
+        }
+    }
+
+    /// A frame that is both over-capacity *and* short of its declared length
+    /// reports the capacity fault: such a datagram can never be forwarded, so
+    /// the protocol violation is the informative cause.  Below capacity and
+    /// short of the declared length keeps the existing `Truncated` report.
+    #[test]
+    fn over_capacity_wins_over_truncation() {
+        let dest = "192.0.2.1:1".parse::<SocketAddr>().unwrap();
+        // Header only, declaring MAX_DATAGRAM_V4 + 1 bytes it does not carry.
+        let short = forge_frame(dest, MAX_DATAGRAM_V4 + 1);
+        assert!(matches!(
+            decode_relay(&short[..HDR_LEN_V4]),
+            Err(RelayError::TooLarge { .. })
+        ));
+        // Below capacity and short of the declared length stays `Truncated`.
+        assert!(matches!(
+            decode_relay(&forge_frame(dest, 64)[..HDR_LEN_V4]),
+            Err(RelayError::Truncated(_))
         ));
     }
 

@@ -298,7 +298,8 @@ Tunnel considers active attacks including:
 - packet modification,
 - downgrade attempts,
 - protocol manipulation,
-- traffic probing.
+- traffic probing,
+- resource exhaustion (denial of service).
 
 Security mechanisms must ensure:
 
@@ -306,6 +307,35 @@ Security mechanisms must ensure:
 - correct protocol state handling,
 - rejection of invalid states,
 - no silent fallback to weaker security.
+
+## 7.1 Resource exhaustion (bounded resources)
+
+An adversary may flood the server with datagrams that are cheap to send and
+expensive to process, or with datagrams that aim to grow internal state.
+
+Tunnel bounds the resources an unauthenticated peer can cause the server to
+consume:
+
+- **Bounded pending handshake table.** No session or handshake state is
+  allocated before a validated fragment and a per-source budget check; the
+  table is capped (`max_pending`) and entries expire on a TTL.
+- **Per-source failure budget.** The data path charges a token only when an
+  AEAD decrypt actually fails — not per byte and not per datagram. An
+  exhausted source has its packets dropped without decryption work.
+- **Lookup-first, no allocation on a miss.** A data-path datagram naming an
+  unknown or unowned session id is dropped before the failure gate and
+  allocates no gate state (D24).
+- **Bounded gate state.** Failure-gate state is bounded by the active session
+  population (`max_sessions`, default 64), with `max_fail_buckets` as a hard
+  backstop; the session table is bounded by `max_sessions` with least-
+  recently-active eviction, and idle and lifetime caps bound each session.
+
+These are *bounded-resource* guarantees, not availability guarantees. Out of
+scope: the volume of traffic a legitimate key-holder sends, a server
+deliberately saturated by a very large number of distinct well-formed sources,
+and the availability conditions in §8 (compromised endpoints, malware,
+operating-system failure). Defending against those requires deployment-level
+measures outside the protocol.
 
 ---
 

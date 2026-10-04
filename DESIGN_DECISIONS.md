@@ -1210,6 +1210,145 @@ never the vector.
 
 ---
 
+# D24 - Data-Path Failure Budget: What Is Counted and What Is Bounded
+
+## Status
+
+Accepted (M11, N-4)
+
+## Context
+
+The data path carries a per-source failure gate: a token (burst 64 / 10 s) is
+consumed only when an AEAD decrypt actually fails, and an exhausted source has
+its packets dropped without decrypt work. That gate was sound in intent but
+wrong in two mechanical details, both found in the M11 N-4 review.
+
+- **The gate counted the wrong thing, and touched state it had no business
+  touching.** `fail_gate_peek` ran *before* the sid was extracted and before
+  the session table was consulted, and it both *tested* and *created/refilled*
+  the bucket. So a datagram naming an unknown session id minted a full 64-token
+  bucket for its source and then returned `None` — zero AEAD work performed,
+  zero tokens consumed, one bucket created.
+- **The consequence was unbounded attacker-controlled CPU.** The prune pass ran
+  on every call once the table exceeded 32 entries, and at the 4096-entry cap a
+  `min_by_key` scan ran per packet. Because the source key is the full
+  `SocketAddr`, one IP address yields up to **65,535** distinct keys by varying
+  the port. An attacker could therefore saturate the table and *hold* it there
+  indefinitely — roughly 409.6 datagrams per window keeps every bucket's
+  `last_refill` fresh enough to survive the prune — paying two O(n) scans per
+  packet forever. Memory was sound (genuinely capped); CPU was the defect.
+
+Resource exhaustion was also missing from the formal threat-model enumeration
+altogether (see `THREAT_MODEL.md` §7, corrected alongside this decision).
+
+## Decision
+
+- **What the gate counts is expensive authenticated/decryption work — not
+  bytes and not datagrams.** A token is consumed only when an AEAD decrypt
+  actually fails. Traffic that never reaches a decrypt is never charged;
+  charging it would be accounting for work the server did not do.
+- **The source key is `SocketAddr`, port included.** This is stated explicitly
+  because it is the fact that made the old behaviour exploitable: one IP
+  address is up to 65,535 distinct keys, so "per-source" must never be read as
+  "per-host".
+- **Lookup-first invariant (the fix).** Traffic bearing an unknown or unowned
+  session id is resolved against the session table and dropped **before** the
+  gate. It must not allocate or touch a fail-gate bucket. Such traffic performs
+  no decryption and consumes no budget, so charging it is meaningless work that
+  only inflates attacker-controlled state. The gate is now a pure *test* on the
+  packet path and bucket creation happens only on the real-failure path, which
+  is its sole writer.
+- **Resource bound.** Fail-gate state is bounded by the **active session
+  population** — at most `max_sessions` live sessions (default 64) — and not by
+  unauthenticated source diversity reaching a 4096-entry table.
+  `max_fail_buckets` (default 4096) is retained as a hard backstop and as the
+  fail-closed switch: `max_fail_buckets == 0` disables the data path.
+- **The gate still applies to known sessions.** Reordering the gate does not
+  ungate it. A datagram that presents a live session id and then fails AEAD is
+  charged, and once a source's budget is exhausted its packets are dropped
+  without decrypt work even if they are authentic.
+- **NAT / shared-source consequence is accepted, not solved.** Per-source
+  semantics are preserved deliberately. A global token gate was considered and
+  rejected: it would let one noisy client starve every other client behind the
+  same address, converting a per-source limit into a trivially-triggered
+  global denial of service. The known consequence — clients behind one NAT
+  egress share one budget — is accepted, and is benign in practice because
+  consumption is failure-only, so honest traffic never drains the shared budget.
+- **The remaining bounded scan, and why no second eviction algorithm is
+  introduced.** After this change any scan that still occurs is bounded by the
+  active-session population (≤ `max_sessions`, default 64) rather than by 4096.
+  A clock or LRU eviction pass is deliberately **not** added at this time: the
+  asymptotic win is real but small against a bound of 64, and a second eviction
+  mechanism is a second thing to get wrong, in the one code path whose failure
+  mode is "attacker shapes our internal state". This is a deliberate,
+  revisitable tradeoff, not an oversight.
+- **Actual M1 accounting, recorded precisely.** A full 4-fragment M1 costs
+  exactly **2** tokens; M1 + M3 costs exactly **3**. The charge points, which
+  already existed in code and are now recorded here as contract:
+  - fragment 0 → **1 token**, charged *before* the pending entry is allocated
+    (allocation is what an attacker can force to grow);
+  - the completing fragment → **1 token**, charged *before* the expensive
+    crypto (roster verification + KEM);
+  - fragments 1–2 → **free**, because they are pure reassembly: a `memcpy`
+    into an already-allocated buffer, no allocation and no crypto;
+  - M3 → **1 token**, before decapsulation/HKDF/HMAC.
+  The gate on the completing fragment now runs *before* the ~5.6 KiB
+  `asm.message().to_vec()` copy, so a refused source never pays for the copy.
+  The copy is pure local work with no side effects, so this reordering changes
+  neither token accounting nor retransmission semantics nor the success path.
+
+### Relationship to accepted decisions
+
+D24 **does not modify** D13 (handshake construction and its DoS posture), D16
+(rekey as close + re-establish), D20 (pre-v2 transport removal), or D12
+(authentication model). It refines *where* the existing data-path gate is
+evaluated and *when* buckets are materialised, and it pins the accounting that
+D13's per-source limiter already implemented. D22 and D24 share no surface.
+Resource exhaustion is recorded in `THREAT_MODEL.md` §7 as an adversary
+consideration; the bounded-resource invariants it lists — bounded pending table
+with TTL, per-source failure budget, lookup-first no-allocation — are the
+protocol-level statements of this decision. Out of scope for D24 remains what
+§8 already excludes: compromised endpoints, malware, and OS failures. D24 does
+not and cannot bound traffic *volume* a well-behaved peer sends, nor make a
+server survive being deliberately saturated by a very large number of distinct
+legitimate-looking sources.
+
+## Consequences
+
+**Advantages:**
+
+- unknown-session traffic performs no gate work at all, so the attacker-
+  controlled CPU sink (O(n) scans per packet over a 4096-entry table held
+  fresh by ~409.6 pkt/s) is gone
+- fail-gate state is now bounded by something the protocol already bounds and
+  the operator already configures (`max_sessions`), not by a number the
+  attacker influences directly
+- the bucket table's only writer is a real AEAD failure, which makes the
+  "failure-only" property true by construction rather than by convention
+
+**Tradeoffs / notes:**
+
+- the sid is parsed before the gate, so a gated source still pays a
+  fixed-size slice read and a hash lookup — negligible, and unavoidable if the
+  gate is to remain keyed on the session that will be decrypted
+- clients sharing a NAT egress share a failure budget; accepted (§ above) and
+  benign because honest traffic never consumes it
+- a deliberately large number of genuinely distinct sources that each cause
+  real failures can still reach `max_fail_buckets`; that is now the correct
+  signal (real failures, not probe noise), and the cap still holds
+
+**Validation:** 10 new focused tests assert the resource invariants directly,
+not by timing: unknown-SID traffic across 4,096 distinct ports on one IP
+allocates **zero** buckets; the same volume repeated 8× still allocates zero;
+bucket count equals the live-session population under 2,000-source hostile
+churn and does not grow on a second churn round; the gate demonstrably still
+bites on a known sid whose AEAD fails; shared-source fairness holds; and the
+handshake limiter's exact M1=2 / M1+M3=3 accounting is pinned through
+observable gate behaviour with no wall clock. Existing suite: 226 core tests
+green, plus the wider workspace gates.
+
+---
+
 # Open Design Decisions
 
 The following areas remain intentionally unresolved.
@@ -1222,7 +1361,8 @@ Rekeying Model (D16), Key Provisioning (D17), Application Model (D18), Cover
 Traffic Scheduling Model (D19), Removal of the Pre-v2 QUIC/TLS Transport (D20),
 External Known-Answer Anchoring Policy (D21), Metadata Resistance Target:
 Reduction, Not Anonymity (D22), Recoverable Transport Reset Isolation +
-Windows Cover Clock (D23).
+Windows Cover Clock (D23), Data-Path Failure Budget: What Is Counted and
+What Is Bounded (D24).
 
 ---
 

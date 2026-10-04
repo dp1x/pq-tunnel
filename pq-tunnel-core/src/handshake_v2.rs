@@ -1448,28 +1448,47 @@ impl ServerHandshake {
         let sid = frag.sid;
 
         if self.pending.contains_key(&sid) {
-            let entry = self.pending.get_mut(&sid).expect("checked");
-            if entry.source != from {
+            // Snapshot the entry fields this arm needs: no `self.pending` borrow
+            // may be live across `rate_ok`, which takes `&mut self`.
+            let (entry_source, entry_state) = {
+                let entry = self.pending.get(&sid).expect("checked");
+                (entry.source, entry.state)
+            };
+            if entry_source != from {
                 // sid collision across sources → reject the newcomer (D13).
                 return Ok(ServerEvent::None);
             }
-            let entry_state = entry.state;
             match entry_state {
                 PendingState::AwaitM1 => {
-                    let asm = entry.assembler.as_mut().expect("AwaitM1 has assembler");
-                    match asm.add_fragment(&frag) {
+                    // Feed the fragment (it advances the assembler) in its own
+                    // scoped borrow.
+                    let frag_result = {
+                        let entry = self.pending.get_mut(&sid).expect("checked");
+                        let asm = entry.assembler.as_mut().expect("AwaitM1 has assembler");
+                        asm.add_fragment(&frag)
+                    };
+                    match frag_result {
                         FragmentResult::Completed => {
-                            let m1_bytes = asm.message().expect("complete").to_vec();
                             // Expensive work (roster verify + KEM) is per-source
                             // budgeted like every other allocation (D13 DoS pin).
+                            // The gate runs BEFORE the ~5.6 KiB reassembly copy so
+                            // a refused source never pays for it; the copy is pure
+                            // local work, so ordering it after the gate changes
+                            // neither token accounting nor the success path.
                             if !self.rate_ok(from) {
                                 return Ok(ServerEvent::None);
                             }
+                            let m1_bytes = {
+                                let entry = self.pending.get(&sid).expect("checked");
+                                let asm = entry.assembler.as_ref().expect("AwaitM1 has assembler");
+                                asm.message().expect("complete").to_vec()
+                            };
                             self.complete_m1(sid, m1_bytes, from)
                         }
                         // Only state-advancing fragments extend the TTL; a
                         // duplicate flood cannot keep an entry alive.
                         FragmentResult::Advanced => {
+                            let entry = self.pending.get_mut(&sid).expect("checked");
                             entry.last_seen = Instant::now();
                             Ok(ServerEvent::None)
                         }
@@ -1477,15 +1496,18 @@ impl ServerHandshake {
                     }
                 }
                 PendingState::AwaitM3 => {
+                    let (body, src) = {
+                        let entry = self.pending.get(&sid).expect("checked");
+                        let body = entry
+                            .m2_cache
+                            .as_ref()
+                            .expect("AwaitM3 has M2 cache")
+                            .clone();
+                        (body, entry.source)
+                    };
                     if frag.frag_idx != 0 {
                         return Ok(ServerEvent::None);
                     }
-                    let body = entry
-                        .m2_cache
-                        .as_ref()
-                        .expect("AwaitM3 has M2 cache")
-                        .clone();
-                    let src = entry.source;
                     // Duplicate M1 → resend the cached M2 byte-identical (D13).
                     // Gated to fragment 0 so one retransmit burst yields ONE
                     // resend (no per-fragment 4×5 self-amplification), and
@@ -2500,6 +2522,200 @@ pub(crate) mod tests {
             .handle_datagram(&m1_frag0_datagram(sid), OTHER_ADDR)
             .expect("srv");
         assert_eq!(server.pending_len(), 3, "rate limit is per-source");
+    }
+
+    /// D24 — exact per-source token accounting, observed through the gate.
+    ///
+    /// A full 4-fragment M1 costs exactly **2** tokens: one at fragment 0
+    /// (pending-entry ALLOCATION) and one at the completing fragment (the gate
+    /// that precedes the expensive crypto: roster verify + KEM).  Fragments 1-2
+    /// return `FragmentResult::Advanced` and are free — they memcpy into an
+    /// already-allocated buffer, performing no allocation and no crypto.  M3
+    /// costs 1 more, so M1 + M3 = 3.
+    ///
+    /// Proven deterministically with `rate_limit_burst = 3`: with a full M1+M3
+    /// costing 3, a *second* full M1 from the same source is refused outright
+    /// (its fragment 0 cannot even allocate), whereas a budget of 4 would let
+    /// the second M1 allocate.  `pending_len` is the discriminator and needs no
+    /// wall clock.
+    #[test]
+    fn d24_full_m1_costs_two_tokens_and_m3_one_more() {
+        let (cc, mut sc) = test_configs();
+        sc.rate_limit_burst = 3; // exactly M1 (2) + M3 (1)
+
+        // First handshake.  `reach_await_m3` stops *before* delivering M3, so
+        // at this point exactly the M1's 2 tokens are spent and 1 remains.
+        let sid = [41u8; SESSION_ID_LEN];
+        let (_, mut server, _, m3_frags) = reach_await_m3(&cc, &sc, sid);
+        assert_eq!(server.pending_len(), 1, "first handshake held its entry");
+
+        // The remaining single token is exactly the M3's cost: the genuine M3
+        // is accepted and completes the handshake.
+        assert!(
+            matches!(
+                server
+                    .handle_datagram(&m3_frags[0], CLIENT_ADDR)
+                    .expect("srv"),
+                ServerEvent::Complete(_)
+            ),
+            "M1 (2) + M3 (1) exactly exhausts a 3-token budget"
+        );
+        assert_eq!(
+            server.pending_len(),
+            0,
+            "entry consumed by the completed M3"
+        );
+
+        // Budget now empty: a second full M1 from the same source is refused
+        // outright — its fragment 0 cannot even allocate a pending entry.  If
+        // the M1 had cost fewer than 2 tokens this entry would exist.
+        let sid2 = [42u8; SESSION_ID_LEN];
+        let client2 = ClientHandshake::new(&cc, sid2).expect("client");
+        let mut m2 = Vec::new();
+        for f in client2.m1_frags() {
+            if let ServerEvent::Emit(frags, _) =
+                server.handle_datagram(f, CLIENT_ADDR).expect("srv")
+            {
+                m2 = frags;
+            }
+        }
+        assert!(
+            m2.is_empty(),
+            "an exhausted budget must refuse the second M1 outright"
+        );
+        assert_eq!(
+            server.pending_len(),
+            0,
+            "the second M1 must not allocate a pending entry (frag 0 is gated)"
+        );
+    }
+
+    /// D24 — the completion charge is charged at the completing fragment, not
+    /// at allocation, and pure-reassembly fragments are free.  With a budget of
+    /// exactly 2 (one allocation + one completion), a full M1 emits its M2 and
+    /// spends everything.
+    #[test]
+    fn d24_reassembly_fragments_are_free_but_completion_is_charged() {
+        let (cc, mut sc) = test_configs();
+        sc.rate_limit_burst = 2;
+        let mut server = ServerHandshake::new(&sc);
+        let sid = [43u8; SESSION_ID_LEN];
+
+        let client = ClientHandshake::new(&cc, sid).expect("client");
+        let m1 = client.m1_frags().to_vec();
+        assert_eq!(m1.len(), M1_FRAG_COUNT as usize, "M1 is 4 fragments");
+
+        // Fragment 0: charged (allocation), 1 token left.
+        server.handle_datagram(&m1[0], CLIENT_ADDR).expect("srv");
+        assert_eq!(server.pending_len(), 1, "frag 0 allocated the entry");
+
+        // Fragments 1 and 2: `Advanced`, no charge — they advance the entry.
+        for (i, f) in m1.iter().enumerate().take(3).skip(1) {
+            assert!(
+                matches!(
+                    server.handle_datagram(f, CLIENT_ADDR).expect("srv"),
+                    ServerEvent::None
+                ),
+                "reassembly fragment {i} emits nothing"
+            );
+        }
+        assert_eq!(
+            server.pending_len(),
+            1,
+            "reassembly fragments are free and keep the entry"
+        );
+
+        // Fragment 3 completes the M1: charged (expensive crypto gate) and the
+        // budget is now exactly empty — the M2 is still emitted.
+        let mut m2 = Vec::new();
+        if let ServerEvent::Emit(frags, _) =
+            server.handle_datagram(&m1[3], CLIENT_ADDR).expect("srv")
+        {
+            m2 = frags;
+        }
+        assert_eq!(m2.len(), M2_FRAG_COUNT as usize, "full M2 emitted");
+
+        // Budget empty: a second M1's fragment 0 cannot allocate.
+        let sid2 = [44u8; SESSION_ID_LEN];
+        let client2 = ClientHandshake::new(&cc, sid2).expect("client");
+        server
+            .handle_datagram(&client2.m1_frags()[0], CLIENT_ADDR)
+            .expect("srv");
+        assert_eq!(
+            server.pending_len(),
+            1,
+            "an exhausted 2-token budget refuses a second M1 at frag 0"
+        );
+    }
+
+    /// An invalid M1 is still rejected correctly after the reordered gate: the
+    /// `rate_ok` decision now precedes the ~5.6 KiB reassembly copy, but the
+    /// failure semantics (no M2, no session state, silent drop) are unchanged.
+    #[test]
+    fn d24_invalid_m1_is_still_rejected_after_the_reorder() {
+        let (cc, mut sc) = test_configs();
+        sc.rate_limit_burst = 16;
+        let mut server = ServerHandshake::new(&sc);
+        let sid = [45u8; SESSION_ID_LEN];
+
+        // Reassemble a structurally valid M1, then corrupt a signature byte in
+        // the final fragment so roster verification fails in `complete_m1`.
+        let client = ClientHandshake::new(&cc, sid).expect("client");
+        let m1 = client.m1_frags().to_vec();
+        let mut dg = *m1[3].as_bytes();
+        let pos = HS_FRAG_HEADER_LEN + 4; // inside the ClientHello signature
+        dg[pos] ^= 0xFF;
+        let corrupt = WirePacket::from_bytes(&dg).expect("1280");
+
+        for (i, f) in m1.iter().enumerate() {
+            let pkt = if i == 3 { &corrupt } else { f };
+            assert!(
+                matches!(
+                    server.handle_datagram(pkt, CLIENT_ADDR).expect("srv"),
+                    ServerEvent::None
+                ),
+                "an unverifiable M1 must be a silent drop"
+            );
+        }
+        assert_eq!(
+            server.pending_len(),
+            0,
+            "invalid M1: no session state, no M2 (D12)"
+        );
+    }
+
+    /// Valid M1 retransmission semantics are unchanged by the reorder: a
+    /// duplicate M1 after M2 resends the cached M2 byte-identical, once per
+    /// burst.  This is the D13 client-driven retransmission contract and the
+    /// reason the completion arm cannot change what it charges or returns.
+    #[test]
+    fn d24_valid_m1_retransmission_is_unchanged() {
+        let (cc, sc) = test_configs();
+        let sid = [46u8; SESSION_ID_LEN];
+        let (_, mut server, m2_frags, _) = reach_await_m3(&cc, &sc, sid);
+        assert_eq!(m2_frags.len(), M2_FRAG_COUNT as usize);
+
+        let client = ClientHandshake::new(&cc, sid).expect("client");
+        let m1 = client.m1_frags().to_vec();
+
+        // One retransmit burst yields exactly ONE byte-identical M2 resend.
+        let mut resends: Vec<Vec<WirePacket>> = Vec::new();
+        for f in &m1 {
+            if let ServerEvent::Emit(frags, _) =
+                server.handle_datagram(f, CLIENT_ADDR).expect("srv")
+            {
+                resends.push(frags);
+            }
+        }
+        assert_eq!(resends.len(), 1, "one M2 resend per retransmit burst");
+        assert_eq!(resends[0].len(), m2_frags.len(), "resend is the full M2");
+        for (a, b) in resends[0].iter().zip(&m2_frags) {
+            assert_eq!(
+                a.as_bytes(),
+                b.as_bytes(),
+                "cached M2 resend must be byte-identical"
+            );
+        }
     }
 
     #[test]

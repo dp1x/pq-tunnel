@@ -43,8 +43,12 @@
 //!   decrypt fails; when a source's tokens are exhausted its packets are
 //!   dropped without decrypt work.  Legitimate traffic has ~0% failure rate;
 //!   a failing session is gated for at most one window and recovers via D16
-//!   re-establishment.  The bucket table is hard-capped (`max_fail_buckets`,
-//!   default 4096) with stalest eviction.
+//!   re-establishment.  D24 pins the lookup-first ordering: a datagram whose
+//!   sid names no live session is dropped *before* the gate, so it allocates
+//!   and touches no bucket.  The source key is the full `SocketAddr` (port
+//!   included), so the table is bounded by the active session population
+//!   (`max_sessions`, default 64) rather than by unauthenticated source
+//!   diversity; `max_fail_buckets` (default 4096) remains a hard backstop.
 //!
 //! # Event model
 //!
@@ -424,12 +428,20 @@ impl ServerSessionManager {
         pkt: &WirePacket,
         from: SocketAddr,
     ) -> Result<ManagerEvent, ManagerError> {
-        if !self.fail_gate_peek(from) {
-            return Ok(ManagerEvent::None);
-        }
         let sid: [u8; SESSION_ID_LEN] = pkt.as_bytes()[1..1 + SESSION_ID_LEN]
             .try_into()
             .expect("fixed-size sid slice");
+        // D24 lookup-first: the sid is resolved BEFORE the failure gate.  A
+        // datagram naming an unowned sid performs no decryption and burns no
+        // budget, so charging it is meaningless work that only inflates
+        // attacker-controlled state (one bucket per distinct source, up to
+        // 65,535 from a single IP by varying the port).
+        if !self.sessions.contains_key(&sid) {
+            return Ok(ManagerEvent::None);
+        }
+        if !self.fail_gate_peek(from) {
+            return Ok(ManagerEvent::None);
+        }
         let now = Instant::now();
 
         let result = match self.sessions.get_mut(&sid) {
@@ -609,13 +621,41 @@ impl ServerSessionManager {
 
     // -- data-path failure gate ----------------------------------------------
 
-    /// Token check WITHOUT consuming: refill the bucket for `from` and report
-    /// whether a decrypt attempt may proceed.  Bucket creation / cap
-    /// eviction happens here (mirrors handshake_v2 `rate_ok`).
-    fn fail_gate_peek(&mut self, from: SocketAddr) -> bool {
+    /// Token check WITHOUT consuming, and WITHOUT allocating: report whether a
+    /// decrypt attempt for a *known* session may proceed.  A source with no
+    /// bucket has spent nothing yet, so a full burst is assumed and no state is
+    /// created (D24 lookup-first: buckets are only materialised by a real
+    /// failure, which bounds the table by the active session population).
+    fn fail_gate_peek(&self, from: SocketAddr) -> bool {
         if self.limits.max_fail_buckets == 0 {
             // Degenerate configuration: fail closed (no data path).
             return false;
+        }
+        match self.fail_buckets.get(&from) {
+            // No bucket → nothing consumed, so nothing to gate on.
+            None => true,
+            Some(b) => {
+                if Instant::now().duration_since(b.last_refill) >= self.limits.fail_window {
+                    // Window elapsed: the bucket refills to a full burst on the
+                    // next real failure (see `fail_gate_consume`).
+                    return true;
+                }
+                b.tokens > 0
+            }
+        }
+    }
+
+    /// Consume one failure token (called only after a real AEAD failure).
+    ///
+    /// The bucket is created on first failure — this is the only writer of the
+    /// fail-gate table.  Cap handling (prune stale, evict stalest at
+    /// `max_fail_buckets`) mirrors handshake_v2 `rate_ok`, but runs on the
+    /// failure path rather than on every datagram: after D24 the table can only
+    /// reach that size if the active session population itself reaches it.
+    fn fail_gate_consume(&mut self, from: SocketAddr) {
+        if self.limits.max_fail_buckets == 0 {
+            // Degenerate configuration: fail closed (no data path).
+            return;
         }
         let now = Instant::now();
         if self.fail_buckets.len() > 32 {
@@ -643,14 +683,7 @@ impl ServerSessionManager {
             bucket.tokens = self.limits.fail_burst;
             bucket.last_refill = now;
         }
-        bucket.tokens > 0
-    }
-
-    /// Consume one failure token (called only after a real AEAD failure).
-    fn fail_gate_consume(&mut self, from: SocketAddr) {
-        if let Some(b) = self.fail_buckets.get_mut(&from) {
-            b.tokens = b.tokens.saturating_sub(1);
-        }
+        bucket.tokens = bucket.tokens.saturating_sub(1);
     }
 }
 
@@ -1178,6 +1211,9 @@ pub async fn run_client_manager<T: HandshakeTransport>(
     // schedule under app load.
     let retransmit = client_retransmit_timer(manager);
     tokio::pin!(retransmit);
+    // One warn per reset episode (an ICMP storm from a vanished peer would
+    // otherwise spam at cover cadence until idle eviction reaps it).
+    let mut reset_noticed = false;
     loop {
         // D15 confirmation signal (informational for the app; outbound is not
         // gated — see module docs).
@@ -1196,8 +1232,24 @@ pub async fn run_client_manager<T: HandshakeTransport>(
         tokio::select! {
             r = transport.recv() => match r {
                 Err(HandshakeV2Error::DatagramRejected) => {}
+                // ICMP port-unreachable / WSAECONNRESET: the server's port
+                // vanished (it closed, crashed, or its network path reset).
+                // Informational in UDP, with no source address attached; the
+                // session itself is left to the manager's own timeout/retry
+                // path (handshake retransmits, or the D16 re-establishment).
+                // Local-transport error only: it must never tear down the
+                // tunnel (M9B).
+                Err(HandshakeV2Error::TransportReset) => {
+                    if !reset_noticed {
+                        reset_noticed = true;
+                        warn!("transport reset by peer (recoverable: session eviction handles the dead peer)");
+                    }
+                    continue;
+                }
                 Err(e) => return Err(ManagerError::Handshake(e)),
-                Ok((pkt, from)) => match manager.handle_datagram(&pkt, from)? {
+                Ok((pkt, from)) => {
+                    reset_noticed = false;
+                    match manager.handle_datagram(&pkt, from)? {
                     ManagerEvent::Send { packets, peer } => {
                         for p in &packets {
                             transport.send_to(p, peer).await?;
@@ -1223,6 +1275,7 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                         retransmit.set(client_retransmit_timer(manager));
                     }
                     ManagerEvent::Established { .. } | ManagerEvent::None => {}
+                    }
                 },
             },
             cmd = app_rx.recv() => {
@@ -1504,7 +1557,7 @@ async fn rearm_client<T: HandshakeTransport>(
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
-    use crate::codec::{Direction, MAX_PACKET_NONCE, PACKET_SIZE, PacketHeader};
+    use crate::codec::{Direction, MAX_PACKET_NONCE, PACKET_SIZE, PacketHeader, VERSION_LEN};
     use crate::handshake_v2::tests::{
         CLIENT_ADDR, OTHER_ADDR, SERVER_ADDR, test_configs, wired_transports,
     };
@@ -2963,10 +3016,12 @@ mod tests {
             0,
             "garbage must not establish sessions"
         );
-        // fail_gate_peek creates at most one bucket per distinct source.
-        assert!(
-            manager.fail_bucket_count() <= sources.len(),
-            "fail buckets must be bounded"
+        // D24: junk naming an unowned sid performs no decryption, so it
+        // allocates no fail bucket at all.
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "garbage must not allocate fail buckets"
         );
     }
 
@@ -3018,8 +3073,10 @@ mod tests {
         );
     }
 
-    /// The data-path fail-gate bucket table must not grow past
-    /// `max_fail_buckets` regardless of spoofed-source volume.
+    /// D24: a datagram whose sid names no live session must not allocate or
+    /// touch a fail-gate bucket, so spoofed-source junk volume cannot populate
+    /// the table at all.  `max_fail_buckets` (8 here) is no longer the binding
+    /// constraint on this path — the bucket count is exactly zero.
     #[test]
     fn server_fail_gate_bucket_table_bounded() {
         let (_, sc) = shared_configs();
@@ -3038,11 +3095,219 @@ mod tests {
                     .unwrap_or(ManagerEvent::None);
             }
         }
-        assert!(
-            manager.fail_bucket_count() <= 8,
-            "fail-gate table must cap at max_fail_buckets (got {})",
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "unknown-sid junk must allocate no fail bucket (got {})",
             manager.fail_bucket_count()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Session-accounting invariant: server Established/Closed pairing
+    // -----------------------------------------------------------------------
+
+    /// Mirrors the server driver's `ManagerEvent` → `ManagerNotification`
+    /// relay (run_server_manager): `Established`/`Closed` are relayed in the
+    /// order produced, `tick()` output is appended as it comes, everything
+    /// else is silent.  Session accounting in the forwarding app is an
+    /// add/sub pair over this stream, so it is only correct while the two
+    /// events are strictly paired — every `Closed` preceded by exactly one
+    /// `Established` for the same sid, and every `Established` eventually
+    /// matched by exactly one `Closed`.
+    #[derive(Default)]
+    struct NotificationRelay {
+        /// Sids announced `Established` to the app and not yet retired by a
+        /// `Closed`, in announcement order.  The forwarding app's session
+        /// counter is `Established - Closed`, so it stays correct exactly while
+        /// a `Closed` never arrives for a sid outside this set.
+        live: Vec<[u8; SESSION_ID_LEN]>,
+        /// Every `Established` seen, so the test can assert full pairing.
+        established: Vec<[u8; SESSION_ID_LEN]>,
+        /// Every `Closed` seen, in order.
+        closed: Vec<[u8; SESSION_ID_LEN]>,
+    }
+
+    impl NotificationRelay {
+        /// Feed one `ManagerEvent` exactly as the driver relays it.
+        fn event(&mut self, ev: ManagerEvent) {
+            match ev {
+                ManagerEvent::Established { sid, .. } => {
+                    assert!(
+                        !self.live.contains(&sid),
+                        "Established twice without a Closed for {sid:02x?}"
+                    );
+                    self.live.push(sid);
+                    self.established.push(sid);
+                }
+                ManagerEvent::Closed { sid, .. } => {
+                    // A Closed for a sid that was never announced to the app
+                    // would underflow any Established-minus-Closed counter.
+                    let pos =
+                        self.live.iter().position(|s| *s == sid).unwrap_or_else(|| {
+                            panic!("Closed for never-established sid {sid:02x?}")
+                        });
+                    self.live.remove(pos);
+                    self.closed.push(sid);
+                }
+                _ => {}
+            }
+        }
+
+        fn tick(&mut self, events: Vec<ManagerEvent>) {
+            for ev in events {
+                self.event(ev);
+            }
+        }
+    }
+
+    /// The driver relays `Established` in the same `handle_datagram` call that
+    /// returns `Closed{Capacity}` to `pending_closed`; the queued `Closed` is
+    /// drained by the next `tick`.  Ordering is therefore preserved and every
+    /// evicted sid was announced — the accounting add/sub pair stays balanced.
+    #[test]
+    fn server_capacity_eviction_is_paired_after_established() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_sessions = 2;
+        let mut manager = server_manager(limits);
+        let mut relay = NotificationRelay::default();
+
+        let mut live: Vec<([u8; SESSION_ID_LEN], WireSession)> = Vec::new();
+        // 3 iterations is the ceiling: the server's per-source DoS limiter
+        // (`rate_limit_burst` = 16 per window) charges exactly 2 tokens for one
+        // full 4-fragment M1 (fragment 0 allocation + completion) and 1 for the
+        // M3, so three handshakes cost 9 of 16 tokens.  A 4th would still fit;
+        // the loop is bounded by what the pairing assertion below needs (one
+        // eviction at `max_sessions` = 2), not by the budget.  That budget is
+        // D13's / D24's accounting, not a test artefact.
+        for i in 0..3u8 {
+            let sid = [i; SESSION_ID_LEN];
+            let mut client = ClientHandshake::new(&cc, sid).unwrap();
+            let mut m2 = Vec::new();
+            for f in client.m1_frags() {
+                if let ManagerEvent::Send { packets, .. } =
+                    manager.handle_datagram(f, CLIENT_ADDR).unwrap()
+                {
+                    m2 = packets;
+                }
+            }
+            assert_eq!(m2.len(), M2_FRAG_COUNT as usize, "full M2 emitted");
+            let mut m3 = Vec::new();
+            for f in &m2 {
+                if let ClientEvent::Emit(pkts) = client.handle_datagram(f).unwrap() {
+                    m3 = pkts;
+                }
+            }
+            for f in &m3 {
+                // Relay EVERY event the driver would relay, in the same order.
+                relay.event(manager.handle_datagram(f, CLIENT_ADDR).unwrap());
+            }
+            let (ws, _out) = client_established(&mut client, &cc);
+            live.push((sid, ws));
+        }
+        // Drain the capacity `Closed` events queued during the last handshake,
+        // exactly as the driver does (receive path, then `tick`).
+        relay.tick(manager.tick(Instant::now()));
+
+        assert_eq!(manager.session_count(), 2);
+        assert_eq!(relay.live.len(), 2, "relay must track the live table");
+        assert!(
+            !relay.closed.is_empty(),
+            "capacity evictions must be reported"
+        );
+        assert_eq!(
+            relay.established.len() - relay.closed.len(),
+            relay.live.len(),
+            "Established minus Closed must equal the live sessions"
+        );
+    }
+
+    /// Full server lifecycle sweep: every close path (capacity eviction, idle
+    /// and lifetime eviction, peer Close, nonce exhaustion, app-driven close)
+    /// must emit exactly one `Closed` per `Established` — none before, none
+    /// after, none twice.
+    #[test]
+    fn server_lifecycle_events_are_strictly_paired() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_sessions = 2;
+        limits.idle_timeout = Some(Duration::from_secs(3600));
+        limits.lifetime_cap = Some(Duration::from_secs(7200));
+        let mut manager = server_manager(limits);
+        let mut relay = NotificationRelay::default();
+
+        // 1. Peer Close.
+        let sid_a = [0x01; SESSION_ID_LEN];
+        let (_c_a, mut ws_a) = established_client_session(&mut manager, &cc, sid_a);
+        relay.event(ManagerEvent::Established {
+            sid: sid_a,
+            peer: CLIENT_ADDR,
+        });
+        let pkt = ws_a
+            .encrypt(MessageType::Close, &[0u8; PAYLOAD_LEN])
+            .unwrap();
+        relay.event(manager.handle_datagram(&pkt, CLIENT_ADDR).unwrap());
+
+        // 2. Idle + lifetime eviction of a second session.
+        let sid_b = [0x02; SESSION_ID_LEN];
+        established_client_session(&mut manager, &cc, sid_b);
+        relay.event(ManagerEvent::Established {
+            sid: sid_b,
+            peer: CLIENT_ADDR,
+        });
+        relay.tick(manager.tick(Instant::now() + Duration::from_secs(7200)));
+
+        // 3. Capacity eviction: a third handshake at max_sessions=2 evicts
+        //    the least-recently-active survivor, queued for the next tick.
+        let sid_c = [0x03; SESSION_ID_LEN];
+        established_client_session(&mut manager, &cc, sid_c);
+        relay.event(ManagerEvent::Established {
+            sid: sid_c,
+            peer: CLIENT_ADDR,
+        });
+        relay.tick(manager.tick(Instant::now() + Duration::from_secs(7200)));
+
+        // 4. App-driven close of the survivor.
+        let sid_d = [0x04; SESSION_ID_LEN];
+        let (mut client_d, _ws_d) = established_client_session(&mut manager, &cc, sid_d);
+        relay.event(ManagerEvent::Established {
+            sid: sid_d,
+            peer: CLIENT_ADDR,
+        });
+        let _ = client_established(&mut client_d, &cc);
+        relay.event(manager.close_session(&sid_d).unwrap());
+
+        // 5. Nonce exhaustion (D16) via an authentic boundary packet.  The
+        //    boundary packet must be built from the master that established
+        //    THIS sid, so the handshake outcome is driven directly here rather
+        //    than via `established_client_session` (which discards it).
+        let sid_e = [0x05; SESSION_ID_LEN];
+        let mut client_e = server_established(&mut manager, &cc, sid_e, CLIENT_ADDR);
+        let (_ws_e, out_e) = client_established(&mut client_e, &cc);
+        relay.event(ManagerEvent::Established {
+            sid: sid_e,
+            peer: CLIENT_ADDR,
+        });
+        let boundary = exhaustion_packet_c2s(&out_e.master, sid_e);
+        relay.event(manager.handle_datagram(&boundary, CLIENT_ADDR).unwrap());
+
+        // Table is empty again.
+        assert_eq!(manager.session_count(), 0);
+        relay.tick(manager.tick(Instant::now()));
+        assert!(relay.live.is_empty(), "no session may remain live");
+        assert_eq!(
+            relay.closed.len(),
+            relay.established.len(),
+            "every Established must be matched by exactly one Closed"
+        );
+        for sid in &relay.established {
+            assert_eq!(
+                relay.closed.iter().filter(|c| *c == sid).count(),
+                1,
+                "sid {sid:02x?} must be closed exactly once"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3668,8 +3933,9 @@ mod tests {
             "unknown-sid flood must not create/touch sessions"
         );
         assert!(
-            manager.fail_bucket_count() <= 8,
-            "fail buckets must stay capped"
+            manager.fail_bucket_count() == 0,
+            "unknown-sid flood must allocate no fail bucket (got {})",
+            manager.fail_bucket_count()
         );
         // Legit traffic from the un-gated client still works.
         assert!(matches!(
@@ -3734,9 +4000,10 @@ mod tests {
 
     /// Campaign 4 — logical leak check: establish+close 200 sessions on one server
     /// manager; session_count must return to 0 each time and the fail-bucket table
-    /// must not grow unboundedly across close cycles (a single legitimate source
-    /// may leave one full-token bucket, created by `fail_gate_peek` on a
-    /// successful Close — it never burns the source's failure budget).
+    /// must not grow across close cycles.  Under D24 lookup-first, a fully
+    /// legitimate establish→Close cycle performs no decryption failure at all,
+    /// so it leaves *zero* buckets — the table is only ever materialised by a
+    /// real AEAD failure.
     #[test]
     fn adv_sessions_table_resets_on_close() {
         let (cc, mut sc) = shared_configs();
@@ -3769,10 +4036,10 @@ mod tests {
                 "iter {i}: close already drained inline"
             );
             assert_eq!(manager.session_count(), 0, "iter {i}: session removed");
-            assert!(
-                manager.fail_bucket_count() <= 1,
-                "iter {i}: fail buckets must stay bounded (<=1 legit source), got {}",
-                manager.fail_bucket_count()
+            assert_eq!(
+                manager.fail_bucket_count(),
+                0,
+                "iter {i}: a legitimate lifecycle must allocate no fail bucket"
             );
         }
     }
@@ -4026,6 +4293,323 @@ mod tests {
         ));
     }
 
+    // -----------------------------------------------------------------------
+    // D24 — data-path failure gate: what is counted, and what is bounded
+    // -----------------------------------------------------------------------
+
+    /// Build a version-valid data-path datagram naming `sid`, addressed to
+    /// reach the data path (byte 9 ∉ {0x10,0x20,0x30}) with no AEAD
+    /// relationship to any session.
+    fn d24_data_packet(sid: [u8; SESSION_ID_LEN]) -> WirePacket {
+        let mut bytes = [0u8; PACKET_SIZE];
+        bytes[0] = crate::codec::PROTOCOL_VERSION;
+        bytes[1..1 + SESSION_ID_LEN].copy_from_slice(&sid);
+        bytes[VERSION_LEN + SESSION_ID_LEN] = 0x00; // MessageType::Data
+        WirePacket::from_bytes(&bytes).expect("fixed-size")
+    }
+
+    /// A datagram naming an unowned sid performs no decryption and must not
+    /// allocate a fail-gate bucket — for ANY source, including 4,096 distinct
+    /// ports on one IP address (the source key is the full `SocketAddr`, port
+    /// included).  Before D24 each such source minted a full-token bucket,
+    /// saturating and holding the table indefinitely at ~409 packets/window.
+    #[test]
+    fn d24_unknown_sid_never_allocates_a_fail_bucket() {
+        let (_, sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_fail_buckets = 4096;
+        let mut manager = ServerSessionManager::new(&sc, limits).expect("manager");
+        let pkt = d24_data_packet([0xEE; SESSION_ID_LEN]); // no session owns this sid
+
+        // 4096 distinct sources on a single IP, one datagram each: the exact
+        // shape that used to fill the table to its cap.
+        for port in 0..4096u16 {
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), 1024 + port));
+            assert!(
+                matches!(
+                    manager.handle_datagram(&pkt, from).unwrap(),
+                    ManagerEvent::None
+                ),
+                "unknown-sid datagram from {from} must be silent"
+            );
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "unknown-SID traffic must allocate no fail-gate bucket, got {}",
+            manager.fail_bucket_count()
+        );
+        assert_eq!(manager.session_count(), 0, "and no session state");
+    }
+
+    /// The same 4,096-source volume, repeated many times, still allocates
+    /// nothing: the invariant is about the miss path, not about a one-shot
+    /// table that happens to be empty.
+    #[test]
+    fn d24_unknown_sid_flood_never_allocates_a_fail_bucket() {
+        let (_, sc) = shared_configs();
+        let mut manager =
+            ServerSessionManager::new(&sc, SessionLimits::default()).expect("manager");
+        let pkt = d24_data_packet([0xEE; SESSION_ID_LEN]);
+        for round in 0..8u16 {
+            for port in 0..512u16 {
+                let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 7), 1024 + port));
+                let _ = manager.handle_datagram(&pkt, from).unwrap();
+            }
+            assert_eq!(
+                manager.fail_bucket_count(),
+                0,
+                "round {round}: unknown-SID flood allocated {} buckets",
+                manager.fail_bucket_count()
+            );
+        }
+    }
+
+    /// The gate MUST still apply to a KNOWN sid whose AEAD fails — lookup-first
+    /// reorders the gate, it does not remove it.  With `fail_burst = 2`, the
+    /// first two tampered packets for a live session are decrypted-and-failed
+    /// (each consuming one token), and the third is dropped without decrypt:
+    /// after exhaustion even a VALID packet from that source yields `None`.
+    #[test]
+    fn d24_known_sid_aead_failure_is_still_gated() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.fail_burst = 2;
+        let mut manager = server_manager(limits);
+        let (_client, mut ws) = established_client_session(&mut manager, &cc, SID);
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+
+        // Before any failure the gate must let legitimate traffic through.
+        assert!(matches!(
+            manager.handle_datagram(&good, CLIENT_ADDR).unwrap(),
+            ManagerEvent::AppData { .. }
+        ));
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "a success must not allocate a bucket"
+        );
+
+        // Two real AEAD failures: each is decrypted-and-rejected and charges a
+        // token.  A bucket now exists — the failure path is its only writer.
+        for i in 0..2 {
+            assert!(matches!(
+                manager
+                    .handle_datagram(&tampered(&good), CLIENT_ADDR)
+                    .unwrap(),
+                ManagerEvent::None
+            ));
+            assert_eq!(
+                manager.fail_bucket_count(),
+                1,
+                "failure {i} must create exactly one bucket"
+            );
+        }
+
+        // Budget exhausted: a VALID packet is now dropped without decrypt.
+        // This is the whole point of the gate and proves it was not ungated.
+        let fresh = ws.encrypt(MessageType::Data, &[0x11; PAYLOAD_LEN]).unwrap();
+        assert!(
+            matches!(
+                manager.handle_datagram(&fresh, CLIENT_ADDR).unwrap(),
+                ManagerEvent::None
+            ),
+            "a gated source must be dropped without decrypt even on a valid packet"
+        );
+        // The session itself survives — the gate is per-source, not a kill.
+        assert_eq!(
+            manager.session_count(),
+            1,
+            "gating must not remove the session"
+        );
+    }
+
+    /// Fail-gate state is bounded by the ACTIVE SESSION POPULATION, not by
+    /// unauthenticated source diversity: N live sessions can produce at most N
+    /// buckets, no matter how much traffic arrives from elsewhere.
+    #[test]
+    fn d24_fail_gate_state_is_bounded_by_session_population() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_sessions = 4;
+        limits.max_fail_buckets = 4096;
+        let mut manager = server_manager(limits);
+
+        // Four live sessions, each from its own source address.
+        let mut sessions = Vec::new();
+        for i in 0..4u8 {
+            let sid = [i; SESSION_ID_LEN];
+            let from = SocketAddr::from((Ipv4Addr::new(203, 0, 113, i), 5000));
+            let mut client = server_established(&mut manager, &cc, sid, from);
+            let (ws, _out) = client_established(&mut client, &cc);
+            sessions.push((ws, from));
+        }
+        assert_eq!(manager.session_count(), 4, "four sessions established");
+
+        // 2,000 distinct hostile sources, all naming an unknown sid.
+        let unknown = d24_data_packet([0xEE; SESSION_ID_LEN]);
+        for port in 0..2000u16 {
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 1024 + port));
+            let _ = manager.handle_datagram(&unknown, from).unwrap();
+        }
+
+        // Every live session's source now fails AEAD once.
+        for (ws, from) in sessions.iter_mut() {
+            let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+            assert!(matches!(
+                manager.handle_datagram(&tampered(&good), *from).unwrap(),
+                ManagerEvent::None
+            ));
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            sessions.len(),
+            "bucket count must equal the session population ({}), got {}",
+            sessions.len(),
+            manager.fail_bucket_count()
+        );
+
+        // And one more round of hostile churn does not grow it.
+        for port in 0..2000u16 {
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 1024 + port));
+            let _ = manager.handle_datagram(&unknown, from).unwrap();
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            sessions.len(),
+            "hostile churn must not grow the fail-gate table"
+        );
+    }
+
+    /// NAT / shared-source fairness (D24): per-source semantics are preserved
+    /// deliberately.  Two clients behind ONE source address share a budget,
+    /// but consumption is failure-only, so the honest client's successful
+    /// traffic can never drain the shared budget or starve it.
+    #[test]
+    fn d24_shared_source_client_is_not_starved_by_another_client() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.fail_burst = 4;
+        let mut manager = server_manager(limits);
+
+        // Two sessions, both bound to the SAME source address (one NAT egress).
+        let shared = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 50), 40000));
+        let sid_a = [0xA1; SESSION_ID_LEN];
+        let sid_b = [0xB2; SESSION_ID_LEN];
+        let mut ca = server_established(&mut manager, &cc, sid_a, shared);
+        let (mut ws_a, _oa) = client_established(&mut ca, &cc);
+        let mut cb = server_established(&mut manager, &cc, sid_b, shared);
+        let (mut ws_b, _ob) = client_established(&mut cb, &cc);
+        assert_eq!(manager.session_count(), 2, "both sessions share one source");
+
+        // Client B generates failures — burning the SHARED budget.
+        for i in 0..4u8 {
+            let bad = ws_b
+                .encrypt(MessageType::Data, &[(i + 1); PAYLOAD_LEN])
+                .unwrap();
+            assert!(matches!(
+                manager.handle_datagram(&tampered(&bad), shared).unwrap(),
+                ManagerEvent::None
+            ));
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            1,
+            "both clients share a single bucket"
+        );
+
+        // Client A, honest, is still gated (the known consequence of
+        // per-source accounting under a shared address).
+        let a1 = ws_a
+            .encrypt(MessageType::Data, &[0x01; PAYLOAD_LEN])
+            .unwrap();
+        assert!(matches!(
+            manager.handle_datagram(&a1, shared).unwrap(),
+            ManagerEvent::None
+        ));
+
+        // But client A's *successful* traffic never drains a budget.  This is
+        // deterministic and timing-free: A has already been charged nothing,
+        // and no amount of honest traffic can push a fresh source below a full
+        // burst.  Deliver many successes from a fresh source (session A roams
+        // to it on the first authenticated decrypt, §10) and show every one
+        // of them is delivered — none is gated, and no bucket is created.
+        let solo = SocketAddr::from((Ipv4Addr::new(192, 168, 1, 51), 40000));
+        for i in 0..256u16 {
+            let good = ws_a
+                .encrypt(MessageType::Data, &[(i as u8); PAYLOAD_LEN])
+                .unwrap();
+            assert!(
+                matches!(
+                    manager.handle_datagram(&good, solo).unwrap(),
+                    ManagerEvent::AppData { .. }
+                ),
+                "honest packet {i} must deliver: success never consumes budget"
+            );
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            1,
+            "256 successes from a fresh source must create no bucket"
+        );
+        // Client A has roamed to `solo`, so B's failures now hit a fresh key.
+        let _ = &mut ws_b;
+    }
+
+    /// Hostile source churn must not consume the legitimate client's budget and
+    /// must not grow the fail-gate table.  The legitimate handshake is driven
+    /// from a source the hostile traffic never used, and the hostile sids are
+    /// distinct, so the only shared budget key is by construction not spent.
+    #[test]
+    fn d24_hostile_source_churn_does_not_block_a_legitimate_handshake() {
+        let (cc, mut sc) = shared_configs();
+        sc.rate_limit_burst = 64; // ample for one legit handshake (M1 2 + M3 1)
+        sc.max_pending = 8;
+        let mut manager =
+            ServerSessionManager::new(&sc, SessionLimits::default()).expect("manager");
+
+        // A legitimate session is established first and must remain serviceable.
+        let (_c, mut ws) = established_client_session(&mut manager, &cc, SID);
+        assert_eq!(manager.session_count(), 1, "legit client established");
+
+        // Hostile churn: partial M1s (fragment 0 only), each with a distinct sid
+        // and source, saturating the pending table at `max_pending`.  Each is
+        // charged against its OWN source budget, never the legitimate one.
+        for i in 0..64u16 {
+            let sid = [0xC0u8.wrapping_add(i as u8); SESSION_ID_LEN];
+            let client = ClientHandshake::new(&cc, sid).expect("client");
+            let frag0 = client.m1_frags()[0].clone();
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 20), 1024 + i));
+            let _ = manager.handle_datagram(&frag0, from).unwrap();
+        }
+        assert_eq!(
+            manager.pending_handshakes(),
+            sc.max_pending,
+            "pending table is capped at max_pending"
+        );
+
+        // The legitimate client's traffic is untouched: 256 authentic data
+        // packets all deliver.  Hostile sources spent their own budgets.
+        for i in 0..256u16 {
+            let good = ws
+                .encrypt(MessageType::Data, &[(i as u8); PAYLOAD_LEN])
+                .unwrap();
+            assert!(
+                matches!(
+                    manager.handle_datagram(&good, CLIENT_ADDR).unwrap(),
+                    ManagerEvent::AppData { .. }
+                ),
+                "legit packet {i} must survive hostile source churn"
+            );
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "handshake churn and successful data must allocate no fail buckets"
+        );
+        assert_eq!(manager.session_count(), 1, "the legit session survives");
+    }
+
     // ---- Windows process-working-set probe (best-effort RSS) ----
     #[cfg(windows)]
     mod mem_probe {
@@ -4152,6 +4736,82 @@ mod tests {
             "server driver must survive a transport reset; got {outcome:?}"
         );
         driver.abort();
+    }
+
+    // No cover cadence and a single ResetOnce arm would otherwise leave the
+    // driver blocked in `recv()` after its one reset — indistinguishable from
+    // a torn-down driver at the observation points below, and a race against
+    // any transport signal from the preceding test.
+    /// Pre-armed one-shot reset. Fires on the first `recv` *of the driver* and
+    /// thereafter blocks (like `MemoryTransport` on an idle channel) — so the
+    /// only way out of the driver is the app channel closing.
+    struct ResetThenIdle {
+        inner: MemoryTransport,
+    }
+
+    impl HandshakeTransport for ResetThenIdle {
+        async fn send_to(
+            &mut self,
+            packet: &WirePacket,
+            peer: SocketAddr,
+        ) -> Result<(), HandshakeV2Error> {
+            self.inner.send_to(packet, peer).await
+        }
+
+        async fn recv(&mut self) -> Result<(WirePacket, SocketAddr), HandshakeV2Error> {
+            match self.inner.recv().await {
+                // The ICMP signal and the next real packet can be queued
+                // together; reset first, so the driver is observed in exactly
+                // the state a Windows socket reaches.
+                Err(_) | Ok(_) if RESET_ARMED.swap(false, Ordering::SeqCst) => {
+                    Err(HandshakeV2Error::TransportReset)
+                }
+                r => r,
+            }
+        }
+    }
+
+    static RESET_ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// N-2 regression: the same ICMP port-unreachable / WSAECONNRESET signal
+    /// reaching the *client* transport must NOT terminate the client manager.
+    /// The driver returns Err only if the reset escapes the select!; a driver
+    /// that returns stays alive until the app channel closes.  The signal is
+    /// delivered before any session exists (a vanished server at start-up),
+    /// so it cannot be a side effect of the preceding exchange.
+    #[tokio::test]
+    async fn client_driver_survives_transport_reset() {
+        let (cc, _sc) = shared_configs();
+        let mut manager = ClientSessionManager::new(&cc, SessionLimits::default()).unwrap();
+        let (client_t, _server_t, _guard) = wired_transports();
+        let (app_tx, mut app_rx) = mpsc::channel(64);
+        let (data_tx, data_rx) = mpsc::channel(64);
+        RESET_ARMED.store(true, Ordering::SeqCst);
+        let mut cli = ResetThenIdle { inner: client_t };
+        let mut driver = tokio::spawn(async move {
+            run_client_manager(&mut cli, &mut manager, app_tx, data_rx, no_cover()).await
+        });
+
+        // The driver keeps running across the reset.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !driver.is_finished(),
+            "client driver terminated on a recoverable transport reset"
+        );
+        assert!(app_rx.try_recv().is_err(), "no session may be established");
+
+        // The driver is only reachable through its result: it must still be
+        // alive after the reset, and its only way out is the app channel
+        // closing (Ok) — never the reset itself (Err).
+        drop(data_tx);
+        let joined = tokio::time::timeout(Duration::from_secs(2), &mut driver)
+            .await
+            .expect("client driver hung after a transport reset")
+            .expect("client driver panicked");
+        assert!(
+            joined.is_ok(),
+            "client driver returned Err on a recoverable transport reset: {joined:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
