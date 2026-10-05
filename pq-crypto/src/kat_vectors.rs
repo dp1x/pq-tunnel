@@ -11,12 +11,24 @@
 //! * `RFC5869_*` -- RFC 5869 SA.1 (HKDF-SHA-256 test case 1).
 //! * `RFC7748_*` -- RFC 7748 S6.1 (X25519 test vector: Alice/Bob keys and
 //!   their shared secret).
-//! * `KEM_*` -- Wycheproof `testvectors_v1`, `mlkem_768_test.json` tcId 1
-//!   (keygen: seed → ek) and `mlkem_768_encaps_test.json` tcId 14
-//!   (encapsulation with fixed `m`).
-//! * `DSA_*` -- Wycheproof `testvectors_v1`, `mldsa_65_verify_test.json`
-//!   tcId 1 (valid) and `mldsa_65_sign_seed_test.json` group 0
-//!   (deterministic keygen from seed).
+//! * `KEM_KEYGEN_*` -- Wycheproof `testvectors_v1`, `mlkem_768_test.json`
+//!   tcId 1 (source `CCTV/strcmp`): seed → ek, c, K.
+//! * `KEM_ENCAPS_*` -- Wycheproof `testvectors_v1`,
+//!   `mlkem_768_encaps_test.json` **testGroups[1]** tcId 14 (source
+//!   `FIPS 203`): ek + m → c, K.
+//! * `DSA_PK`, `DSA_MSG`, `DSA_SIG` -- Wycheproof `testvectors_v1`,
+//!   `mldsa_65_verify_test.json` group 0 tcId 1 (verify vector). `DSA_SIG`
+//!   is byte-identical to `mldsa_65_sign_seed_test.json` group 0 tcId 1
+//!   `.sig`, which is the file the signing KAT anchors to.
+//! * `DSA_SEED`, `DSA_KEYGEN_PK` -- Wycheproof `testvectors_v1`,
+//!   `mldsa_65_sign_seed_test.json` group 0 (deterministic keygen from seed).
+//!
+//! Note on the signing KAT: `mldsa_65_sign_seed_test.json` group 0 tcId 1
+//! carries **no `rnd` and no `ctx` field**. Per that file's schema an omitted
+//! `rnd` is implicitly all-zero, i.e. it is exactly the *deterministic*
+//! ML-DSA variant that `ml-dsa`'s `Signer` impl produces. That makes
+//! `DSA_SEED` + `DSA_MSG` + `DSA_SIG` a genuine externally-anchored
+//! signing vector for this implementation, not a self-generated one.
 
 /// Decode a lowercase hex string into bytes. Test-only helper.
 pub fn unhex(hex: &str) -> Vec<u8> {
@@ -75,7 +87,7 @@ pub const RFC7748_BOB_PUBLIC: &str =
 pub const RFC7748_SHARED: &str = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
 
 // ---------------------------------------------------------------------------
-// Wycheproof -- ML-KEM-768 and ML-DSA-65 (generated, validated lengths)
+// Wycheproof -- ML-KEM-768 and ML-DSA-65 (transcribed verbatim, D21)
 // ---------------------------------------------------------------------------
 pub const KEM_KEYGEN_SEED: &str = concat!(
     "cbfc4405d1b2a3a386c94c25e0f2d5f5ee92cb0388ff4d6aa04223086d51c3fd24752da14c9fc3b8ae0d9e4a8b1016b8",

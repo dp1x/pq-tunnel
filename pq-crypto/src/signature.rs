@@ -289,4 +289,137 @@ mod tests {
             "FIPS 204 keyGen must reproduce the Wycheproof public key from the seed"
         );
     }
+
+    /// Signing known-answer test, anchored to Wycheproof
+    /// `mldsa_65_sign_seed_test.json` group 0 tcId 1.
+    ///
+    /// That vector omits both `rnd` and `ctx`, which its schema defines as the
+    /// deterministic (all-zero `rnd`) empty-context case — exactly what the
+    /// `ml-dsa` `Signer` implementation produces. This therefore pins the
+    /// production `MlDsaKeypair::sign` path (not a raw crate type) to an
+    /// externally supplied signature, and it fails if the dependency ever
+    /// stops signing deterministically.
+    #[test]
+    fn ml_dsa_65_wycheproof_sign_kat() {
+        use crate::kat_vectors::{DSA_MSG, DSA_SEED, DSA_SIG, unhex};
+        let seed: [u8; 32] = <[u8; 32]>::try_from(unhex(DSA_SEED).as_slice()).unwrap();
+        let kp = MlDsaKeypair::from_seed(&seed);
+        let sig = kp.sign(&unhex(DSA_MSG)).expect("sign");
+        assert_eq!(
+            sig.encode(),
+            unhex(DSA_SIG),
+            "FIPS 204 deterministic signing must reproduce the Wycheproof signature"
+        );
+    }
+
+    /// Pins the signing profile D13 records: ML-DSA-65 signing is deliberately
+    /// deterministic (FIPS 204 Algorithm 2, `rnd = 0`). This exists so a
+    /// dependency bump that silently switched to hedged signing would fail
+    /// loudly instead of changing handshake bytes unnoticed.
+    ///
+    /// Determinism is safe here because every signed transcript binds a fresh
+    /// per-session sid, ML-KEM encapsulation key and X25519 key, so no two
+    /// sessions ever sign identical content (see DESIGN_DECISIONS D13).
+    #[test]
+    fn ml_dsa_sign_is_deterministic() {
+        let kp = MlDsaKeypair::generate().expect("keygen");
+        let msg = b"tunnel profile probe";
+        let a = kp.sign(msg).expect("sign a");
+        let b = kp.sign(msg).expect("sign b");
+        assert_eq!(
+            a.encode(),
+            b.encode(),
+            "ML-DSA-65 signing must stay deterministic (D13)"
+        );
+    }
+
+    /// Distinct messages must yield distinct signatures even under
+    /// determinism — determinism is per (key, message), not a constant.
+    #[test]
+    fn ml_dsa_distinct_messages_yield_distinct_signatures() {
+        let kp = MlDsaKeypair::generate().expect("keygen");
+        let a = kp.sign(b"message one").expect("sign a");
+        let b = kp.sign(b"message two").expect("sign b");
+        assert_ne!(
+            a.encode(),
+            b.encode(),
+            "different transcripts must not produce the same signature"
+        );
+    }
+
+    /// Negative verification: a single flipped byte must be rejected. Both
+    /// rejection paths count — `from_bytes` may refuse it structurally
+    /// (`Signature::decode` is not total over arbitrary 3309-byte input), or
+    /// `verify` may return `Ok(false)`. Either way the tampered signature must
+    /// never be accepted. This is the path an attacker reaches on the wire.
+    #[test]
+    fn ml_dsa_verify_rejects_tampered_signature() {
+        use crate::kat_vectors::{DSA_MSG, DSA_PK, DSA_SIG, unhex};
+        let pk = MlDsaPublicKey::from_bytes(&unhex(DSA_PK)).expect("pk decode");
+        let msg = unhex(DSA_MSG);
+        let original = unhex(DSA_SIG);
+
+        // Byte offsets into the *decoded* signature, not the hex string.
+        let mut structural = 0usize;
+        let mut cryptographic = 0usize;
+        for idx in [
+            0usize,
+            ML_DSA_65_SIGNATURE_BYTES / 2,
+            ML_DSA_65_SIGNATURE_BYTES - 1,
+        ] {
+            let mut raw = original.clone();
+            raw[idx] ^= 0x01;
+            match MlDsaSignature::from_bytes(&raw) {
+                Err(_) => structural += 1,
+                Ok(sig) => {
+                    let ok = verify(&pk, &msg, &sig).expect("verify");
+                    assert!(
+                        !ok,
+                        "ML-DSA-65 verify must reject a signature with byte {idx} flipped"
+                    );
+                    cryptographic += 1;
+                }
+            }
+        }
+        assert!(
+            structural + cryptographic == 3,
+            "every tampered byte must be rejected by exactly one path"
+        );
+    }
+
+    /// Wrong-length inputs must be rejected by the production parsers, which
+    /// sit directly on the attacker-controlled handshake decode path
+    /// (`handshake_v2.rs` ClientHello/ServerHello/ClientConfirm).
+    #[test]
+    fn from_bytes_rejects_wrong_lengths() {
+        use crate::kat_vectors::{DSA_PK, DSA_SIG, unhex};
+
+        let pk = unhex(DSA_PK);
+        assert!(
+            MlDsaPublicKey::from_bytes(&pk[..ML_DSA_65_PUBLIC_KEY_BYTES - 1]).is_err(),
+            "short ML-DSA public key must be rejected"
+        );
+        assert!(
+            MlDsaPublicKey::from_bytes(&[0u8; ML_DSA_65_PUBLIC_KEY_BYTES + 1]).is_err(),
+            "over-long ML-DSA public key must be rejected"
+        );
+        assert!(
+            MlDsaPublicKey::from_bytes(&[]).is_err(),
+            "empty ML-DSA public key must be rejected"
+        );
+
+        let sig = unhex(DSA_SIG);
+        assert!(
+            MlDsaSignature::from_bytes(&sig[..ML_DSA_65_SIGNATURE_BYTES - 1]).is_err(),
+            "short ML-DSA signature must be rejected"
+        );
+        assert!(
+            MlDsaSignature::from_bytes(&[0u8; ML_DSA_65_SIGNATURE_BYTES + 1]).is_err(),
+            "over-long ML-DSA signature must be rejected"
+        );
+        assert!(
+            MlDsaSignature::from_bytes(&[]).is_err(),
+            "empty ML-DSA signature must be rejected"
+        );
+    }
 }

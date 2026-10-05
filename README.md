@@ -38,8 +38,9 @@ Core principles (see [PROJECT_CHARTER.md](PROJECT_CHARTER.md)):
 
 1. **HNDL resistance** — captured traffic must remain protected against
    future attackers.
-2. **Metadata resistance** — traffic patterns must not leak identity or
-   communication graph.
+2. **Metadata resistance** — reduces what traffic patterns leak. It is
+   *not* traffic-flow anonymity: see [Known issues](#known-issues--limitations)
+   and `DESIGN_DECISIONS.md` D22.
 3. **Secure by default** — parameters control tradeoffs; they never silently
    redefine security guarantees.
 4. **Fail securely** — a security failure closes the session; it never
@@ -69,7 +70,7 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.2.0-alpha released):** 330 tests pass
+**Validation (v0.2.0-alpha released):** 352 tests pass
 (`cargo test --workspace`), including external known-answer vectors (RFC 8439
 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
 and ML-DSA-65 — D21), adversarial end-to-end cases (garbage, forged
@@ -164,10 +165,10 @@ never-panic contract.
 
 ## Tests
 
-- `pq-crypto`: 61 unit tests (incl. external known-answer vectors, D21)
-- `pq-tunnel-core`: 223 unit tests (incl. session-manager & handshake-v2 tests
+- `pq-crypto`: 67 unit tests (incl. external known-answer vectors, D21)
+- `pq-tunnel-core`: 236 unit tests (incl. session-manager & handshake-v2 tests
   and the D16 nonce-exhaustion full-loop driver E2E)
-- `pq-tunnel-bin`: 34 unit tests + 12 E2E integration tests (identity
+- `pq-tunnel-bin`: 37 unit tests + 12 E2E integration tests (identity
   provisioning, keygen, CIDR parsing, packet length) — single `pq-tunnel`
   binary with `keygen`/`server`/`client` subcommands; the E2E suite covers the
   smoke gate (3), the adversarial tunnel cases (6), and the stress suite (3)
@@ -183,8 +184,9 @@ cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 cargo test --workspace --target x86_64-pc-windows-msvc
 ```
 
-(On Linux CI, 2 `pq-tunnel-core` tests that measure Windows-specific working-set
-memory are skipped; the remaining 221 core tests run.)
+(On Linux CI, 3 `pq-tunnel-core` tests are skipped: one measures
+Windows-specific working-set memory, two cover the Windows high-resolution
+cover clock. The remaining 220 core tests run.)
 
 ## Security
 
@@ -200,6 +202,12 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 
 ### Known issues / limitations
 
+- **No independent third-party security audit has been performed.** Everything
+  asserted here was produced and checked in-tree. The design record
+  ([DESIGN_DECISIONS.md](DESIGN_DECISIONS.md)) is maintained by the authors,
+  and the test suite — including its fuzz targets — is self-referential in
+  the sense that its oracles are written by the same project. Treat the
+  cryptographic and protocol claims as *unreviewed by outsiders*.
 - The v2 handshake is validated at the unit/campaign level and by the
   adversarial E2E suite; **interoperability
   with other implementations is not yet verified** (no independent

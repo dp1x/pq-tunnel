@@ -221,4 +221,47 @@ mod tests {
             MlKemPublicKey::from_bytes(&unhex(KEM_ENCAPS_EK)).expect("wrapper ek decode");
         assert_eq!(wrapper_pk.to_bytes(), unhex(KEM_ENCAPS_EK));
     }
+
+    /// Wrong-length inputs must be rejected by the production parsers, which
+    /// sit directly on the attacker-controlled handshake decode path
+    /// (`handshake_v2.rs` ClientHello/ServerHello/ClientConfirm).
+    ///
+    /// This matters beyond tidiness: `MlKemSharedSecret::as_bytes` performs an
+    /// `unwrap` on a fixed 32-byte conversion, so a silent length change in the
+    /// dependency would panic at runtime rather than fail a test. Length
+    /// rejection is the cheapest place that failure mode is caught.
+    #[test]
+    fn from_bytes_rejects_wrong_lengths() {
+        use crate::kat_vectors::{KEM_ENCAPS_C, KEM_ENCAPS_EK, unhex};
+
+        let ek = unhex(KEM_ENCAPS_EK);
+        assert_eq!(ek.len(), ML_KEM_768_PUBLIC_KEY_BYTES);
+        assert!(
+            MlKemPublicKey::from_bytes(&ek[..ML_KEM_768_PUBLIC_KEY_BYTES - 1]).is_err(),
+            "short ML-KEM public key must be rejected"
+        );
+        assert!(
+            MlKemPublicKey::from_bytes(&[0u8; ML_KEM_768_PUBLIC_KEY_BYTES + 1]).is_err(),
+            "over-long ML-KEM public key must be rejected"
+        );
+        assert!(
+            MlKemPublicKey::from_bytes(&[]).is_err(),
+            "empty ML-KEM public key must be rejected"
+        );
+
+        let ct = unhex(KEM_ENCAPS_C);
+        assert_eq!(ct.len(), ML_KEM_768_CIPHERTEXT_BYTES);
+        assert!(
+            MlKemCiphertext::from_bytes(&ct[..ML_KEM_768_CIPHERTEXT_BYTES - 1]).is_err(),
+            "short ML-KEM ciphertext must be rejected"
+        );
+        assert!(
+            MlKemCiphertext::from_bytes(&[0u8; ML_KEM_768_CIPHERTEXT_BYTES + 1]).is_err(),
+            "over-long ML-KEM ciphertext must be rejected"
+        );
+        assert!(
+            MlKemCiphertext::from_bytes(&[]).is_err(),
+            "empty ML-KEM ciphertext must be rejected"
+        );
+    }
 }

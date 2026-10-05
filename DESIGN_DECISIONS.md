@@ -613,6 +613,25 @@ A 3-message client-initiated flow over uniform 1280-byte datagrams.
 - Retransmission is client-driven: M1 and M3 retransmitted byte-identical
   with jittered backoff and bounded budgets; the server caches M2 per sid
   (duplicate M1 → resend cached M2).
+- Signature generation uses the **deterministic** variant of ML-DSA-65
+  (FIPS 204 Algorithm 2, `rnd = 0`). This is a deliberate profile choice, not
+  an incidental property of the `ml-dsa` dependency, and it is pinned by
+  `ml_dsa_sign_is_deterministic` plus the external known-answer vector in
+  `ml_dsa_65_wycheproof_sign_kat`.
+  - It is **not** a metadata weakness. Both signed digests bind a fresh
+    per-session CSPRNG `sid`, a fresh ML-KEM-768 encapsulation key and a fresh
+    X25519 key (`M1_z` / `M2_z` under `canonical_zerofill`), so no digest is
+    ever signed twice and no observer can link two sessions by signature
+    equality. Hedged signing is therefore **rejected**: it would add a
+    randomness dependency to the handshake path (CRYPTO_PROFILE §12) for no
+    privacy gain.
+  - Byte-identical retransmission is guaranteed by **byte caching**
+    (`m1_frags`, `m3_frags`, `m2_cache`), never by re-signing, so the
+    retransmission contract is independent of the signing mode. Cached
+    handshake bytes MUST NOT be re-derived on retransmit.
+  - Consequence for operators: the identity key alone reveals nothing about
+    past sessions, because traffic keys derive from ephemeral secrets only
+    (D14) — identity keys never enter the key schedule.
 - Default timing invariant (fixed M6): the client's M3 retransmit budget —
   the only path to client establishment (passive server, no M4) — must
   complete strictly inside the session manager's default handshake deadline.
