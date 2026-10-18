@@ -422,4 +422,83 @@ mod tests {
             "empty ML-DSA signature must be rejected"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Exact length boundaries: len-1 / len / len+1 (Item 4)
+    // -----------------------------------------------------------------------
+    //
+    // Self-consistency/regression tests, NOT external anchors. The exact
+    // lengths come from the FIPS 204 parameter set for ML-DSA-65 and are
+    // pinned by the Wycheproof KATs above.
+
+    /// `MlDsaPublicKey::from_bytes` accepts exactly 1952 and rejects the
+    /// neighbouring lengths. Unlike ML-KEM, an all-zero key of the correct
+    /// length decodes structurally — the *verification* fails later, not the
+    /// parse.
+    #[test]
+    fn public_key_from_bytes_length_boundaries() {
+        let bytes = [0x5Au8; ML_DSA_65_PUBLIC_KEY_BYTES];
+        assert!(MlDsaPublicKey::from_bytes(&bytes[..ML_DSA_65_PUBLIC_KEY_BYTES - 1]).is_err());
+        assert!(
+            MlDsaPublicKey::from_bytes(&bytes).is_ok(),
+            "exact pk length accepted"
+        );
+        assert!(MlDsaPublicKey::from_bytes(&[0x5Au8; ML_DSA_65_PUBLIC_KEY_BYTES + 1]).is_err());
+    }
+
+    /// `MlDsaSignature::from_bytes` rejects the neighbouring lengths.
+    ///
+    /// At the *exact* length the parser is deliberately **not** total:
+    /// `EncodedSignature::try_from` accepts any 3309 bytes, but the subsequent
+    /// `Signature::decode` rejects hint encodings it cannot represent, so some
+    /// correct-length inputs are refused. That is the intended fail-secure
+    /// behaviour on the attacker-controlled M1/M2 signature slot (an invalid
+    /// hint encoding is a malformed signature, not a valid one), and it is why
+    /// this test asserts only the *length* boundary: the caller cannot assume
+    /// `is_ok()` at the exact size.
+    #[test]
+    fn signature_from_bytes_length_boundaries() {
+        let bytes = [0x5Au8; ML_DSA_65_SIGNATURE_BYTES];
+        assert!(MlDsaSignature::from_bytes(&bytes[..ML_DSA_65_SIGNATURE_BYTES - 1]).is_err());
+        assert!(MlDsaSignature::from_bytes(&[0x5Au8; ML_DSA_65_SIGNATURE_BYTES + 1]).is_err());
+        assert!(MlDsaSignature::from_bytes(&[]).is_err());
+
+        // A genuine signature does decode at the exact length, so the
+        // non-totality above is a property of the hint encoding, not of the
+        // length check itself.
+        let kp = MlDsaKeypair::generate().expect("keygen");
+        let sig = kp.sign(b"length boundary probe").expect("sign");
+        let encoded = sig.encode();
+        assert_eq!(encoded.len(), ML_DSA_65_SIGNATURE_BYTES);
+        assert!(MlDsaSignature::from_bytes(&encoded).is_ok());
+    }
+
+    /// `verify` must never panic on any correctly-sized key/signature pair and
+    /// must never report a *valid* verification for bytes it did not sign.
+    /// This is the pre-authentication path: a client's M1 signature is verified
+    /// against the whole roster before any keying material exists.
+    #[test]
+    fn verify_never_panics_and_never_accepts_unsigned_bytes() {
+        let kp = MlDsaKeypair::generate().expect("keygen");
+        let msg = b"boundary probe";
+
+        for fill in [0x00u8, 0x01, 0x7F, 0xFF] {
+            let pk = MlDsaPublicKey::from_bytes(&[fill; ML_DSA_65_PUBLIC_KEY_BYTES])
+                .expect("length check passes");
+            // Either the parse rejects the encoding or verification fails, but
+            // it must never succeed and must never panic.
+            if let Ok(sig) = MlDsaSignature::from_bytes(&[fill; ML_DSA_65_SIGNATURE_BYTES]) {
+                let ok = verify(&pk, msg, &sig).expect("verify");
+                assert!(
+                    !ok,
+                    "a forged signature over fill 0x{fill:02x} must not verify"
+                );
+            }
+        }
+
+        // The genuine signature still verifies — the negative probes above must
+        // not have poisoned anything.
+        let sig = kp.sign(msg).expect("sign");
+        assert!(verify(&kp.public, msg, &sig).expect("verify"));
+    }
 }

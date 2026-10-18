@@ -264,4 +264,59 @@ mod tests {
             "empty ML-KEM ciphertext must be rejected"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Exact length boundaries: len-1 / len / len+1 (Item 4)
+    // -----------------------------------------------------------------------
+    //
+    // Self-consistency/regression tests, NOT external anchors. The exact
+    // lengths come from the FIPS 203 parameter set for ML-KEM-768 and are
+    // pinned by the Wycheproof KATs above; these tests pin only that the
+    // parsers accept exactly those lengths.
+
+    /// `MlKemPublicKey::from_bytes` accepts exactly 1184 and rejects the
+    /// neighbouring lengths.
+    #[test]
+    fn public_key_from_bytes_length_boundaries() {
+        let bytes = [0x5Au8; ML_KEM_768_PUBLIC_KEY_BYTES];
+        assert!(MlKemPublicKey::from_bytes(&bytes[..ML_KEM_768_PUBLIC_KEY_BYTES - 1]).is_err());
+        assert!(
+            MlKemPublicKey::from_bytes(&bytes).is_ok(),
+            "exact ek length accepted"
+        );
+        assert!(MlKemPublicKey::from_bytes(&[0x5Au8; ML_KEM_768_PUBLIC_KEY_BYTES + 1]).is_err());
+    }
+
+    /// `MlKemCiphertext::from_bytes` accepts exactly 1088 and rejects the
+    /// neighbouring lengths. Every ciphertext byte pattern is accepted at the
+    /// exact length — ML-KEM ciphertexts have no invalid encodings, which is
+    /// why this parser is length-only.
+    #[test]
+    fn ciphertext_from_bytes_length_boundaries() {
+        for fill in [0x00u8, 0x01, 0xFF] {
+            let bytes = [fill; ML_KEM_768_CIPHERTEXT_BYTES];
+            assert!(
+                MlKemCiphertext::from_bytes(&bytes[..ML_KEM_768_CIPHERTEXT_BYTES - 1]).is_err()
+            );
+            assert!(
+                MlKemCiphertext::from_bytes(&bytes).is_ok(),
+                "exact ct length accepted"
+            );
+            assert!(MlKemCiphertext::from_bytes(&[fill; ML_KEM_768_CIPHERTEXT_BYTES + 1]).is_err());
+        }
+    }
+
+    /// `decapsulate` must accept any 1088-byte ciphertext and return a
+    /// well-formed 32-byte shared secret (implicit rejection / FO transform),
+    /// never panic — this is the path an attacker reaches with a forged `ct3`.
+    #[test]
+    fn decapsulate_accepts_any_ciphertext_and_never_panics() {
+        let kp = MlKemKeypair::generate().expect("keygen");
+        for fill in [0x00u8, 0x01, 0x80, 0xFF] {
+            let ct = MlKemCiphertext::from_bytes(&[fill; ML_KEM_768_CIPHERTEXT_BYTES])
+                .expect("length check passes");
+            let ss = decapsulate(&kp.secret, &ct).expect("decapsulation always yields a secret");
+            assert_eq!(ss.as_bytes().len(), ML_KEM_768_SHARED_SECRET_BYTES);
+        }
+    }
 }

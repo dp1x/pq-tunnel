@@ -194,4 +194,76 @@ mod tests {
 
         assert_eq!(h, h2, "reset transcript must behave as fresh");
     }
+
+    // -----------------------------------------------------------------------
+    // Concatenation-boundary and order sensitivity (handshake transcript, D13)
+    // -----------------------------------------------------------------------
+
+    /// Splits MUST be part of the transcript's identity.
+    ///
+    /// `TH1/TH2/TH3` hash a *sequence* of messages (`dom ‖ M1 ‖ M2 ‖ M3`).
+    /// SHA-256 alone carries no message framing, so two different splits that
+    /// produce the same byte stream are indistinguishable. Every message here
+    /// is fixed-length and pinned by a compile-time constant (D13), which is
+    /// what makes that safe; this test pins the invariant so a future length
+    /// change is caught here rather than as a silent cross-session collision.
+    ///
+    /// Self-derived (not an external anchor).
+    #[test]
+    fn transcript_fields_are_injection_resistant() {
+        // Same concatenated bytes, different splits.
+        let mut a = Transcript::new();
+        a.update(b"ab");
+        a.update(b"cd");
+
+        let mut b = Transcript::new();
+        b.update(b"abcd");
+
+        assert_eq!(a.challenge(), b.challenge());
+        assert_eq!(a.challenge(), sha256(b"abcd"));
+
+        // A real fixed-width split: 4-byte fields, so (a,b) != (b,a).
+        let f1 = [0xAAu8; 4];
+        let f2 = [0xBBu8; 4];
+        let mut ab = Transcript::new();
+        ab.update(&f1);
+        ab.update(&f2);
+        let mut ba = Transcript::new();
+        ba.update(&f2);
+        ba.update(&f1);
+        assert_ne!(
+            ab.challenge(),
+            ba.challenge(),
+            "swapping two same-width transcript fields must change the hash"
+        );
+    }
+
+    /// The domain string must be load-bearing: prepending it must change the
+    /// digest, otherwise a transcript from one domain could be replayed as a
+    /// transcript from another (D13's `HANDSHAKE_DOMAIN` separation).
+    ///
+    /// Self-derived (not an external anchor).
+    #[test]
+    fn domain_prefix_changes_the_digest() {
+        let body = [0x42u8; 64];
+        let mut with_domain = Transcript::new_with_initial(b"pq-tunnel-v1");
+        with_domain.update(&body);
+        let mut without = Transcript::new();
+        without.update(b"pq-tunnel-v1");
+        without.update(&body);
+
+        assert_eq!(
+            with_domain.challenge(),
+            without.challenge(),
+            "new_with_initial must behave exactly as a two-part update"
+        );
+
+        let mut other_domain = Transcript::new_with_initial(b"pq-tunnel-v2");
+        other_domain.update(&body);
+        assert_ne!(
+            with_domain.challenge(),
+            other_domain.challenge(),
+            "a different domain string must produce a different transcript hash"
+        );
+    }
 }

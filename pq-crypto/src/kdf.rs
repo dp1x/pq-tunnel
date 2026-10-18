@@ -573,4 +573,247 @@ mod tests {
             "RFC 5869 §A.1 OKM (42 octets) must match exactly"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Domain-separation matrix (Item 3)
+    // -----------------------------------------------------------------------
+
+    /// A `derive_*` entry point that yields 32 bytes from a fixed master.
+    type LabelDerive = fn(&MasterSecret, &[u8]) -> Result<[u8; 32], CryptoError>;
+
+    /// Every `info` label the key schedule can put in front of HKDF, paired
+    /// with a `derive` that produces 32 bytes from a fixed master.
+    ///
+    /// Self-derived (not an external anchor): the assertion is that distinct
+    /// labels never collide for the same key material, i.e. that the label is
+    /// actually load-bearing in the `info` string. A label that were dropped
+    /// from the `info` construction would make two rows of this table equal
+    /// and fail the pairwise test below.
+    const SEPARATION_LABELS: [(&str, LabelDerive); 5] = [
+        ("pq-tunnel-c2s-v2", |m, sid| {
+            derive_client_to_server_key(m, sid)
+        }),
+        ("pq-tunnel-s2c-v2", |m, sid| {
+            derive_server_to_client_key(m, sid)
+        }),
+        ("pq-tunnel-nonce-c2s-v2", |m, sid| {
+            let p = derive_nonce_prefix_c2s(m, sid)?;
+            let mut out = [0u8; 32];
+            out[..4].copy_from_slice(&p);
+            Ok(out)
+        }),
+        ("pq-tunnel-nonce-s2c-v2", |m, sid| {
+            let p = derive_nonce_prefix_s2c(m, sid)?;
+            let mut out = [0u8; 32];
+            out[..4].copy_from_slice(&p);
+            Ok(out)
+        }),
+        ("pq-tunnel-finished-v1", |m, sid| {
+            derive_finished_key(m, PROTOCOL_VERSION_FOR_KDF_TESTS, sid)
+        }),
+    ];
+
+    /// Protocol version byte used by the separation matrix. Pinned to `1`
+    /// (the codec's `PROTOCOL_VERSION`) so the matrix does not silently track
+    /// a future version bump without review.
+    const PROTOCOL_VERSION_FOR_KDF_TESTS: u8 = 1;
+
+    /// Every pair of distinct labels must yield distinct keying material from
+    /// the same master. Cross-label separation is the whole point of the
+    /// `-v1`/`-v2` suffixes (D14), and it is what stops the Finished key,
+    /// the traffic keys, and the nonce prefixes from sharing a derivation.
+    #[test]
+    fn every_kdf_label_is_pairwise_separated() {
+        let master = derive_master_secret(&[0x11u8; 32], &[0x22u8; 32]).expect("master");
+        let mut seen: Vec<(&str, [u8; 32])> = Vec::new();
+        for (label, derive) in SEPARATION_LABELS {
+            let out = derive(&master, &TEST_SID).expect("derive");
+            for (prior_label, prior) in &seen {
+                assert_ne!(
+                    &out, prior,
+                    "labels {label:?} and {prior_label:?} must not collide"
+                );
+            }
+            seen.push((label, out));
+        }
+        assert_eq!(seen.len(), SEPARATION_LABELS.len());
+    }
+
+    /// The v1 master derivation (`pq-tunnel-master-v1`) and the v2 master
+    /// derivation (`pq-tunnel-master-v2`) must never coincide, even for
+    /// identical KEM shares and sid. This is the version-separation half of
+    /// D14: an attacker must not be able to present a v1-shaped derivation
+    /// where a v2 one is expected.
+    #[test]
+    fn master_labels_v1_and_v2_are_separated() {
+        let (a, b, dh, v, sid, th3) = v2_inputs();
+        let v1 = derive_master_secret(&a, &b).expect("v1");
+        let v2 = derive_master_secret_v2(&a, &b, &dh, v, &sid, &th3).expect("v2");
+        assert_ne!(
+            v1.as_bytes(),
+            v2.as_bytes(),
+            "pq-tunnel-master-v1 and -v2 must not collide"
+        );
+
+        // Nor may the v1 master equal the finished key derived from the v2
+        // master (different ikm, different label, different length class).
+        let fk = derive_finished_key(&v2, v, &sid).expect("finished");
+        assert_ne!(v1.as_bytes(), &fk);
+    }
+
+    /// The handshake-init labels (`pq-tunnel-init-v1`,
+    /// `pq-tunnel-init-nonce-v1`) must be separated from each other *and* from
+    /// every traffic/finished label. The init key and nonce share the same
+    /// `ikm` (a bare KEM shared secret) and the same salt, so the label is
+    /// the only thing keeping them apart.
+    #[test]
+    fn handshake_init_labels_are_separated_from_traffic_labels() {
+        let ss = [0x5au8; 32];
+        let key = derive_handshake_init_key(&ss).expect("init key");
+        let nonce = derive_handshake_init_nonce(&ss).expect("init nonce");
+        assert_ne!(
+            &key[..AEAD_NONCE_TEST_BYTES],
+            &nonce[..AEAD_NONCE_TEST_BYTES],
+            "pq-tunnel-init-v1 and -init-nonce-v1 must not collide"
+        );
+
+        let master = MasterSecret::from_bytes(ss);
+        let traffic: Vec<[u8; 32]> = SEPARATION_LABELS
+            .iter()
+            .map(|(_, d)| d(&master, &TEST_SID).expect("derive"))
+            .collect();
+        for out in &traffic {
+            assert_ne!(
+                &key[..],
+                &out[..],
+                "pq-tunnel-init-v1 must not collide with a traffic/finished key"
+            );
+            assert_ne!(
+                &nonce[..AEAD_NONCE_TEST_BYTES],
+                &out[..AEAD_NONCE_TEST_BYTES],
+                "pq-tunnel-init-nonce-v1 must not collide with a traffic/finished key"
+            );
+        }
+    }
+
+    /// The nonce prefix is a 4-byte truncation of a 32-byte derivation. A
+    /// truncation can in principle collide even when the full derivations do
+    /// not, so the 4-byte prefixes are compared against each other directly.
+    #[test]
+    fn nonce_prefixes_are_pairwise_distinct_as_four_byte_values() {
+        let master = derive_master_secret(&[0x11u8; 32], &[0x22u8; 32]).expect("master");
+        let c2s = derive_nonce_prefix_c2s(&master, &TEST_SID).expect("c2s");
+        let s2c = derive_nonce_prefix_s2c(&master, &TEST_SID).expect("s2c");
+        assert_ne!(c2s, s2c, "4-byte nonce prefixes must differ");
+
+        // The nonce prefix must never equal the first 4 bytes of either
+        // traffic key either — otherwise a nonce prefix and a key share a
+        // prefix by accident rather than by construction.
+        let k_c2s = derive_client_to_server_key(&master, &TEST_SID).expect("k");
+        let k_s2c = derive_server_to_client_key(&master, &TEST_SID).expect("k");
+        assert_ne!(&c2s[..], &k_c2s[..4]);
+        assert_ne!(&s2c[..], &k_s2c[..4]);
+    }
+
+    /// Length of the init nonce used in the comparison above. The nonce is 12
+    /// bytes; the comparison window is the shorter 4-byte prefix so the same
+    /// slice length applies to the 32-byte key output.
+    const AEAD_NONCE_TEST_BYTES: usize = 4;
+
+    // -----------------------------------------------------------------------
+    // Hybrid key-schedule binding surface (Item 2)
+    // -----------------------------------------------------------------------
+
+    /// The v2 master derivation binds exactly these inputs:
+    /// `ikm = ss_a ‖ ss_b ‖ dh_cs` and
+    /// `info = "pq-tunnel-master-v2" ‖ version ‖ session_id ‖ th3`.
+    ///
+    /// Note what is **not** in that set: the ML-KEM ciphertexts `ct2`/`ct3`
+    /// and the ephemeral X25519/ML-KEM *public keys*. Those are not direct
+    /// HKDF inputs. They are nevertheless bound into the derivation
+    /// transitively, because `TH3` (fed to `info`) covers `M1_z ‖ M2_z ‖
+    /// M3_z`, and `ct2`/`ct3` and both public keys are fields of those
+    /// messages (D13). This test pins the *direct* binding surface so the
+    /// argument stays visible: if a future revision drops `th3` from `info`,
+    /// the ciphertext/public keys stop being bound and this test still passes
+    /// (it only inspects the direct inputs), so the transitive binding must be
+    /// re-argued deliberately.
+    ///
+    /// Self-derived (not an external anchor).
+    #[test]
+    fn master_v2_direct_binding_surface_is_pinned() {
+        let (a, b, dh, v, sid, th3) = v2_inputs();
+
+        // Every direct input is load-bearing.
+        let base = derive_master_secret_v2(&a, &b, &dh, v, &sid, &th3).expect("base");
+
+        let mut b2 = b;
+        b2[31] ^= 0x80;
+        assert_ne!(
+            derive_master_secret_v2(&a, &b2, &dh, v, &sid, &th3)
+                .expect("mutated")
+                .as_bytes(),
+            base.as_bytes(),
+            "ss_b (the server's KEM share) must be bound directly"
+        );
+
+        let mut a2 = a;
+        a2[0] ^= 0x40;
+        assert_ne!(
+            derive_master_secret_v2(&a2, &b, &dh, v, &sid, &th3)
+                .expect("mutated")
+                .as_bytes(),
+            base.as_bytes(),
+            "ss_a (the client's KEM share) must be bound directly"
+        );
+
+        // The ikm is exactly 96 bytes in the order ss_a ‖ ss_b ‖ dh_cs: a
+        // rotation that swaps two legs must change the master.
+        let rotated = derive_master_secret_v2(&b, &a, &dh, v, &sid, &th3).expect("rotated");
+        assert_ne!(rotated.as_bytes(), base.as_bytes());
+    }
+
+    /// An empty `th3` and an all-zero `th3` must produce different masters,
+    /// proving `th3` is concatenated (not merely length-checked) into `info`.
+    ///
+    /// Self-derived (not an external anchor).
+    #[test]
+    fn master_v2_distinguishes_absent_and_zero_transcript() {
+        let (a, b, dh, v, sid, _th3) = v2_inputs();
+        let empty = derive_master_secret_v2(&a, &b, &dh, v, &sid, &[]).expect("empty th3");
+        let zero = derive_master_secret_v2(&a, &b, &dh, v, &sid, &[0u8; 32]).expect("zero th3");
+        let real = derive_master_secret_v2(&a, &b, &dh, v, &sid, &[0x44u8; 32]).expect("real th3");
+        assert_ne!(empty.as_bytes(), zero.as_bytes());
+        assert_ne!(zero.as_bytes(), real.as_bytes());
+        assert_ne!(empty.as_bytes(), real.as_bytes());
+    }
+
+    /// `session_id` is concatenated into `info` after a single `version` byte.
+    /// A one-byte sid appended to a two-byte version must therefore be
+    /// ambiguous unless `version` is fixed-width — which it is (exactly one
+    /// byte, `u8`). This test pins that a version bump and a sid change are
+    /// independently observable, which is what rules out a
+    /// (version ‖ sid) re-splitting collision between two peers.
+    ///
+    /// Self-derived (not an external anchor).
+    #[test]
+    fn master_v2_version_and_sid_are_independently_observable() {
+        let (a, b, dh, _v, sid, th3) = v2_inputs();
+        let base = derive_master_secret_v2(&a, &b, &dh, 1, &sid, &th3).expect("base");
+
+        let mut sid_shift = sid;
+        sid_shift.rotate_left(1);
+        assert_ne!(
+            derive_master_secret_v2(&a, &b, &dh, 1, &sid_shift, &th3)
+                .expect("shifted sid")
+                .as_bytes(),
+            base.as_bytes()
+        );
+        assert_ne!(
+            derive_master_secret_v2(&a, &b, &dh, 2, &sid, &th3)
+                .expect("v2")
+                .as_bytes(),
+            base.as_bytes()
+        );
+    }
 }

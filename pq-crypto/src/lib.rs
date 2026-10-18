@@ -15,7 +15,7 @@ pub mod kat_vectors;
 /// Classical X25519 key exchange.
 ///
 /// X25519 is the classical leg of Tunnel's hybrid key-establishment profile
-/// (ML-KEM-768 + X25519, both ephemeral �?" DESIGN_DECISIONS D13). It is
+/// (ML-KEM-768 + X25519, both ephemeral — DESIGN_DECISIONS D13). It is
 /// deprecated as a *sole* mechanism: X25519 alone provides no post-quantum
 /// protection and must never be used as the only key-establishment component.
 pub mod classical;
