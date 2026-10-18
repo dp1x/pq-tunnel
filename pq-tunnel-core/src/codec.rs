@@ -1008,4 +1008,174 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Exact length boundaries: len-1 / len / len+1 (Item 4)
+    // -----------------------------------------------------------------------
+    //
+    // These pin the off-by-one boundary of every parser on the attacker-reachable
+    // path. They are self-consistency/regression tests, NOT external anchors:
+    // the expectation is "exactly `N` bytes is the only accepted length",
+    // which is a statement about this implementation's contract.
+
+    /// `PacketHeader::decode` accepts ≥ HEADER_LEN and rejects HEADER_LEN-1.
+    ///
+    /// The `.expect()` after the bounds check (codec.rs, `packet_nonce`) is
+    /// sound: `data.len() >= HEADER_LEN` implies the 8-byte slice at
+    /// `1 + SESSION_ID_LEN` is in bounds, so the `try_into` cannot fail. This
+    /// test exercises the boundary from both sides to keep it that way.
+    #[test]
+    fn packet_header_decode_length_boundaries() {
+        let hdr = PacketHeader::new([0xABu8; SESSION_ID_LEN], 0x0102_0304_0506_0708).encode();
+
+        assert!(
+            matches!(
+            PacketHeader::decode(&hdr[..HEADER_LEN - 1]),
+            Err(CodecError::Truncated { min, got, .. })
+                if min == HEADER_LEN && got == HEADER_LEN - 1
+            ),
+            "HEADER_LEN-1 must be Truncated"
+        );
+        assert!(
+            PacketHeader::decode(&hdr).is_ok(),
+            "exactly HEADER_LEN must decode"
+        );
+        // len+1 is *accepted* by design (`>=`), and the extra byte is ignored.
+        let mut longer = hdr.to_vec();
+        longer.push(0xFF);
+        assert_eq!(
+            PacketHeader::decode(&longer).expect("len+1 accepted"),
+            PacketHeader::new([0xABu8; SESSION_ID_LEN], 0x0102_0304_0506_0708),
+            "len+1 must decode identically to the exact length"
+        );
+    }
+
+    /// `PacketHeader::decode` must not panic at any length in a window around
+    /// the boundary, including the empty slice (the `data[0]` read).
+    #[test]
+    fn packet_header_decode_never_panics_near_the_boundary() {
+        for len in 0..=(HEADER_LEN + 8) {
+            let data = fuzz_bytes(len);
+            // Only the exact-version path can succeed; nothing may panic.
+            let _ = PacketHeader::decode(&data);
+        }
+    }
+
+    /// `InnerPlaintext::decode` accepts exactly `INNER_PLAINTEXT_LEN` and
+    /// rejects len-1 and len+1.
+    #[test]
+    fn inner_plaintext_decode_length_boundaries() {
+        let mut bytes = vec![0u8; INNER_PLAINTEXT_LEN];
+        bytes[0] = MessageType::Data.as_u8();
+        bytes[1] = Direction::ClientToServer.as_u8();
+
+        assert!(
+            matches!(
+                InnerPlaintext::decode(&bytes[..INNER_PLAINTEXT_LEN - 1]),
+                Err(CodecError::Truncated { .. })
+            ),
+            "INNER_PLAINTEXT_LEN-1 must be rejected"
+        );
+        assert!(
+            InnerPlaintext::decode(&bytes).is_ok(),
+            "exactly INNER_PLAINTEXT_LEN must decode"
+        );
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert!(
+            matches!(
+                InnerPlaintext::decode(&longer),
+                Err(CodecError::Truncated { .. })
+            ),
+            "INNER_PLAINTEXT_LEN+1 must be rejected"
+        );
+    }
+
+    /// `InnerPlaintext::new` rejects payload lengths PAYLOAD_LEN-1 and
+    /// PAYLOAD_LEN+1 and accepts exactly PAYLOAD_LEN.
+    #[test]
+    fn inner_plaintext_new_length_boundaries() {
+        let ok = fuzz_bytes(PAYLOAD_LEN);
+        assert!(InnerPlaintext::new(MessageType::Data, Direction::ClientToServer, &ok).is_ok());
+        assert!(
+            InnerPlaintext::new(
+                MessageType::Data,
+                Direction::ClientToServer,
+                &ok[..PAYLOAD_LEN - 1]
+            )
+            .is_err(),
+            "PAYLOAD_LEN-1 must be rejected"
+        );
+        let mut longer = ok.clone();
+        longer.push(0);
+        assert!(
+            InnerPlaintext::new(MessageType::Data, Direction::ClientToServer, &longer).is_err(),
+            "PAYLOAD_LEN+1 must be rejected"
+        );
+    }
+
+    /// `WirePacket::from_bytes` accepts exactly PACKET_SIZE and rejects
+    /// PACKET_SIZE-1 / PACKET_SIZE+1.
+    #[test]
+    fn wire_packet_from_bytes_length_boundaries() {
+        assert!(WirePacket::from_bytes(&[0u8; PACKET_SIZE]).is_ok());
+        assert!(
+            WirePacket::from_bytes(&[0u8; PACKET_SIZE - 1]).is_err(),
+            "PACKET_SIZE-1 must be rejected"
+        );
+        assert!(
+            WirePacket::from_bytes(&[0u8; PACKET_SIZE + 1]).is_err(),
+            "PACKET_SIZE+1 must be rejected"
+        );
+        assert!(WirePacket::from_bytes(&[]).is_err());
+    }
+
+    /// `WirePacket::from_parts` accepts exactly `PACKET_SIZE - HEADER_LEN` and
+    /// rejects one byte either side. Also pins that the version check runs
+    /// before the length check.
+    #[test]
+    fn wire_packet_from_parts_length_boundaries() {
+        const EXACT: usize = PACKET_SIZE - HEADER_LEN;
+        let hdr = PacketHeader::new([1u8; SESSION_ID_LEN], 7).encode();
+
+        assert!(matches!(
+            WirePacket::from_parts(&hdr, &[0u8; EXACT - 1]),
+            Err(CodecError::Truncated { min, got, .. })
+                if min == EXACT && got == EXACT - 1
+        ));
+        assert!(WirePacket::from_parts(&hdr, &[0u8; EXACT]).is_ok());
+        assert!(matches!(
+            WirePacket::from_parts(&hdr, &[0u8; EXACT + 1]),
+            Err(CodecError::Truncated { min, got, .. })
+                if min == EXACT && got == EXACT + 1
+        ));
+    }
+
+    /// Every fixed-size region accessor must stay in bounds after construction
+    /// by *either* constructor. The `.expect()` calls in `header_bytes` /
+    /// `ciphertext` / `tag` are guarded only by compile-time asserts plus
+    /// `debug_assert!`; this test runs them in every configuration.
+    #[test]
+    fn region_accessors_are_in_bounds_for_both_constructors() {
+        let hdr = PacketHeader::new([0x33u8; SESSION_ID_LEN], 99).encode();
+        let region = [0x7Eu8; PACKET_SIZE - HEADER_LEN];
+
+        let by_parts = WirePacket::from_parts(&hdr, &region).expect("from_parts");
+        let mut whole = Vec::with_capacity(PACKET_SIZE);
+        whole.extend_from_slice(&hdr);
+        whole.extend_from_slice(&region);
+        let by_bytes = WirePacket::from_bytes(&whole).expect("from_bytes");
+
+        for pkt in [&by_parts, &by_bytes] {
+            assert_eq!(pkt.header_bytes().len(), HEADER_LEN);
+            assert_eq!(pkt.ciphertext().len(), INNER_PLAINTEXT_LEN);
+            assert_eq!(pkt.tag().len(), AEAD_TAG_LEN);
+            assert_eq!(
+                pkt.header_bytes().len() + pkt.ciphertext().len() + pkt.tag().len(),
+                PACKET_SIZE
+            );
+            assert_eq!(pkt.aad(), pkt.header_bytes());
+            assert_eq!(pkt.aead_region().len(), PACKET_SIZE - HEADER_LEN);
+        }
+    }
 }

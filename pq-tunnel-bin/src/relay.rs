@@ -514,6 +514,176 @@ mod tests {
             .unwrap()
     }
 
+    // -----------------------------------------------------------------------
+    // Boundary / ordering audit (Item 4)
+    // -----------------------------------------------------------------------
+    //
+    // Self-consistency/regression tests, NOT external anchors.
+
+    /// The documented ordering claim — "capacity is checked **before** the
+    /// truncation check" — verified directly at the decision boundary for both
+    /// families and both sides of it.
+    ///
+    /// For `declared = cap` the frame is *both* exactly at capacity and
+    /// exactly complete, so it must decode. For `declared = cap + 1` on a
+    /// header-only buffer it is both over capacity *and* truncated; the
+    /// documented contract says `TooLarge` wins. If the two checks were ever
+    /// swapped, this test fails.
+    #[test]
+    fn capacity_check_precedes_truncation_check() {
+        for (dest, cap) in [
+            (
+                "192.0.2.1:1".parse::<SocketAddr>().unwrap(),
+                MAX_DATAGRAM_V4,
+            ),
+            (
+                "[2001:db8::1]:1".parse::<SocketAddr>().unwrap(),
+                MAX_DATAGRAM_V6,
+            ),
+        ] {
+            let hdr = hdr_for(dest);
+
+            // Over capacity AND truncated -> TooLarge, not Truncated.
+            let over = forge_frame(dest, cap + 1);
+            assert!(
+                matches!(
+                    decode_relay(&over[..hdr]),
+                    Err(RelayError::TooLarge { max, got })
+                        if max == cap && got == cap + 1
+                ),
+                "over-capacity must be reported before truncation"
+            );
+
+            // At capacity AND truncated (header only) -> the declared length is
+            // legal and the buffer is simply short, so this stays `Truncated`.
+            // The two error classes are disjoint by construction: `TooLarge`
+            // means "declared past the family cap", `Truncated` means "buffer
+            // shorter than header + declared length". Only a declared length
+            // that is *over* the cap takes the capacity branch first.
+            let at_cap = forge_frame(dest, cap);
+            assert!(
+                matches!(decode_relay(&at_cap[..hdr]), Err(RelayError::Truncated(_))),
+                "at-capacity but truncated is a truncation fault, not a capacity one"
+            );
+
+            // Below capacity AND truncated -> Truncated.
+            let under = forge_frame(dest, cap - 1);
+            assert!(
+                matches!(decode_relay(&under[..hdr]), Err(RelayError::Truncated(_))),
+                "below-capacity and truncated must stay Truncated"
+            );
+
+            // Exactly at capacity and complete -> Ok.
+            assert!(
+                decode_relay(&at_cap).is_ok(),
+                "a complete at-capacity frame decodes"
+            );
+        }
+    }
+
+    /// Header-length boundaries: `len-1`, `len`, `len+1` for the fixed header
+    /// of each family, with `len = 0` covered too.
+    #[test]
+    fn relay_header_length_boundaries() {
+        for (dest, hdr) in [
+            ("192.0.2.1:1".parse::<SocketAddr>().unwrap(), HDR_LEN_V4),
+            ("[2001:db8::1]:1".parse::<SocketAddr>().unwrap(), HDR_LEN_V6),
+        ] {
+            let full = forge_frame(dest, 0);
+            assert_eq!(
+                full.len(),
+                hdr,
+                "a zero-length datagram frame is just a header"
+            );
+
+            // len-1: header incomplete -> Truncated, never a panic or a read
+            // past the end.
+            assert!(
+                matches!(
+                    decode_relay(&full[..hdr - 1]),
+                    Err(RelayError::Truncated(_))
+                ),
+                "{}-1 bytes must be Truncated for the header",
+                hdr
+            );
+            // len: complete header, zero declared length -> Ok.
+            let (got_dest, datagram) = decode_relay(&full).expect("header-only frame decodes");
+            assert_eq!(got_dest, dest);
+            assert!(datagram.is_empty());
+            // len+1: one payload byte beyond the zero declared length is
+            // padding and must be ignored, not surfaced.
+            let mut padded = full.clone();
+            padded.push(0xEE);
+            let (_, ignored) = decode_relay(&padded).expect("padding is ignored");
+            assert!(ignored.is_empty(), "declared length 0 means no data");
+        }
+
+        // len 0.
+        assert!(matches!(decode_relay(&[]), Err(RelayError::Truncated(0))));
+        // len 1: family byte only.
+        assert!(decode_relay(&[FAMILY_IPV4]).is_err());
+        assert!(decode_relay(&[FAMILY_IPV6]).is_err());
+    }
+
+    /// Every length from 0 to one past a full slot must be handled without a
+    /// panic, for every family tag.
+    #[test]
+    fn decode_relay_never_panics_across_all_lengths() {
+        for len in 0..=(PAYLOAD_LEN + 8) {
+            for family in [FAMILY_IPV4, FAMILY_IPV6, 0x00u8, 0x05, 0xFF] {
+                let mut buf = vec![0x11u8; len];
+                if len > 0 {
+                    buf[0] = family;
+                }
+                // Must not panic. A valid header at an in-range length may
+                // succeed; anything else is an error variant.
+                let _ = decode_relay(&buf);
+            }
+        }
+    }
+
+    /// A frame whose declared length exactly equals the buffer remainder must
+    /// decode and yield the whole remainder; one byte more must be Truncated.
+    #[test]
+    fn declared_length_exact_buffer_boundary() {
+        let dest = "203.0.113.9:1234".parse::<SocketAddr>().unwrap();
+        let hdr = hdr_for(dest);
+        for declared in [0usize, 1, 2, 7, 64] {
+            let exact = forge_frame(dest, declared);
+            assert_eq!(exact.len(), hdr + declared);
+            let (_, data) = decode_relay(&exact).expect("exact frame decodes");
+            assert_eq!(data.len(), declared);
+
+            // Truncate the last byte of the declared payload.
+            if declared > 0 {
+                let short = &exact[..exact.len() - 1];
+                assert!(
+                    matches!(decode_relay(short), Err(RelayError::Truncated(_))),
+                    "declared {declared} with one byte missing must be Truncated"
+                );
+            }
+        }
+    }
+
+    /// The encoder's capacity is the decoder's capacity: no length the encoder
+    /// can produce may be rejected by the decoder (len-1/len/len+1 at the top).
+    #[test]
+    fn encoder_decoder_capacity_agree_at_the_edge() {
+        let dest = "198.51.100.1:53".parse::<SocketAddr>().unwrap();
+        for declared in [MAX_DATAGRAM_V4 - 1, MAX_DATAGRAM_V4] {
+            let frame = encode_relay(dest, &vec![0x7Eu8; declared]).expect("encodes");
+            // The encoder always emits the declared datagram length; the slot is
+            // sized so `HDR_LEN_V4 + MAX_DATAGRAM_V4` fills it exactly.
+            assert_eq!(frame.len(), HDR_LEN_V4 + declared);
+            let (_, data) = decode_relay(&frame).expect("decodes");
+            assert_eq!(data.len(), declared);
+        }
+        assert!(
+            encode_relay(dest, &vec![0u8; MAX_DATAGRAM_V4 + 1]).is_err(),
+            "the encoder refuses one past the cap"
+        );
+    }
+
     #[test]
     fn prune_bindings_ttl_sweeps_stale_even_under_cap() {
         let now = Instant::now();

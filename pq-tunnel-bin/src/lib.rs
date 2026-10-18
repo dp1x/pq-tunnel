@@ -135,9 +135,20 @@ pub struct ClientArgs {
     pub no_cover: bool,
 }
 
+/// Largest `--cover-mbps` value whose bitrate is representable in a `u64`:
+/// `u64::MAX / 1_000_000` = 18_446_744_073_709 Mbps (~1.8e19 bit/s).  Any
+/// larger value is rejected rather than wrapped (D29).
+pub const MAX_COVER_MBPS: u64 = u64::MAX / 1_000_000;
+
 /// Build the cover-traffic policy from CLI flags (transport policy, never a
 /// handshake property — D19).  Fail-closed on nonsensical input: `--no-cover`
 /// is the only supported way to disable.
+///
+/// The megabit→bit conversion is `checked_mul`, not `*`.  Unchecked, a value
+/// at or above `u64::MAX / 1_000_000` wraps (release) or panics (debug) and
+/// yields a nonsense rate — e.g. a wrapped-small value becomes an enormous
+/// interval, silently disabling cover traffic without `--no-cover`, which
+/// PROTOCOL_SPEC §12.2 reserves for the explicit flag (D29).
 pub fn cover_policy_from_args(no_cover: bool, mbps: u64) -> Result<CoverPolicy, String> {
     if no_cover {
         return Ok(CoverPolicy {
@@ -148,9 +159,12 @@ pub fn cover_policy_from_args(no_cover: bool, mbps: u64) -> Result<CoverPolicy, 
     if mbps == 0 {
         return Err("--cover-mbps must be >= 1; use --no-cover to disable cover traffic".into());
     }
+    let bps = mbps.checked_mul(1_000_000).ok_or_else(|| {
+        format!("--cover-mbps {mbps} overflows a u64 bitrate (max {MAX_COVER_MBPS})")
+    })?;
     Ok(CoverPolicy {
         enabled: true,
-        interval: interval_from_rate_bps(mbps * 1_000_000),
+        interval: interval_from_rate_bps(bps),
     })
 }
 
@@ -166,5 +180,73 @@ pub async fn main_entry() -> Result<(), Box<dyn std::error::Error>> {
         Command::Keygen(args) => keygen::run(&args),
         Command::Server(args) => v2_server::run(&args).await,
         Command::Client(args) => v2_client::run(&args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact overflow boundary: `u64::MAX / 1_000_000` is the largest
+    /// megabit value whose bitrate still fits in a `u64`. One more overflows.
+    const MAX_SAFE_MBPS: u64 = u64::MAX / 1_000_000;
+
+    /// Pinned arithmetic: the largest in-range value is 18_446_744_073_709,
+    /// and 18_446_744_073_710 is the first that does not fit. Written out so a
+    /// change to the multiplier fails the test rather than silently re-basing
+    /// the boundary.
+    #[test]
+    fn cover_mbps_overflow_boundary_is_exact() {
+        assert_eq!(MAX_SAFE_MBPS, 18_446_744_073_709);
+        assert!(MAX_SAFE_MBPS.checked_mul(1_000_000).is_some());
+        assert!(
+            (MAX_SAFE_MBPS + 1).checked_mul(1_000_000).is_none(),
+            "MAX_SAFE_MBPS + 1 must overflow the u64 bitrate"
+        );
+    }
+
+    /// Regression: `--cover-mbps` above the u64 bitrange must be *rejected*,
+    /// never wrapped. The pre-fix code did `mbps * 1_000_000` unchecked, which
+    /// wraps in release and panics in debug — either way it silently produced a
+    /// nonsense rate (a wrapped-small value became an enormous interval, i.e.
+    /// cover effectively switched itself off without `--no-cover`).
+    #[test]
+    fn cover_mbps_above_u64_bitrange_is_rejected_not_wrapped() {
+        for mbps in [MAX_SAFE_MBPS + 1, u64::MAX / 2, u64::MAX] {
+            let err = cover_policy_from_args(false, mbps)
+                .expect_err("out-of-range --cover-mbps must fail closed");
+            assert!(
+                err.contains("cover-mbps"),
+                "error must name the flag, got: {err}"
+            );
+        }
+    }
+
+    /// The largest in-range value is accepted, and yields a 1 ns interval —
+    /// i.e. acceptance is deliberately allowed to produce the clamp floor.
+    /// The clamp itself is pinned separately in `pq-tunnel-core::scheduler`.
+    #[test]
+    fn cover_mbps_at_u64_boundary_is_accepted() {
+        let p = cover_policy_from_args(false, MAX_SAFE_MBPS).expect("boundary must be accepted");
+        assert!(p.enabled);
+        assert_eq!(
+            p.interval,
+            interval_from_rate_bps(MAX_SAFE_MBPS * 1_000_000)
+        );
+    }
+
+    /// Documented lower bound and the `--no-cover` escape hatch (pre-existing
+    /// behaviour, pinned so the new upper bound cannot disturb it).
+    #[test]
+    fn cover_mbps_zero_is_rejected_and_no_cover_wins() {
+        let err = cover_policy_from_args(false, 0).expect_err("0 must be rejected");
+        assert!(
+            err.contains("no-cover"),
+            "error must point at --no-cover: {err}"
+        );
+
+        let off = cover_policy_from_args(true, u64::MAX).expect("--no-cover ignores --cover-mbps");
+        assert!(!off.enabled);
+        assert_eq!(off.interval, CoverPolicy::default().interval);
     }
 }

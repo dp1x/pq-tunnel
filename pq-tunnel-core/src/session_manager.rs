@@ -89,6 +89,7 @@ use crate::handshake_v2::{
 };
 use crate::scheduler::{CoverPolicy, CoverScheduler};
 use crate::wire_session::{SessionError, WireSession};
+use pq_crypto::MlDsaPublicKey;
 
 /// Driver tick interval: session eviction / deadline checks.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -351,6 +352,22 @@ impl ServerSessionManager {
     /// Number of pending handshake entries (diagnostics).
     pub fn pending_handshakes(&self) -> usize {
         self.hs.pending_len()
+    }
+
+    /// Replace the client roster without restarting (D27).
+    ///
+    /// Atomic and fail-closed: an empty roster is rejected and the existing
+    /// roster is left in force.  Pending handshakes authenticated against the
+    /// old roster are re-checked at M3 and will not complete if their key was
+    /// revoked in the meantime.  Established sessions are deliberately NOT
+    /// torn down — revocation gates future establishment (D27 §5).
+    pub fn set_roster(&mut self, roster: Vec<MlDsaPublicKey>) -> Result<(), ManagerError> {
+        self.hs.set_roster(roster).map_err(ManagerError::from)
+    }
+
+    /// Number of client keys on the current roster (diagnostics).
+    pub fn roster_len(&self) -> usize {
+        self.hs.roster_len()
     }
 
     /// Number of data-path failure-gate buckets (diagnostics).

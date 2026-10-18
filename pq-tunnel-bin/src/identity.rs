@@ -436,6 +436,80 @@ pub fn append_roster(path: &Path, key: &MlDsaPublicKey) -> Result<(), IdentityEr
     save_roster(path, &keys)
 }
 
+/// A hot-swappable client roster backed by a provisioning file (D27).
+///
+/// The invariant is **parse-then-swap, never mutate-in-place**: a reload
+/// builds a complete new roster off to the side, validates it fully, and only
+/// then replaces the published snapshot in one `Arc` store. A concurrent
+/// reader therefore observes either the entire old roster or the entire new
+/// one — never a partial, half-parsed, or empty roster.
+///
+/// `reload` is fail-closed: any parse error, or a roster that parses to zero
+/// keys, leaves the previously published snapshot untouched and in force.
+#[derive(Clone)]
+pub struct RosterHandle {
+    path: PathBuf,
+    current: std::sync::Arc<Vec<MlDsaPublicKey>>,
+}
+
+impl RosterHandle {
+    /// Load `path` and hold it. Fails closed at startup on a missing or
+    /// malformed roster — the server never starts with no trusted clients.
+    pub fn load(path: &Path) -> Result<Self, IdentityError> {
+        let roster = load_roster(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            current: std::sync::Arc::new(roster),
+        })
+    }
+
+    /// The path this handle reloads from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The currently published roster.
+    ///
+    /// The returned `Arc` is an immutable snapshot: it keeps the old roster
+    /// alive for any reader still holding it, which is what makes the swap
+    /// safe without a lock on the read path.
+    pub fn snapshot(&self) -> std::sync::Arc<Vec<MlDsaPublicKey>> {
+        std::sync::Arc::clone(&self.current)
+    }
+
+    /// Number of keys in the published roster.
+    pub fn len(&self) -> usize {
+        self.current.len()
+    }
+
+    /// True when the published roster is empty.  Only ever true for a handle
+    /// built from a roster that was non-empty, so this is false in practice —
+    /// it exists so the emptiness case is observable rather than assumed.
+    pub fn is_empty(&self) -> bool {
+        self.current.is_empty()
+    }
+
+    /// Re-read the backing file and, if it parses to a non-empty roster,
+    /// publish it as the new snapshot.
+    ///
+    /// Returns the new roster length on success. On any failure the previous
+    /// snapshot stays in force and the error is returned to the caller: a
+    /// half-written or corrupt roster can never narrow the trusted set.
+    pub fn reload(&mut self) -> Result<usize, IdentityError> {
+        let parsed = load_roster(&self.path)?;
+        if parsed.is_empty() {
+            return Err(IdentityError::EmptyRoster {
+                path: self.path.clone(),
+            });
+        }
+        let len = parsed.len();
+        // Single publication point: one store of a fully-built Arc. Readers
+        // see the old snapshot until this line and the new one after it.
+        self.current = std::sync::Arc::new(parsed);
+        Ok(len)
+    }
+}
+
 /// Short, stable fingerprint of a public key for out-of-band verification.
 ///
 /// `SHA-256(encoded_key)[..16]`, hex-encoded (32 chars): a 128-bit digest,

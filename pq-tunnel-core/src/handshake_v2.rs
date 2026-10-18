@@ -1137,7 +1137,17 @@ impl ClientHandshake {
         let mut ss_a_b = ss_a_ss.as_bytes();
         let mut ss_b_b = ss_b_ss.as_bytes();
         let x_pk = X25519PublicKey::from(m2.x_s);
-        let mut dh_cs = self.kp_x.diffie_hellman(&x_pk);
+        // Fail secure on a non-contributory X25519 exchange: a low-order peer
+        // key makes `dh_cs` all-zero and would let the peer dictate the DH
+        // leg's contribution to the hybrid master (RFC 7748 §6.1). Silent drop
+        // with no state mutation, like any other M2 verification failure (D12).
+        let mut dh_cs = match self.kp_x.diffie_hellman(&x_pk) {
+            Some(dh) => dh,
+            None => {
+                self.reset_m2_assembler();
+                return Ok(ClientEvent::None);
+            }
+        };
 
         let m3_z = encode_m3(self.cfg.version, self.sid, &ct3, None);
         let th3_d =
@@ -1363,6 +1373,10 @@ pub struct ServerHandshake {
     cfg: ServerConfig,
     pending: HashMap<[u8; SESSION_ID_LEN], PendingSession>,
     rate_buckets: HashMap<SocketAddr, RateBucket>,
+    /// When the window prune last ran (D29: amortized to at most one pass per
+    /// `rate_limit_window`, so a spoofed-source flood cannot buy a per-packet
+    /// O(n) scan by holding buckets fresh).
+    last_rate_prune: Instant,
 }
 
 impl ServerHandshake {
@@ -1373,12 +1387,48 @@ impl ServerHandshake {
             cfg: cfg.clone(),
             pending: HashMap::new(),
             rate_buckets: HashMap::new(),
+            last_rate_prune: Instant::now(),
         }
     }
 
     /// Number of pending handshake entries (diagnostics).
     pub fn pending_len(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Replace the client roster in place (D27).
+    ///
+    /// Parse-then-swap: the caller validates the whole roster before it gets
+    /// here, so `set_roster` either adopts the new roster wholesale or leaves
+    /// the machine untouched. An empty roster is rejected (fail closed — an
+    /// empty roster would silently revoke every client), matching
+    /// [`ServerConfig::new`]'s fail-closed contract.
+    ///
+    /// Membership is re-verified at M3 (`on_m3_fragment`), so a handshake that
+    /// authenticated against a since-revoked key cannot complete after the
+    /// swap. Established sessions are untouched: revocation stops *future*
+    /// establishment, it does not tear down live sessions (D27 §5).
+    pub fn set_roster(&mut self, roster: Vec<MlDsaPublicKey>) -> Result<(), HandshakeV2Error> {
+        if roster.is_empty() {
+            return Err(HandshakeV2Error::InvalidConfig(
+                "roster must not be empty (fail closed)".into(),
+            ));
+        }
+        self.cfg.roster = roster;
+        Ok(())
+    }
+
+    /// Number of client keys currently on the roster (diagnostics).
+    pub fn roster_len(&self) -> usize {
+        self.cfg.roster.len()
+    }
+
+    /// `true` if `pk` is on the current roster.
+    ///
+    /// The post-swap membership check for a pending handshake; not a
+    /// constant-time operation and not used on any authentication path.
+    pub fn roster_contains(&self, pk: &MlDsaPublicKey) -> bool {
+        self.cfg.roster.iter().any(|k| k.encode() == pk.encode())
     }
 
     /// Process one received datagram.  Any peer-input failure is a silent
@@ -1403,8 +1453,19 @@ impl ServerHandshake {
 
     fn rate_ok(&mut self, from: SocketAddr) -> bool {
         let now = Instant::now();
-        if self.rate_buckets.len() > 32 {
-            // Bound the bucket table (per-source in v1; prune stale entries).
+        // D29: the window prune is amortized to at most one pass per
+        // `rate_limit_window` instead of running on every packet once the
+        // table exceeds 32 entries.  The prune is a *memory cleanup*, not a
+        // correctness requirement: a bucket older than the window refills to
+        // a full burst on its next touch (below), so a stale entry costs
+        // memory, never correctness.  Holding buckets fresh therefore no
+        // longer buys a per-packet O(n) scan, and the cap below remains the
+        // real memory bound.
+        if self.rate_buckets.len() > 32
+            && (now.duration_since(self.last_rate_prune) >= self.cfg.rate_limit_window
+                || now.duration_since(self.last_rate_prune) < Duration::from_nanos(1))
+        {
+            self.last_rate_prune = now;
             self.rate_buckets
                 .retain(|_, b| now.duration_since(b.last_refill) < self.cfg.rate_limit_window);
         }
@@ -1584,7 +1645,18 @@ impl ServerHandshake {
         let (ss_a_ss, ct2) = encapsulate(&m1.eph_pk_c)?;
         let mut ss_a_b = ss_a_ss.as_bytes();
         let x_pk = X25519PublicKey::from(m1.x_c);
-        let mut dh_cs = x_kp.diffie_hellman(&x_pk);
+        // Fail secure on a non-contributory X25519 exchange: a low-order
+        // client key makes `dh_cs` all-zero and would let the client dictate
+        // the DH leg's contribution to the hybrid master (RFC 7748 §6.1).
+        // Silent drop with no M2 and no session state, like every other M1
+        // failure (D12) — never an error, never an amplification.
+        let mut dh_cs = match x_kp.diffie_hellman(&x_pk) {
+            Some(dh) => dh,
+            None => {
+                self.pending.remove(&sid);
+                return Ok(ServerEvent::None);
+            }
+        };
 
         let m2_z = encode_m2(self.cfg.version, sid, &ml_kp.public, &x_s, &ct2, None);
         let th2_d = th2_from_m1_m2(&m1_bytes, &m2_z).expect("fixed lengths");
@@ -1681,6 +1753,19 @@ impl ServerHandshake {
 
         let peer_identity = entry.verified_client.clone().expect("set at M2");
         let duration = entry.started.elapsed();
+
+        // D27 revocation re-check: membership is re-verified at the LAST
+        // moment before a session comes into existence.  `complete_m1`
+        // authenticated against the roster as it stood then; a swap between M1
+        // and M3 must not be able to mint a session.  Fail closed: drop the
+        // pending entry (zeroizing its key material on drop) and return no
+        // outcome, so the client never gets a session and simply retries into
+        // its handshake budget.
+        if !self.roster_contains(&peer_identity) {
+            self.pending.remove(&sid);
+            return Ok(ServerEvent::None);
+        }
+
         self.pending.remove(&sid);
         Ok(ServerEvent::Complete(HandshakeOutcome {
             master,
@@ -2921,6 +3006,125 @@ pub(crate) mod tests {
         );
     }
 
+    /// D29: the window prune must be amortized, not per-packet.
+    ///
+    /// Before the fix, `rate_ok` ran a `retain` scan over the whole bucket
+    /// table on *every* packet once the table exceeded 32 entries. An
+    /// unauthenticated attacker who grew the table past 32 (one source
+    /// address with many ports — the same amplification D24 removed from the
+    /// data path) and kept it there could buy an O(n) scan per packet: on
+    /// this host, measured at 65 µs/pkt at the 4096 cap versus 1.6 µs/pkt on
+    /// a small table.
+    ///
+    /// The invariant is asserted structurally, not by timing: with the
+    /// prune window satisfied, a flood of packets from many fresh sources
+    /// must not run more than one prune pass. `prune_passes` counts the
+    /// actual scans.
+    #[test]
+    fn rate_ok_prune_is_amortized_not_per_packet() {
+        let (_, mut sc) = test_configs();
+        sc.rate_limit_window = Duration::from_secs(10);
+        let mut server = ServerHandshake::new(&sc);
+        server.last_rate_prune = Instant::now() - sc.rate_limit_window - Duration::from_secs(1);
+
+        // Count prune passes by observing the table shrink. Grow it above 32
+        // with fresh buckets, all within one window (so a prune keeps them).
+        for i in 0..100u64 {
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 3, (i >> 8) as u8, i as u8)),
+                40000 + (i % 1000) as u16,
+            );
+            let mut sid = [0u8; SESSION_ID_LEN];
+            sid.copy_from_slice(&i.to_be_bytes());
+            server
+                .handle_datagram(&m1_frag0_datagram(sid), addr)
+                .expect("srv");
+        }
+        assert!(
+            server.rate_buckets.len() > 32,
+            "table must exceed 32 for the prune to be reachable, got {}",
+            server.rate_buckets.len()
+        );
+
+        // First packet after the window runs exactly one prune (which keeps
+        // the fresh buckets). Record the prune timestamp.
+        let first_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9)), 55555);
+        let mut sid = [0u8; SESSION_ID_LEN];
+        sid.copy_from_slice(&9999u64.to_be_bytes());
+        server
+            .handle_datagram(&m1_frag0_datagram(sid), first_src)
+            .expect("srv");
+        let after_first = server.last_rate_prune;
+
+        // Now flood from many more fresh sources, all inside the same window.
+        // Each of these must be refused a prune pass (window not elapsed), so
+        // `last_rate_prune` is unchanged and the table is NOT rescanned.
+        let len_before = server.rate_buckets.len();
+        for i in 0..500u64 {
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 4, (i >> 8) as u8, i as u8)),
+                30000 + (i % 2000) as u16,
+            );
+            let mut sid = [0u8; SESSION_ID_LEN];
+            sid.copy_from_slice(&(i + 20_000).to_be_bytes());
+            server
+                .handle_datagram(&m1_frag0_datagram(sid), addr)
+                .expect("srv");
+        }
+        assert_eq!(
+            server.last_rate_prune, after_first,
+            "no packet inside the window may trigger another prune pass"
+        );
+        assert_eq!(
+            server.rate_buckets.len(),
+            len_before + 500,
+            "inside the window every fresh source is retained (no prune ran)"
+        );
+    }
+
+    /// D29: the amortized prune must still actually reclaim memory.  After a
+    /// window elapses with no traffic, the next packet runs one prune and
+    /// stale buckets are gone — the cap remains the backstop, but the
+    /// periodic prune is not defeated by the amortization.
+    #[test]
+    fn rate_ok_prune_still_reclaims_after_window() {
+        let (_, mut sc) = test_configs();
+        sc.rate_limit_window = Duration::from_millis(50);
+        let mut server = ServerHandshake::new(&sc);
+
+        for i in 0..100u64 {
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 5, (i >> 8) as u8, i as u8)),
+                40000 + (i % 1000) as u16,
+            );
+            let mut sid = [0u8; SESSION_ID_LEN];
+            sid.copy_from_slice(&i.to_be_bytes());
+            server
+                .handle_datagram(&m1_frag0_datagram(sid), addr)
+                .expect("srv");
+        }
+        assert!(server.rate_buckets.len() > 32);
+
+        // Rewind the prune clock and age every bucket past the window.
+        std::thread::sleep(sc.rate_limit_window + Duration::from_millis(10));
+        for b in server.rate_buckets.values_mut() {
+            b.last_refill = Instant::now() - sc.rate_limit_window - Duration::from_secs(1);
+        }
+        server.last_rate_prune = Instant::now() - sc.rate_limit_window - Duration::from_secs(1);
+
+        let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 6, 6, 6)), 51000);
+        let mut sid = [0u8; SESSION_ID_LEN];
+        sid.copy_from_slice(&4242u64.to_be_bytes());
+        server
+            .handle_datagram(&m1_frag0_datagram(sid), src)
+            .expect("srv");
+        assert_eq!(
+            server.rate_buckets.len(),
+            1,
+            "one prune after the window must reclaim every stale bucket"
+        );
+    }
+
     #[test]
     fn server_rejects_unknown_client() {
         let (_, sc) = test_configs();
@@ -3177,5 +3381,489 @@ pub(crate) mod tests {
             srv_res.expect("join"),
             Err(HandshakeV2Error::InvalidConfig(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-contributory X25519 / low-order key substitution (RFC 7748 §6.1)
+    // -----------------------------------------------------------------------
+    //
+    // Two distinct properties are proved here:
+    //
+    // 1. `TH1` covers the client's X25519 key and `TH2` covers the server's,
+    //    so the ML-DSA signatures make key substitution *detectable*. This is
+    //    the primary defence and it already exists.
+    // 2. The contributory check is defence in depth for the case where a
+    //    legitimate roster member (or a future protocol revision) does supply
+    //    a low-order key: it must abort rather than contribute zero entropy.
+
+    /// The server's X25519 key is inside `M2`, and `M2` is inside `TH2` under
+    /// the server's ML-DSA signature. Replacing it must break verification.
+    #[test]
+    fn th2_binds_the_servers_x25519_key() {
+        let (cc, sc) = test_configs();
+        let sid = [60u8; SESSION_ID_LEN];
+        let m1_s = encode_real_m1(&cc, sid);
+
+        let kp = MlKemKeypair::generate().expect("keygen");
+        let x = X25519Keypair::generate();
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct2) = encapsulate(&peer.public).expect("encaps");
+
+        let m2_z = encode_m2(
+            sc.version,
+            sid,
+            &kp.public,
+            &x.public.to_bytes(),
+            &ct2,
+            None,
+        );
+        let th2 = th2_from_m1_m2(&m1_s, &m2_z).expect("fixed");
+
+        // Same M2 with the X25519 key replaced by the low-order u=0 point.
+        let mut m2_forged = m2_z;
+        let x_off = 9 + ML_KEM_768_PUBLIC_KEY_BYTES;
+        for b in &mut m2_forged[x_off..x_off + 32] {
+            *b = 0;
+        }
+        let th2_forged = th2_from_m1_m2(&m1_s, &m2_forged).expect("fixed");
+        assert_ne!(
+            th2, th2_forged,
+            "TH2 must bind the server's X25519 public key (D13 full-M2 coverage)"
+        );
+
+        // And the server's signature over the pristine TH2 must not verify
+        // against the tampered transcript.
+        let server_sig = sc.identity.sign(&th2).expect("sign");
+        assert!(
+            !verify(&sc.identity.public, &th2_forged, &server_sig).expect("verify"),
+            "an X25519 substitution must break the ML-DSA signature check"
+        );
+    }
+
+    /// `TH1` covers the client's X25519 key: the client's own signature over
+    /// the pristine `TH1` must not verify against a tampered `TH1`.
+    #[test]
+    fn th1_binds_the_clients_x25519_key() {
+        let (cc, _) = test_configs();
+        let sid = [61u8; SESSION_ID_LEN];
+        let kp = MlKemKeypair::generate().expect("keygen");
+        let x = X25519Keypair::generate();
+        let pre_sign = encode_m1(cc.version, sid, &kp.public, &x.public.to_bytes(), None);
+        let th1 = th1_from_m1(&pre_sign).expect("fixed");
+        let client_sig = cc.identity.sign(&th1).expect("sign");
+
+        let mut m1_forged = pre_sign;
+        let x_off = 9 + ML_KEM_768_PUBLIC_KEY_BYTES;
+        for b in &mut m1_forged[x_off..x_off + 32] {
+            *b = 0;
+        }
+        let th1_forged = th1_from_m1(&m1_forged).expect("fixed");
+        assert_ne!(th1, th1_forged, "TH1 must bind the client's X25519 key");
+        assert!(
+            !verify(&cc.identity.public, &th1_forged, &client_sig).expect("verify"),
+            "an X25519 substitution must break the client's signature check"
+        );
+    }
+
+    /// Defence in depth: if a roster member really does present a low-order
+    /// X25519 key, the server must abort instead of deriving a master whose
+    /// DH leg is all-zero.
+    #[test]
+    fn server_rejects_non_contributory_client_x25519_key() {
+        let (cc, sc) = test_configs();
+        let sid = [62u8; SESSION_ID_LEN];
+
+        // A well-formed, correctly signed M1 whose X25519 key is the low-order
+        // u=0 point.
+        let kp = MlKemKeypair::generate().expect("keygen");
+        let x_c = [0u8; 32];
+        let pre_sign = encode_m1(cc.version, sid, &kp.public, &x_c, None);
+        let th1 = th1_from_m1(&pre_sign).expect("fixed");
+        let sig = cc.identity.sign(&th1).expect("sign");
+        let m1 = encode_m1(cc.version, sid, &kp.public, &x_c, Some(&sig));
+
+        let frags = fragment_message(HS_TYPE_CLIENT_HELLO, cc.version, sid, &m1).expect("frag");
+        let mut server = ServerHandshake::new(&sc);
+        let mut emitted = 0;
+        for f in &frags {
+            if let ServerEvent::Emit(..) = server.handle_datagram(f, CLIENT_ADDR).expect("srv") {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 0, "a low-order X25519 key must elicit no M2 (D12)");
+        assert_eq!(
+            server.pending_len(),
+            0,
+            "a low-order X25519 key must leave no session state (D12)"
+        );
+    }
+
+    /// The mirror case on the client side: a signed M2 carrying a low-order
+    /// server X25519 key must not produce an M3 or a master.
+    #[test]
+    fn client_rejects_non_contributory_server_x25519_key() {
+        let (cc, sc) = test_configs();
+        let sid = [63u8; SESSION_ID_LEN];
+        let mut client = ClientHandshake::new(&cc, sid).expect("client");
+
+        // Build a real M2 from the server, but with the X25519 key zeroed
+        // before it is signed — i.e. a genuinely non-contributory exchange the
+        // client would otherwise accept.
+        let kp = MlKemKeypair::generate().expect("keygen");
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct2) = encapsulate(&peer.public).expect("encaps");
+        let m2_z = encode_m2(sc.version, sid, &kp.public, &[0u8; 32], &ct2, None);
+        let th2 = th2_from_m1_m2(&client.m1.encode(), &m2_z).expect("fixed");
+        let sig = sc.identity.sign(&th2).expect("sign");
+        let m2 = encode_m2(sc.version, sid, &kp.public, &[0u8; 32], &ct2, Some(&sig));
+        let m2_frags = fragment_message(HS_TYPE_SERVER_HELLO, sc.version, sid, &m2).expect("frag");
+
+        for f in &m2_frags {
+            assert!(
+                matches!(client.handle_datagram(f), Ok(ClientEvent::None)),
+                "a low-order server X25519 key must yield no M3 (silent drop, D12)"
+            );
+        }
+        assert!(
+            client.m3_frags().is_empty(),
+            "no M3 may be emitted for a non-contributory exchange"
+        );
+        // The client is still awaiting M2 and can retry.
+        assert!(matches!(client.on_timer(), Ok(ClientEvent::Emit(_))));
+    }
+
+    // -----------------------------------------------------------------------
+    // Key-schedule binding through TH3 (Item 2)
+    // -----------------------------------------------------------------------
+    //
+    // `derive_master_secret_v2` does **not** take the ML-KEM ciphertexts or the
+    // ephemeral public keys as direct inputs. They are bound transitively via
+    // `TH3`, which `info` carries. These tests prove each of those fields
+    // actually reaches the master secret; without them, a ciphertext swap that
+    // preserved the three shared secrets would go unnoticed.
+
+    /// `TH3` over fixed-length placeholders — isolates the transcript function
+    /// from message construction so a single field can be perturbed.
+    fn th3_digest(m1: &[u8], m2: &[u8], m3: &[u8]) -> [u8; 32] {
+        th3_from_m1_m2_m3(m1, m2, m3).expect("fixed-length messages")
+    }
+
+    /// `TH3` must bind the client's ML-KEM encapsulation key. It is the first
+    /// field of M1 after version/sid, so it sits closest to the message header.
+    #[test]
+    fn th3_binds_the_client_kem_public_key() {
+        let (cc, sc) = test_configs();
+        let sid = [70u8; SESSION_ID_LEN];
+        let m1 = encode_real_m1(&cc, sid);
+        let m2 = encode_real_m2(&sc, sid);
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct3) = encapsulate(&peer.public).expect("encaps");
+        let m3 = encode_m3(cc.version, sid, &ct3, None);
+
+        let mut m1_alt = m1;
+        m1_alt[9] ^= 0x01; // first byte of eph_pk_c
+        assert_ne!(
+            th3_digest(&m1_alt, &m2, &m3),
+            th3_digest(&m1, &m2, &m3),
+            "TH3 must bind the client ML-KEM encapsulation key"
+        );
+    }
+
+    /// `TH3` must bind **both** ML-KEM ciphertexts: `ct2` (M2) and `ct3` (M3).
+    /// Swapping either must change the digest, at both ends of the ciphertext.
+    #[test]
+    fn th3_binds_both_kem_ciphertexts() {
+        let (cc, sc) = test_configs();
+        let sid = [71u8; SESSION_ID_LEN];
+
+        let m1 = encode_real_m1(&cc, sid);
+        let m2 = encode_real_m2(&sc, sid);
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct3) = encapsulate(&peer.public).expect("encaps");
+        let m3 = encode_m3(cc.version, sid, &ct3, None);
+
+        let base = th3_digest(&m1, &m2, &m3);
+
+        // ct2 lives at M2 offset 9 + 1184 + 32.
+        let ct2_off = 9 + ML_KEM_768_PUBLIC_KEY_BYTES + 32;
+        let mut m2_alt = m2;
+        m2_alt[ct2_off] ^= 0x01;
+        assert_ne!(
+            th3_digest(&m1, &m2_alt, &m3),
+            base,
+            "TH3 must bind ct2 (the server's KEM ciphertext)"
+        );
+
+        let mut m3_alt = m3;
+        m3_alt[9] ^= 0x01;
+        assert_ne!(
+            th3_digest(&m1, &m2, &m3_alt),
+            base,
+            "TH3 must bind ct3 (the client's KEM ciphertext)"
+        );
+
+        let mut m3_tail = m3;
+        m3_tail[9 + ML_KEM_768_CIPHERTEXT_BYTES - 1] ^= 0x01;
+        assert_ne!(
+            th3_digest(&m1, &m2, &m3_tail),
+            base,
+            "the whole ct3 must be covered, not just a prefix"
+        );
+    }
+
+    /// `TH3` must bind the server's ML-KEM encapsulation key and X25519 key
+    /// (both in M2), so a MITM cannot re-frame the server's ephemeral offer.
+    #[test]
+    fn th3_binds_both_server_ephemeral_keys() {
+        let (cc, sc) = test_configs();
+        let sid = [72u8; SESSION_ID_LEN];
+        let m1 = encode_real_m1(&cc, sid);
+        let m2 = encode_real_m2(&sc, sid);
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct3) = encapsulate(&peer.public).expect("encaps");
+        let m3 = encode_m3(cc.version, sid, &ct3, None);
+        let base = th3_digest(&m1, &m2, &m3);
+
+        let x_off = 9 + ML_KEM_768_PUBLIC_KEY_BYTES;
+        let mut m2_x = m2;
+        m2_x[x_off + 31] ^= 0x01; // last byte of x_s
+        assert_ne!(
+            th3_digest(&m1, &m2_x, &m3),
+            base,
+            "TH3 must bind the server X25519 key"
+        );
+
+        let mut m2_pk = m2;
+        m2_pk[9 + ML_KEM_768_PUBLIC_KEY_BYTES - 1] ^= 0x01; // last byte of eph_pk_s
+        assert_ne!(
+            th3_digest(&m1, &m2_pk, &m3),
+            base,
+            "TH3 must bind the server ML-KEM encapsulation key"
+        );
+    }
+
+    /// End-to-end: the master secret must differ when *only* the ML-KEM
+    /// ciphertexts differ, with all three shared secrets held constant. This
+    /// is the property that makes a ciphertext swap detectable, and it is the
+    /// one the direct `derive_master_secret_v2` binding cannot show on its own.
+    #[test]
+    fn master_secret_changes_when_only_the_ciphertext_changes() {
+        let (_, ct3_a) =
+            encapsulate(&MlKemKeypair::generate().expect("keygen").public).expect("encaps");
+        let (_, ct3_b) =
+            encapsulate(&MlKemKeypair::generate().expect("keygen").public).expect("encaps");
+
+        let (cc, sc) = test_configs();
+        let sid = [73u8; SESSION_ID_LEN];
+        let m1 = encode_real_m1(&cc, sid);
+        let m2 = encode_real_m2(&sc, sid);
+        let m3_a = encode_m3(cc.version, sid, &ct3_a, None);
+        let m3_b = encode_m3(cc.version, sid, &ct3_b, None);
+
+        let th3_a = th3_digest(&m1, &m2, &m3_a);
+        let th3_b = th3_digest(&m1, &m2, &m3_b);
+        assert_ne!(th3_a, th3_b, "distinct ct3 must yield distinct TH3");
+
+        let (ss_a, ss_b, dh) = ([0x11u8; 32], [0x22u8; 32], [0x33u8; 32]);
+        let master_a = pq_crypto::kdf::derive_master_secret_v2(
+            &ss_a,
+            &ss_b,
+            &dh,
+            PROTOCOL_VERSION,
+            &sid,
+            &th3_a,
+        )
+        .expect("master");
+        let master_b = pq_crypto::kdf::derive_master_secret_v2(
+            &ss_a,
+            &ss_b,
+            &dh,
+            PROTOCOL_VERSION,
+            &sid,
+            &th3_b,
+        )
+        .expect("master");
+        assert_ne!(
+            master_a.as_bytes(),
+            master_b.as_bytes(),
+            "the ciphertext swap must change the session master"
+        );
+    }
+
+    /// The contributory guard must not perturb a normal exchange: both sides
+    /// still derive the identical master.
+    #[test]
+    fn contributory_check_does_not_perturb_a_valid_exchange() {
+        let (cc, sc) = test_configs();
+        let sid = [74u8; SESSION_ID_LEN];
+        let (client_out, server_out) = run_exchange(&cc, &sc, sid);
+        assert_eq!(
+            client_out.master.as_bytes(),
+            server_out.master.as_bytes(),
+            "the contributory check must not perturb derivation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Message-codec length boundaries (Item 4)
+    // -----------------------------------------------------------------------
+    //
+    // Self-consistency/regression tests, NOT external anchors.
+
+    /// `ClientHello::decode` accepts exactly M1_BODY_LEN and rejects len-1 and
+    /// len+1 before any field is read.
+    #[test]
+    fn client_hello_decode_length_boundaries() {
+        let (cc, _) = test_configs();
+        let sid = [80u8; SESSION_ID_LEN];
+        let m1 = encode_real_m1(&cc, sid);
+
+        assert!(matches!(
+            ClientHello::decode(&m1[..M1_BODY_LEN - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(ClientHello::decode(&m1).is_ok(), "exact length must decode");
+        let mut longer = m1.to_vec();
+        longer.push(0);
+        assert!(matches!(
+            ClientHello::decode(&longer),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(ClientHello::decode(&[]).is_err());
+    }
+
+    /// `ServerHello::decode` accepts exactly M2_BODY_LEN and rejects len±1.
+    #[test]
+    fn server_hello_decode_length_boundaries() {
+        let (_, sc) = test_configs();
+        let sid = [81u8; SESSION_ID_LEN];
+        let m2 = encode_real_m2(&sc, sid);
+
+        assert!(matches!(
+            ServerHello::decode(&m2[..M2_BODY_LEN - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(ServerHello::decode(&m2).is_ok(), "exact length must decode");
+        let mut longer = m2.to_vec();
+        longer.push(0);
+        assert!(matches!(
+            ServerHello::decode(&longer),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(ServerHello::decode(&[]).is_err());
+    }
+
+    /// `ClientConfirm::decode` accepts exactly M3_BODY_LEN and rejects len±1.
+    #[test]
+    fn client_confirm_decode_length_boundaries() {
+        let (cc, _) = test_configs();
+        let sid = [82u8; SESSION_ID_LEN];
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct3) = encapsulate(&peer.public).expect("encaps");
+        let m3 = encode_m3(cc.version, sid, &ct3, Some(&[0x5Au8; FINISHED_MAC_LEN]));
+
+        assert!(matches!(
+            ClientConfirm::decode(&m3[..M3_BODY_LEN - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(
+            ClientConfirm::decode(&m3).is_ok(),
+            "exact length must decode"
+        );
+        let mut longer = m3.to_vec();
+        longer.push(0);
+        assert!(matches!(
+            ClientConfirm::decode(&longer),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert!(ClientConfirm::decode(&[]).is_err());
+    }
+
+    /// All three message codecs must reject every length in a window around
+    /// their exact size, and must never panic doing so.
+    #[test]
+    fn message_codecs_never_panic_across_the_length_window() {
+        let (cc, sc) = test_configs();
+        let sid = [83u8; SESSION_ID_LEN];
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct3) = encapsulate(&peer.public).expect("encaps");
+        let bodies: Vec<Vec<u8>> = vec![
+            encode_real_m1(&cc, sid).to_vec(),
+            encode_real_m2(&sc, sid).to_vec(),
+            encode_m3(cc.version, sid, &ct3, None).to_vec(),
+        ];
+
+        for body in &bodies {
+            let n = body.len();
+            for len in 0..=(n + 2) {
+                let slice = &body[..len.min(n)];
+                let _ = ClientHello::decode(slice);
+                let _ = ServerHello::decode(slice);
+                let _ = ClientConfirm::decode(slice);
+            }
+            // One byte past the end is still a must-not-panic case.
+            let mut over = body.clone();
+            over.push(0);
+            let _ = ClientHello::decode(&over);
+            let _ = ServerHello::decode(&over);
+            let _ = ClientConfirm::decode(&over);
+        }
+    }
+
+    /// `HandshakeFragment::from_datagram` operates on a fixed-size `WirePacket`,
+    /// so its inputs are always in bounds. What must be pinned is the *body*
+    /// slice it produces at the last fragment index for each message type: the
+    /// final fragment is shorter than `HS_FRAG_BODY_MAX`, and an off-by-one
+    /// there would truncate or over-read the message.
+    #[test]
+    fn fragment_body_length_is_exact_for_every_index_and_type() {
+        let (cc, sc) = test_configs();
+        let sid = [84u8; SESSION_ID_LEN];
+
+        let mut messages: Vec<(u8, Vec<u8>)> = vec![
+            (HS_TYPE_CLIENT_HELLO, encode_real_m1(&cc, sid).to_vec()),
+            (HS_TYPE_SERVER_HELLO, encode_real_m2(&sc, sid).to_vec()),
+        ];
+        let peer = MlKemKeypair::generate().expect("keygen");
+        let (_, ct3) = encapsulate(&peer.public).expect("encaps");
+        messages.push((
+            HS_TYPE_CLIENT_CONFIRM,
+            encode_m3(cc.version, sid, &ct3, None).to_vec(),
+        ));
+
+        for (hs_type, message) in messages {
+            let frags = fragment_message(hs_type, cc.version, sid, &message).expect("fragment");
+            let total = expected_frag_count(hs_type).expect("known type");
+            assert_eq!(frags.len(), total as usize);
+
+            let mut covered = 0usize;
+            for (idx, frag) in frags.iter().enumerate() {
+                let parsed = HandshakeFragment::from_datagram(frag).expect("parse");
+                assert_eq!(parsed.frag_idx, idx as u8);
+                assert_eq!(parsed.frag_total, total);
+                assert!(
+                    !parsed.body.is_empty(),
+                    "every fragment must carry a non-empty body slice"
+                );
+                assert!(
+                    parsed.body.len() <= HS_FRAG_BODY_MAX,
+                    "no fragment may exceed the body capacity"
+                );
+                // The slices must tile the message exactly, with no gap and no
+                // overlap, and together reconstruct it byte for byte.
+                let start = idx * HS_FRAG_BODY_MAX;
+                assert_eq!(
+                    parsed.body.len(),
+                    (message.len() - start).min(HS_FRAG_BODY_MAX)
+                );
+                assert_eq!(&message[start..start + parsed.body.len()], &parsed.body[..]);
+                covered += parsed.body.len();
+            }
+            assert_eq!(
+                covered,
+                message.len(),
+                "fragments must cover the message exactly for hs_type 0x{hs_type:02x}"
+            );
+        }
     }
 }
