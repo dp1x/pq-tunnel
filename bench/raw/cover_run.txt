@@ -1,0 +1,55 @@
+================================================================================
+Tunnel performance harness (TRACK I) — measurements only
+================================================================================
+host_arch_env      : x86_64
+profile            : release (opt-level=3, debug=true)
+sample_definition  : 1 sample = Instant::now() delta around the measured region
+percentile_method  : nearest-rank, i = ceil(q*n)-1, clamped to [0, n-1]
+threads            : single-threaded, no rayon/threads in the harness
+
+bench group       : cover
+iteration counts  : prims warmup=200 iters=5000 | roster warmup=3 iters=200 | handshake warmup=2 iters=60
+amortisation      : scheduler tick x1000 calls/sample | AEAD x1000 calls/sample
+cadence window    : 30s
+mode              : FULL
+
+--- Bench 4a-0: clock calibration floor ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+calibration: Instant::now() round-trip         ns  n=510     warmup=200   min=      1000.0 p50=      1100.0 median=      1100.0 p99=      1200.0 max=     15000.0 mean=      1156.5
+
+--- Bench 4a: cover scheduler tick cost (virtual time) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+CoverScheduler::on_deadline (emitting tick)    ns  n=110     warmup=25    min=      9258.4 p50=      9689.7 median=      9689.7 p99=     20675.6 max=     28129.2 mean=     10820.3
+CoverScheduler::on_deadline (steady, pre-armed) ns  n=110     warmup=25    min=      7360.1 p50=      7648.9 median=      7648.9 p99=     22531.1 max=     23138.6 mean=      8798.3
+
+--- Bench 4b: interval_from_rate_bps cost sweep ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+interval_from_rate_bps(1000) -> 10.24s         ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=   2868600.0 mean=       459.6
+interval_from_rate_bps(64000) -> 160ms         ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=   3636600.0 mean=       490.5
+interval_from_rate_bps(100000) -> 102.4ms      ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=    401100.0 mean=       436.3
+interval_from_rate_bps(1000000) -> 10.24ms     ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=    584900.0 mean=       431.4
+interval_from_rate_bps(2000000) -> 5.12ms      ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=   2846600.0 mean=       495.7
+interval_from_rate_bps(10000000) -> 1.024ms    ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=   1054900.0 mean=       435.7
+interval_from_rate_bps(100000000) -> 102.4µs   ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=   1200200.0 mean=       454.8
+interval_from_rate_bps(1000000000) -> 10.24µs  ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=     88500.0 mean=       407.1
+interval_from_rate_bps(1000000000000) -> 10ns  ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=    865600.0 mean=       429.0
+interval_from_rate_bps(1000000000000000) -> 1ns ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=    417200.0 mean=       418.3
+interval_from_rate_bps(1000000000000000000) -> 1ns ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=   1209600.0 mean=       433.8
+interval_from_rate_bps(18446744073709551615) -> 1ns ns  n=50000   warmup=10000 min=       300.0 p50=       400.0 median=       400.0 p99=       500.0 max=    867400.0 mean=       425.2
+
+--- Bench 4c: AEAD / record encrypt cost (1280-byte record) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+aead::encrypt (raw ChaCha20Poly1305, inner+tag) ns  n=510     warmup=200   min=      6685.7 p50=      6965.8 median=      6965.8 p99=     35395.1 max=     45530.7 mean=      9680.1
+CipherSession::encrypt (full 1280B record)     ns  n=510     warmup=200   min=      9486.5 p50=     10211.7 median=     10211.7 p99=     43639.1 max=     60556.6 mean=     14709.3
+
+--- Record geometry (from crate constants) ---
+  PACKET_SIZE     = 1280 B
+  PAYLOAD_LEN     = 1245 B (inner plaintext payload slot)
+
+================================================================================
+TOTAL WALL TIME: 19.9434244s
+================================================================================
+not measured in this run (see docs/performance/I-benchmark-methodology.md):
+  - syscall cost per cover packet (sendto + timer arm + wake)
+  - loopback end-to-end handshake wall time including transport
+  - multi-core scaling (single-threaded only)

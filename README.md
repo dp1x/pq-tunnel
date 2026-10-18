@@ -70,8 +70,9 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.2.0-alpha released):** 352 tests pass
-(`cargo test --workspace`), including external known-answer vectors (RFC 8439
+**Validation (v0.2.0-alpha released):** 422 tests pass on
+`x86_64-pc-windows-msvc` (`cargo test --workspace`), including external
+known-answer vectors (RFC 8439
 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
 and ML-DSA-65 — D21), adversarial end-to-end cases (garbage, forged
 handshake, version downgrade, AEAD tamper, replay, reordering) that assert a
@@ -165,13 +166,14 @@ never-panic contract.
 
 ## Tests
 
-- `pq-crypto`: 67 unit tests (incl. external known-answer vectors, D21)
-- `pq-tunnel-core`: 236 unit tests (incl. session-manager & handshake-v2 tests
+- `pq-crypto`: 85 unit tests (incl. external known-answer vectors, D21)
+- `pq-tunnel-core`: 259 unit tests (incl. session-manager & handshake-v2 tests
   and the D16 nonce-exhaustion full-loop driver E2E)
-- `pq-tunnel-bin`: 37 unit tests + 12 E2E integration tests (identity
-  provisioning, keygen, CIDR parsing, packet length) — single `pq-tunnel`
-  binary with `keygen`/`server`/`client` subcommands; the E2E suite covers the
-  smoke gate (3), the adversarial tunnel cases (6), and the stress suite (3)
+- `pq-tunnel-bin`: 53 unit tests + 25 E2E integration tests (identity
+  provisioning, keygen, CIDR parsing, packet length, revocation/lifetime) —
+  single `pq-tunnel` binary with `keygen`/`server`/`client` subcommands; the
+  E2E suite covers the smoke gate (3), the adversarial tunnel cases (6), the
+  stress suite (3), and the revocation/lifetime suite (13)
 - `pq-proxy`: parked (v1 SOCKS5-over-QUIC, excluded from the workspace; v2
   rewrite planned — see D20); `pq-tun`: removed in M4
 - 10 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`

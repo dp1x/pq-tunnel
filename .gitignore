@@ -12,6 +12,10 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/Cargo.lock
 
+# Bench harness lock (its own workspace; volatile deps; not pinned for release)
+bench/target/
+bench/Cargo.lock
+
 # Native compilation outputs that may escape target/
 *.o
 *.obj

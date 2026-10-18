@@ -1,0 +1,34 @@
+[package]
+name = "pq-tunnel-bench"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Opt-in, measurement-only performance harness for Tunnel (TRACK I)."
+
+# Deliberately NOT a workspace member: `cargo test --workspace` must never
+# build or run this crate, and its own workspace keeps it off the production
+# dependency graph. Invoke explicitly:
+#
+#   cargo run --release --manifest-path bench/Cargo.toml \
+#       --target x86_64-pc-windows-msvc -- --bench all
+#
+# See docs/performance/I-benchmark-methodology.md.
+
+[dependencies]
+pq-crypto = { path = "../pq-crypto" }
+pq-tunnel-core = { path = "../pq-tunnel-core" }
+
+[[bin]]
+name = "pq-bench"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = true
+# `panic = "abort"` is deliberately NOT set: the harness reports panics with
+# context and must unwind to record a failure rather than kill the whole run.
+
+# Its own workspace root: keeps this crate out of the production workspace
+# entirely (same pattern as fuzz/Cargo.toml), so `cargo test --workspace` can
+# never pick it up and CI is unaffected.
+[workspace]

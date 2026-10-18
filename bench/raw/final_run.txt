@@ -1,0 +1,280 @@
+================================================================================
+Tunnel performance harness (TRACK I) — measurements only
+================================================================================
+host_arch_env      : x86_64
+profile            : release (opt-level=3, debug=true)
+sample_definition  : 1 sample = Instant::now() delta around the measured region
+percentile_method  : nearest-rank, i = ceil(q*n)-1, clamped to [0, n-1]
+threads            : single-threaded, no rayon/threads in the harness
+
+bench group       : all
+iteration counts  : prims warmup=200 iters=5000 | roster warmup=3 iters=200 | handshake warmup=2 iters=60
+amortisation      : scheduler tick x1000 calls/sample | AEAD x1000 calls/sample
+cadence window    : 30s
+repeats           : 1
+mode              : FULL
+
+--- Bench 2a: ML-KEM-768 (FIPS 203, crate ml-kem 0.3.2) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+ML-KEM-768 keygen (MlKemKeypair::generate)     ns  n=5000    warmup=200   min=     49400.0 p50=     51400.0 median=     51400.0 p99=    115000.0 max=    559400.0 mean=     54461.6
+ML-KEM-768 encaps (encapsulate)                ns  n=5000    warmup=200   min=     47800.0 p50=     48400.0 median=     48400.0 p99=    102000.0 max=   1146600.0 mean=     51146.7
+ML-KEM-768 decaps (decapsulate)                ns  n=5000    warmup=200   min=     58300.0 p50=     58800.0 median=     58800.0 p99=    134100.0 max=   1013300.0 mean=     62594.1
+
+--- Bench 2b: X25519 (x25519-dalek 3.0.0-rc.1) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+X25519 keygen (X25519Keypair::generate)        ns  n=5000    warmup=200   min=     20500.0 p50=     21100.0 median=     21100.0 p99=     37500.0 max=    898400.0 mean=     22166.5
+X25519 DH (X25519Keypair::diffie_hellman)      ns  n=5000    warmup=200   min=     59100.0 p50=     59500.0 median=     59500.0 p99=    101300.0 max=    836800.0 mean=     62326.1
+
+--- Bench 2c: ML-DSA-65 (FIPS 204, crate ml-dsa 0.1.1) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+ML-DSA-65 keygen (MlDsaKeypair::generate)      ns  n=5000    warmup=200   min=    246700.0 p50=    273700.0 median=    273700.0 p99=    643800.0 max=   3531500.0 mean=    293057.9
+ML-DSA-65 sign (32-byte msg)                   ns  n=5000    warmup=200   min=    480700.0 p50=    495300.0 median=    495300.0 p99=    832000.0 max=   3893700.0 mean=    514826.2
+ML-DSA-65 verify (valid sig)                   ns  n=5000    warmup=200   min=     51200.0 p50=     51500.0 median=     51500.0 p99=    118700.0 max=   2859100.0 mean=     56040.7
+
+--- Bench 1a: single ML-DSA-65 verify (the per-element cost) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+verify() single call (roster n=1)              ns  n=510     warmup=3     min=     51300.0 p50=     51600.0 median=     51600.0 p99=     85100.0 max=    116900.0 mean=     53425.9
+verify() single call (roster n=2)              ns  n=510     warmup=3     min=     51200.0 p50=     51400.0 median=     51400.0 p99=     86100.0 max=    223500.0 mean=     53441.0
+verify() single call (roster n=4)              ns  n=510     warmup=3     min=     51400.0 p50=     51600.0 median=     51600.0 p99=    129500.0 max=    768100.0 mean=     56362.2
+verify() single call (roster n=8)              ns  n=510     warmup=3     min=     51700.0 p50=     52100.0 median=     52100.0 p99=     83000.0 max=    282100.0 mean=     54341.2
+verify() single call (roster n=16)             ns  n=510     warmup=3     min=     51300.0 p50=     51500.0 median=     51500.0 p99=    144200.0 max=    485900.0 mean=     56369.0
+verify() single call (roster n=32)             ns  n=510     warmup=3     min=     51300.0 p50=     51500.0 median=     51500.0 p99=     83900.0 max=    162600.0 mean=     53556.5
+verify() single call (roster n=64)             ns  n=510     warmup=3     min=     51300.0 p50=     51500.0 median=     51500.0 p99=    116400.0 max=    496300.0 mean=     55488.6
+verify() single call (roster n=128)            ns  n=510     warmup=3     min=     51300.0 p50=     51600.0 median=     51600.0 p99=    100500.0 max=    190300.0 mean=     54366.5
+verify() single call (roster n=256)            ns  n=510     warmup=3     min=     51300.0 p50=     51500.0 median=     51500.0 p99=    104400.0 max=    208700.0 mean=     54520.2
+verify() single call (roster n=512)            ns  n=510     warmup=3     min=     51400.0 p50=     51600.0 median=     51600.0 p99=    119800.0 max=    350800.0 mean=     55609.0
+verify() single call (roster n=1024)           ns  n=510     warmup=3     min=     51300.0 p50=     51500.0 median=     51500.0 p99=    101200.0 max=    208800.0 mean=     54020.0
+
+--- Bench 1b: D12 full roster loop (uniform verification, no early exit) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+D12 full roster loop (n=1 verifies)            ns  n=200     warmup=3     min=     56400.0 p50=     56700.0 median=     56700.0 p99=     72500.0 max=    133100.0 mean=     58002.0
+D12 full roster loop (n=2 verifies)            ns  n=200     warmup=3     min=    107200.0 p50=    107600.0 median=    107600.0 p99=    295800.0 max=    374300.0 mean=    117337.0
+D12 full roster loop (n=4 verifies)            ns  n=200     warmup=3     min=    209200.0 p50=    209800.0 median=    209800.0 p99=    395200.0 max=    654700.0 mean=    222616.0
+D12 full roster loop (n=8 verifies)            ns  n=200     warmup=3     min=    413100.0 p50=    422300.0 median=    422300.0 p99=    599000.0 max=    660200.0 mean=    432280.5
+D12 full roster loop (n=16 verifies)           ns  n=200     warmup=3     min=    820300.0 p50=    844700.0 median=    844700.0 p99=   1189400.0 max=   1359300.0 mean=    867997.0
+D12 full roster loop (n=32 verifies)           ns  n=200     warmup=3     min=   1636700.0 p50=   1686600.0 median=   1686600.0 p99=   2132900.0 max=   2590800.0 mean=   1732081.5
+D12 full roster loop (n=64 verifies)           ns  n=200     warmup=3     min=   3316100.0 p50=   3411900.0 median=   3411900.0 p99=   4552100.0 max=   5029300.0 mean=   3492980.0
+D12 full roster loop (n=128 verifies)          ns  n=200     warmup=3     min=   6623400.0 p50=   6848400.0 median=   6848400.0 p99=   8452400.0 max=   8600300.0 mean=   6950003.5
+D12 full roster loop (n=256 verifies)          ns  n=200     warmup=3     min=  13290800.0 p50=  13721400.0 median=  13721400.0 p99=  15830400.0 max=  16680300.0 mean=  13898262.0
+D12 full roster loop (n=512 verifies)          ns  n=200     warmup=3     min=  26867400.0 p50=  28199300.0 median=  28199300.0 p99=  32508300.0 max=  40651600.0 mean=  28505111.5
+D12 full roster loop (n=1024 verifies)         ns  n=200     warmup=3     min=  53926200.0 p50=  56330700.0 median=  56330700.0 p99=  82097900.0 max=  97877300.0 mean=  58161728.5
+
+--- Bench 1c: D12 loop, UNKNOWN client (no match; full cost then reject) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+D12 loop, UNKNOWN client (n=1 verifies)        ns  n=51      warmup=3     min=     51400.0 p50=     51500.0 median=     51500.0 p99=     81300.0 max=     81300.0 mean=     54417.6
+D12 loop, UNKNOWN client (n=2 verifies)        ns  n=51      warmup=3     min=    102100.0 p50=    102300.0 median=    102300.0 p99=    130300.0 max=    130300.0 mean=    105721.6
+D12 loop, UNKNOWN client (n=4 verifies)        ns  n=51      warmup=3     min=    204400.0 p50=    204800.0 median=    204800.0 p99=    310200.0 max=    310200.0 mean=    212500.0
+D12 loop, UNKNOWN client (n=8 verifies)        ns  n=51      warmup=3     min=    408000.0 p50=    415500.0 median=    415500.0 p99=   7053100.0 max=   7053100.0 mean=    574331.4
+D12 loop, UNKNOWN client (n=16 verifies)       ns  n=51      warmup=3     min=    816500.0 p50=    837700.0 median=    837700.0 p99=   1520700.0 max=   1520700.0 mean=    883547.1
+D12 loop, UNKNOWN client (n=32 verifies)       ns  n=51      warmup=3     min=   1648900.0 p50=   1721200.0 median=   1721200.0 p99=   6078100.0 max=   6078100.0 mean=   1951054.9
+D12 loop, UNKNOWN client (n=64 verifies)       ns  n=51      warmup=3     min=   3300300.0 p50=   3401600.0 median=   3401600.0 p99=  29700100.0 max=  29700100.0 mean=   4100288.2
+D12 loop, UNKNOWN client (n=128 verifies)      ns  n=51      warmup=3     min=   6620900.0 p50=   6885600.0 median=   6885600.0 p99=   9220500.0 max=   9220500.0 mean=   7068066.7
+D12 loop, UNKNOWN client (n=256 verifies)      ns  n=51      warmup=3     min=  13368000.0 p50=  14208900.0 median=  14208900.0 p99=  21775700.0 max=  21775700.0 mean=  14825441.2
+D12 loop, UNKNOWN client (n=512 verifies)      ns  n=51      warmup=3     min=  27170500.0 p50=  30281600.0 median=  30281600.0 p99=  53636200.0 max=  53636200.0 mean=  31017717.6
+D12 loop, UNKNOWN client (n=1024 verifies)     ns  n=51      warmup=3     min=  53984500.0 p50=  57044900.0 median=  57044900.0 p99=  90823900.0 max=  90823900.0 mean=  58345790.2
+
+--- Bench 1: roster scaling summary (p50 ns) ---
+roster        ns/verify      loop_p50_ns   unknown_p50_ns       verify/s
+     1          51600.0          56700.0          51500.0       19379.84
+     2          51400.0         107600.0         102300.0       19455.25
+     4          51600.0         209800.0         204800.0       19379.84
+     8          52100.0         422300.0         415500.0       19193.86
+    16          51500.0         844700.0         837700.0       19417.48
+    32          51500.0        1686600.0        1721200.0       19417.48
+    64          51500.0        3411900.0        3401600.0       19417.48
+   128          51600.0        6848400.0        6885600.0       19379.84
+   256          51500.0       13721400.0       14208900.0       19417.48
+   512          51600.0       28199300.0       30281600.0       19379.84
+  1024          51500.0       56330700.0       57044900.0       19417.48
+
+--- Bench 3a: full handshake CPU, client + server, in-process ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+FULL handshake client+server CPU (roster n=1)  ns  n=60      warmup=2     min=   1398500.0 p50=   1968200.0 median=   1968200.0 p99=   5689100.0 max=   5689100.0 mean=   2220433.3
+FULL handshake client+server CPU (roster n=2)  ns  n=60      warmup=2     min=   1354700.0 p50=   1851300.0 median=   1851300.0 p99=   6343100.0 max=   6343100.0 mean=   2133245.0
+FULL handshake client+server CPU (roster n=4)  ns  n=60      warmup=2     min=   1545200.0 p50=   2229000.0 median=   2229000.0 p99=   4943600.0 max=   4943600.0 mean=   2382866.7
+FULL handshake client+server CPU (roster n=8)  ns  n=60      warmup=2     min=   1681800.0 p50=   2331300.0 median=   2331300.0 p99=   4674900.0 max=   4674900.0 mean=   2564443.3
+FULL handshake client+server CPU (roster n=16) ns  n=60      warmup=2     min=   2113500.0 p50=   3058100.0 median=   3058100.0 p99=   4670700.0 max=   4670700.0 mean=   3254513.3
+FULL handshake client+server CPU (roster n=32) ns  n=60      warmup=2     min=   2985500.0 p50=   3998800.0 median=   3998800.0 p99=   7316200.0 max=   7316200.0 mean=   4062705.0
+FULL handshake client+server CPU (roster n=64) ns  n=60      warmup=2     min=   4863200.0 p50=   5773700.0 median=   5773700.0 p99=   7802000.0 max=   7802000.0 mean=   5935818.3
+FULL handshake client+server CPU (roster n=128) ns  n=60      warmup=2     min=   8195200.0 p50=   9296300.0 median=   9296300.0 p99=  11277200.0 max=  11277200.0 mean=   9469545.0
+FULL handshake client+server CPU (roster n=256) ns  n=60      warmup=2     min=  15239600.0 p50=  16792200.0 median=  16792200.0 p99=  19597300.0 max=  19597300.0 mean=  16863176.7
+FULL handshake client+server CPU (roster n=512) ns  n=60      warmup=2     min=  28906500.0 p50=  30252800.0 median=  30252800.0 p99=  36457600.0 max=  36457600.0 mean=  30596860.0
+FULL handshake client+server CPU (roster n=1024) ns  n=60      warmup=2     min=  56878100.0 p50=  58596000.0 median=  58596000.0 p99=  62218100.0 max=  62218100.0 mean=  58802541.7
+
+--- Bench 3b: handshake phase breakdown (p50) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+  phase: client M1 (roster n=1)                ns  n=60      warmup=2     min=    268000.0 p50=    531400.0 median=    531400.0 p99=   1926100.0 max=   1926100.0 mean=    683193.3
+  phase: client M1 (roster n=2)                ns  n=60      warmup=2     min=    267200.0 p50=    471400.0 median=    471400.0 p99=   1477800.0 max=   1477800.0 mean=    594166.7
+  phase: client M1 (roster n=4)                ns  n=60      warmup=2     min=    269400.0 p50=    655000.0 median=    655000.0 p99=   2243600.0 max=   2243600.0 mean=    704258.3
+  phase: client M1 (roster n=8)                ns  n=60      warmup=2     min=    267000.0 p50=    485900.0 median=    485900.0 p99=   2115500.0 max=   2115500.0 mean=    709115.0
+  phase: client M1 (roster n=16)               ns  n=60      warmup=2     min=    268900.0 p50=    669000.0 median=    669000.0 p99=   2056000.0 max=   2056000.0 mean=    772858.3
+  phase: client M1 (roster n=32)               ns  n=60      warmup=2     min=    280900.0 p50=    636400.0 median=    636400.0 p99=   2013000.0 max=   2013000.0 mean=    744491.7
+  phase: client M1 (roster n=64)               ns  n=60      warmup=2     min=    277500.0 p50=    622700.0 median=    622700.0 p99=   2024000.0 max=   2024000.0 mean=    676915.0
+  phase: client M1 (roster n=128)              ns  n=60      warmup=2     min=    277600.0 p50=    481100.0 median=    481100.0 p99=   1929600.0 max=   1929600.0 mean=    644816.7
+  phase: client M1 (roster n=256)              ns  n=60      warmup=2     min=    286300.0 p50=    583800.0 median=    583800.0 p99=   2107700.0 max=   2107700.0 mean=    673513.3
+  phase: client M1 (roster n=512)              ns  n=60      warmup=2     min=    291300.0 p50=    564900.0 median=    564900.0 p99=   2954700.0 max=   2954700.0 mean=    668413.3
+  phase: client M1 (roster n=1024)             ns  n=60      warmup=2     min=    289700.0 p50=    585400.0 median=    585400.0 p99=   1786000.0 max=   1786000.0 mean=    681591.7
+  phase: server M2 (roster loop+KEM+sig) (roster n=1) ns  n=60      warmup=2     min=    491600.0 p50=    761900.0 median=    761900.0 p99=   4183500.0 max=   4183500.0 mean=    930865.0
+  phase: server M2 (roster loop+KEM+sig) (roster n=2) ns  n=60      warmup=2     min=    533900.0 p50=    807800.0 median=    807800.0 p99=   4618900.0 max=   4618900.0 mean=    974726.7
+  phase: server M2 (roster loop+KEM+sig) (roster n=4) ns  n=60      warmup=2     min=    649000.0 p50=    936400.0 median=    936400.0 p99=   2259900.0 max=   2259900.0 mean=   1094490.0
+  phase: server M2 (roster loop+KEM+sig) (roster n=8) ns  n=60      warmup=2     min=    849600.0 p50=   1164800.0 median=   1164800.0 p99=   2271100.0 max=   2271100.0 mean=   1247106.7
+  phase: server M2 (roster loop+KEM+sig) (roster n=16) ns  n=60      warmup=2     min=   1260700.0 p50=   1663400.0 median=   1663400.0 p99=   3732900.0 max=   3732900.0 mean=   1878373.3
+  phase: server M2 (roster loop+KEM+sig) (roster n=32) ns  n=60      warmup=2     min=   2121800.0 p50=   2492600.0 median=   2492600.0 p99=   6176900.0 max=   6176900.0 mean=   2661493.3
+  phase: server M2 (roster loop+KEM+sig) (roster n=64) ns  n=60      warmup=2     min=   3819100.0 p50=   4336600.0 median=   4336600.0 p99=   6403000.0 max=   6403000.0 mean=   4509433.3
+  phase: server M2 (roster loop+KEM+sig) (roster n=128) ns  n=60      warmup=2     min=   7145500.0 p50=   7819400.0 median=   7819400.0 p99=   9708600.0 max=   9708600.0 mean=   7961120.0
+  phase: server M2 (roster loop+KEM+sig) (roster n=256) ns  n=60      warmup=2     min=  13924400.0 p50=  15025500.0 median=  15025500.0 p99=  17616500.0 max=  17616500.0 mean=  15076026.7
+  phase: server M2 (roster loop+KEM+sig) (roster n=512) ns  n=60      warmup=2     min=  26973700.0 p50=  28176700.0 median=  28176700.0 p99=  34316100.0 max=  34316100.0 mean=  28437881.7
+  phase: server M2 (roster loop+KEM+sig) (roster n=1024) ns  n=60      warmup=2     min=  53925500.0 p50=  55322700.0 median=  55322700.0 p99=  58175500.0 max=  58175500.0 mean=  55659723.3
+  phase: client M3 (decap+DH+HKDF) (roster n=1) ns  n=60      warmup=2     min=    386200.0 p50=    410800.0 median=    410800.0 p99=    821200.0 max=    821200.0 mean=    441428.3
+  phase: client M3 (decap+DH+HKDF) (roster n=2) ns  n=60      warmup=2     min=    386100.0 p50=    397100.0 median=    397100.0 p99=    515300.0 max=    515300.0 mean=    407661.7
+  phase: client M3 (decap+DH+HKDF) (roster n=4) ns  n=60      warmup=2     min=    385600.0 p50=    401700.0 median=    401700.0 p99=    874500.0 max=    874500.0 mean=    421135.0
+  phase: client M3 (decap+DH+HKDF) (roster n=8) ns  n=60      warmup=2     min=    387200.0 p50=    405100.0 median=    405100.0 p99=    622900.0 max=    622900.0 mean=    421351.7
+  phase: client M3 (decap+DH+HKDF) (roster n=16) ns  n=60      warmup=2     min=    386900.0 p50=    404400.0 median=    404400.0 p99=    958600.0 max=    958600.0 mean=    425670.0
+  phase: client M3 (decap+DH+HKDF) (roster n=32) ns  n=60      warmup=2     min=    387200.0 p50=    415200.0 median=    415200.0 p99=   1085200.0 max=   1085200.0 mean=    441833.3
+  phase: client M3 (decap+DH+HKDF) (roster n=64) ns  n=60      warmup=2     min=    392900.0 p50=    422500.0 median=    422500.0 p99=   1563100.0 max=   1563100.0 mean=    469960.0
+  phase: client M3 (decap+DH+HKDF) (roster n=128) ns  n=60      warmup=2     min=    395600.0 p50=    429700.0 median=    429700.0 p99=    645200.0 max=    645200.0 mean=    442633.3
+  phase: client M3 (decap+DH+HKDF) (roster n=256) ns  n=60      warmup=2     min=    405100.0 p50=    438100.0 median=    438100.0 p99=    669600.0 max=    669600.0 mean=    452755.0
+  phase: client M3 (decap+DH+HKDF) (roster n=512) ns  n=60      warmup=2     min=    405800.0 p50=    426500.0 median=    426500.0 p99=    574000.0 max=    574000.0 mean=    432995.0
+  phase: client M3 (decap+DH+HKDF) (roster n=1024) ns  n=60      warmup=2     min=    411700.0 p50=    437600.0 median=    437600.0 p99=   1322100.0 max=   1322100.0 mean=    473996.7
+  phase: server M3 (verify Finished) (roster n=1) ns  n=60      warmup=2     min=    142800.0 p50=    148500.0 median=    148500.0 p99=    687000.0 max=    687000.0 mean=    164946.7
+  phase: server M3 (verify Finished) (roster n=2) ns  n=60      warmup=2     min=    144100.0 p50=    146500.0 median=    146500.0 p99=    363600.0 max=    363600.0 mean=    156690.0
+  phase: server M3 (verify Finished) (roster n=4) ns  n=60      warmup=2     min=    147600.0 p50=    152900.0 median=    152900.0 p99=    279500.0 max=    279500.0 mean=    162983.3
+  phase: server M3 (verify Finished) (roster n=8) ns  n=60      warmup=2     min=    156000.0 p50=    159700.0 median=    159700.0 p99=   1107800.0 max=   1107800.0 mean=    186870.0
+  phase: server M3 (verify Finished) (roster n=16) ns  n=60      warmup=2     min=    167200.0 p50=    175000.0 median=    175000.0 p99=    212300.0 max=    212300.0 mean=    177611.7
+  phase: server M3 (verify Finished) (roster n=32) ns  n=60      warmup=2     min=    195300.0 p50=    205700.0 median=    205700.0 p99=    446900.0 max=    446900.0 mean=    214886.7
+  phase: server M3 (verify Finished) (roster n=64) ns  n=60      warmup=2     min=    251900.0 p50=    267500.0 median=    267500.0 p99=    437900.0 max=    437900.0 mean=    279510.0
+  phase: server M3 (verify Finished) (roster n=128) ns  n=60      warmup=2     min=    360500.0 p50=    380100.0 median=    380100.0 p99=   2226800.0 max=   2226800.0 mean=    420975.0
+  phase: server M3 (verify Finished) (roster n=256) ns  n=60      warmup=2     min=    593500.0 p50=    611100.0 median=    611100.0 p99=   1173900.0 max=   1173900.0 mean=    660881.7
+  phase: server M3 (verify Finished) (roster n=512) ns  n=60      warmup=2     min=   1013000.0 p50=   1050400.0 median=   1050400.0 p99=   1190700.0 max=   1190700.0 mean=   1057570.0
+  phase: server M3 (verify Finished) (roster n=1024) ns  n=60      warmup=2     min=   1907100.0 p50=   1962000.0 median=   1962000.0 p99=   2793200.0 max=   2793200.0 mean=   1987230.0
+
+--- Bench 3c: handshake TOTAL (both sides), roster 1/8/64/256 ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+handshake TOTAL both sides (roster n=1)        ns  n=60      warmup=2     min=   1301000.0 p50=   1765700.0 median=   1765700.0 p99=   3228500.0 max=   3228500.0 mean=   1948901.7
+handshake TOTAL both sides (roster n=8)        ns  n=60      warmup=2     min=   1669900.0 p50=   2312900.0 median=   2312900.0 p99=   6996000.0 max=   6996000.0 mean=   2573038.3
+handshake TOTAL both sides (roster n=64)       ns  n=60      warmup=2     min=   4721700.0 p50=   5447300.0 median=   5447300.0 p99=   8069900.0 max=   8069900.0 mean=   5678786.7
+handshake TOTAL both sides (roster n=256)      ns  n=60      warmup=2     min=  15173000.0 p50=  16172200.0 median=  16172200.0 p99=  19029600.0 max=  19029600.0 mean=  16473245.0
+
+--- Bench 3d: handshake SERVER-side CPU only, roster 1/8/64/256 ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+handshake SERVER-side CPU (roster n=1)         ns  n=60      warmup=2     min=    626900.0 p50=    843200.0 median=    843200.0 p99=   2340400.0 max=   2340400.0 mean=   1008020.0
+handshake SERVER-side CPU (roster n=8)         ns  n=60      warmup=2     min=   1007200.0 p50=   1298800.0 median=   1298800.0 p99=   3727200.0 max=   3727200.0 mean=   1501881.7
+handshake SERVER-side CPU (roster n=64)        ns  n=60      warmup=2     min=   4004500.0 p50=   4382400.0 median=   4382400.0 p99=   5973800.0 max=   5973800.0 mean=   4555643.3
+handshake SERVER-side CPU (roster n=256)       ns  n=60      warmup=2     min=  14438700.0 p50=  15104700.0 median=  15104700.0 p99=  17335200.0 max=  17335200.0 mean=  15391635.0
+
+  roster n=1    total p50 =      1765700.0 ns | server p50 =       843200.0 ns | server handshakes/s/core =    1185.96
+  roster n=8    total p50 =      2312900.0 ns | server p50 =      1298800.0 ns | server handshakes/s/core =     769.94
+  roster n=64   total p50 =      5447300.0 ns | server p50 =      4382400.0 ns | server handshakes/s/core =     228.19
+  roster n=256  total p50 =     16172200.0 ns | server p50 =     15104700.0 ns | server handshakes/s/core =      66.20
+
+--- Bench 4a-0: clock calibration floor ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+calibration: Instant::now() round-trip         ns  n=510     warmup=200   min=      1200.0 p50=      1300.0 median=      1300.0 p99=      1500.0 max=     17800.0 mean=      1383.3
+
+--- Bench 4a: cover scheduler tick cost (virtual time) + control ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+CoverScheduler::on_deadline (emitting tick)    ns  n=110     warmup=25    min=     10942.3 p50=     11108.9 median=     11108.9 p99=     12690.2 max=     12725.8 mean=     11240.5
+CoverScheduler::on_deadline (steady, pre-armed) ns  n=110     warmup=25    min=      8697.3 p50=      8827.1 median=      8827.1 p99=     10704.6 max=     16471.8 mean=      9065.5
+CONTROL: virtual Instant advance only (no scheduler) ns  n=110     warmup=25    min=      3642.6 p50=      3717.2 median=      3717.2 p99=      4712.8 max=      5594.5 mean=      3807.4
+
+  marginal scheduler cost (steady - control) p50 = 5109.9 ns per tick
+
+--- Bench 4b: interval_from_rate_bps cost sweep ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+interval_from_rate_bps(1000) -> 10.24s         ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    456800.0 mean=       502.5
+interval_from_rate_bps(64000) -> 160ms         ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    127800.0 mean=       482.0
+interval_from_rate_bps(100000) -> 102.4ms      ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    273900.0 mean=       488.1
+interval_from_rate_bps(1000000) -> 10.24ms     ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    134900.0 mean=       492.5
+interval_from_rate_bps(2000000) -> 5.12ms      ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    387500.0 mean=       493.4
+interval_from_rate_bps(10000000) -> 1.024ms    ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    134900.0 mean=       494.6
+interval_from_rate_bps(100000000) -> 102.4µs   ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    216100.0 mean=       490.3
+interval_from_rate_bps(1000000000) -> 10.24µs  ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    103200.0 mean=       493.3
+interval_from_rate_bps(1000000000000) -> 10ns  ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    109500.0 mean=       487.8
+interval_from_rate_bps(1000000000000000) -> 1ns ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    326900.0 mean=       490.4
+interval_from_rate_bps(1000000000000000000) -> 1ns ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    237700.0 mean=       494.6
+interval_from_rate_bps(18446744073709551615) -> 1ns ns  n=50000   warmup=10000 min=       300.0 p50=       500.0 median=       500.0 p99=       600.0 max=    260200.0 mean=       492.5
+
+--- Bench 4c: AEAD / record encrypt cost (1280-byte record) ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+aead::encrypt (raw ChaCha20Poly1305, inner+tag) ns  n=510     warmup=200   min=      7206.5 p50=      7517.1 median=      7517.1 p99=     10475.0 max=     14978.6 mean=      7785.6
+CipherSession::encrypt (full 1280B record)     ns  n=510     warmup=200   min=     10185.0 p50=     10653.1 median=     10653.1 p99=     13821.2 max=     16115.0 mean=     10858.8
+
+--- Record geometry (from crate constants) ---
+  PACKET_SIZE     = 1280 B
+  PAYLOAD_LEN     = 1245 B (inner plaintext payload slot)
+
+--- Bench 4d: Windows cover-clock wake cadence (D23/M9A) ---
+  nominal interval = 5.12ms (5.1200 ms), nominal rate = 195.3125 pkt/s
+--- Bench 4d: cover wake latency ---
+operation                                      unit   iterations              min          p50       median          p99          max         mean
+cover wake latency (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) ns  n=5504    warmup=0     min=     15200.0 p50=    369600.0 median=    369600.0 p99=    766100.0 max=   1334100.0 mean=    331247.5
+cover wake latency (thread::sleep control)     ns  n=5545    warmup=0     min=     16000.0 p50=    269800.0 median=    269800.0 p99=    737000.0 max=   1641800.0 mean=    289414.2
+
+  HR-resolution timer achieved = 183.4667 pkt/s over 5504 wakes (93.93% of nominal 195.3125)
+  thread::sleep control        = 184.8333 pkt/s over 5545 wakes (94.63% of nominal)
+  D23 recorded reference       = p50 5.31 ms, ~93.5% of nominal (182.6 pkt/s over 30 s)
+
+================================================================================
+DERIVED FIGURES (arithmetic on measured values + source constants only)
+================================================================================
+--- Derived: server worst-case cover egress (D19) ---
+  max_sessions              = 64
+  nominal cover rate        = 195.31249999999997 pkt/s per session-direction
+  PACKET_SIZE               = 1280 B
+  arithmetic: 64 x 195.31249999999997 x 1280 x 8
+             = 64 * 195.31249999999997 = 12500.0000 pkt/s
+             = 12500.0000 * 1280 B/s = 16000000.0000 B/s
+             = 16000000.0000 B/s * 8 = 128000000 bit/s
+  RESULT                    = 128000000 bit/s = 128.000 Mbit/s = 0.1280 Gbit/s
+
+--- Derived: packet-nonce exhaustion time ---
+  MAX_PACKET_NONCE          = 18446744069414584320  (u64::MAX - 2^32)
+  -- default 2 Mbps, 1 session, 1 direction --
+     packet rate            = 195.3125 pkt/s
+     arithmetic: 18446744069414584320 / 195.3125 = 9.444733e16 s
+     RESULT                  = 9.444733e16 s = 2992916731.483 years (9.445e16 s)
+  -- worst case (64 sessions, egress total) --
+     packet rate            = 12500.0000 pkt/s
+     arithmetic: 18446744069414584320 / 12500.0000 = 1.475740e15 s
+     RESULT                  = 1.475740e15 s = 46764323.929 years (1.476e15 s)
+
+--- Derived: ML-DSA-65 verify throughput and handshake capacity ---
+  single verify             = 51500.0 ns
+  arithmetic: 1e9 ns/s / 51500.0 ns = 19417.48 verify/s
+  RESULT                    = 19417.48 verifications/second (one core, single-threaded)
+
+  full-handshake CPU cost is dominated by the roster loop, so:
+    roster n=1     D12 loop =        56700.0 ns ->     17636.68 handshakes/s/core (loop-bound lower bound)
+    roster n=2     D12 loop =       107600.0 ns ->      9293.68 handshakes/s/core (loop-bound lower bound)
+    roster n=4     D12 loop =       209800.0 ns ->      4766.44 handshakes/s/core (loop-bound lower bound)
+    roster n=8     D12 loop =       422300.0 ns ->      2367.98 handshakes/s/core (loop-bound lower bound)
+    roster n=16    D12 loop =       844700.0 ns ->      1183.85 handshakes/s/core (loop-bound lower bound)
+    roster n=32    D12 loop =      1686600.0 ns ->       592.91 handshakes/s/core (loop-bound lower bound)
+    roster n=64    D12 loop =      3411900.0 ns ->       293.09 handshakes/s/core (loop-bound lower bound)
+    roster n=128   D12 loop =      6848400.0 ns ->       146.02 handshakes/s/core (loop-bound lower bound)
+    roster n=256   D12 loop =     13721400.0 ns ->        72.88 handshakes/s/core (loop-bound lower bound)
+    roster n=512   D12 loop =     28199300.0 ns ->        35.46 handshakes/s/core (loop-bound lower bound)
+    roster n=1024  D12 loop =     56330700.0 ns ->        17.75 handshakes/s/core (loop-bound lower bound)
+
+  Rate-limit context (ServerConfig::new defaults):
+    rate_limit_burst        = 16 per 10 s per source address
+    arithmetic: 16 / 10 = 1.6000 handshakes/s per source address
+    -> the per-source budget (1.60/s) is the binding limit for a
+       single source address, not the core's verify throughput,
+       UNLESS a single source is admitted from many source addresses.
+
+--- Derived: cover-path CPU (measured components only) ---
+  scheduler tick            = 11.109 us
+  AEAD encrypt (1280B)      = 10.653 us
+  per-packet CPU (excl. syscalls, NOT MEASURED separately)
+    = 11.109 us + 10.653 us = 21.762 us
+    1 session(s) x 195.3125 pkt/s = 195.3125 pkt/s -> 0.004250 CPU-s/s = 0.4250% of one core
+   64 session(s) x 195.3125 pkt/s = 12500.0000 pkt/s -> 0.272025 CPU-s/s = 27.2025% of one core
+
+================================================================================
+PASS WALL TIME: 126.6124371s
+================================================================================
+not measured by this harness (see docs/performance/I-benchmark-methodology.md):
+  - syscall cost per cover packet (sendto + timer arm + wake)
+  - loopback end-to-end handshake wall time including transport
+  - multi-core scaling (single-threaded only)
