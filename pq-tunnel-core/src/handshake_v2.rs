@@ -856,7 +856,13 @@ fn jittered(base: Duration) -> Duration {
     Duration::from_nanos((nanos * factor / 100).try_into().unwrap_or(u64::MAX))
 }
 
-fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+/// Jittered exponential backoff, capped at 32× base.
+///
+/// `pub(crate)` because the session manager owns the M3 retransmission
+/// schedule once the handshake machine has been dropped (D31 §2: the manager
+/// must never hold the handshake machine and a session at the same time), and
+/// it must use the *same* backoff policy the machine would have used.
+pub(crate) fn backoff_delay(base: Duration, attempt: u32) -> Duration {
     // Exponential backoff, capped at 32× base.
     let shift = attempt.min(5);
     jittered(base.saturating_mul(1u32 << shift))
@@ -935,15 +941,32 @@ impl ClientConfig {
     }
 }
 
-/// Event produced by the client state machine: datagrams to emit, or
-/// completion.
+/// Event produced by the client state machine: datagrams to emit, or the
+/// moment the M3 was emitted.
+///
+/// The client machine has exactly **one** success signal: the M3 was
+/// transmitted.  There is no "handshake complete" event, because v2 has no
+/// server confirmation message — the key agreement is confirmed by the first
+/// *authenticated server packet* that decrypts (D15), which is a session-layer
+/// concern, not a handshake-layer one.
 #[derive(Debug)]
 pub enum ClientEvent {
-    /// Emit these datagrams (byte-identical retransmit or the M3).
+    /// Emit these datagrams (byte-identical M1 retransmit, or the M3).
     Emit(Vec<WirePacket>),
-    /// Handshake complete: the client is ready (1 RTT; server confirmation is
-    /// implicit — D15; liveness enforcement is the session layer's job).
-    Complete(HandshakeOutcome),
+    /// The M3 was emitted: these are the M3 fragments to send, and `outcome`
+    /// carries the derived session master.
+    ///
+    /// The session is created by the *caller* at this moment, in an
+    /// **unconfirmed** state: the peer is authenticated (its ML-DSA-65
+    /// signature over TH2 was verified while assembling the M2), but the key
+    /// agreement is not yet confirmed — no authenticated server packet has
+    /// decrypted yet (D15).
+    M3Sent {
+        /// The M3 fragments, to be sent to the peer.
+        packets: Vec<WirePacket>,
+        /// The derived session material.
+        outcome: HandshakeOutcome,
+    },
     /// Nothing to do — silent drop, no state change.
     None,
 }
@@ -1029,6 +1052,21 @@ impl ClientHandshake {
         }
     }
 
+    /// The derived session outcome, once the M3 has been emitted.
+    ///
+    /// **Test-only.**  In production the outcome is always delivered *with*
+    /// the M3 (see [`ClientEvent::M3Sent`]), and the session manager drops
+    /// the machine at that point, so there is no production caller.  The
+    /// accessor exists for the test helpers, which drive the machine
+    /// directly and need the outcome the machine derived.
+    #[cfg(test)]
+    pub(crate) fn outcome(&self) -> Option<&HandshakeOutcome> {
+        match &self.state {
+            ClientState::M3Sent { outcome, .. } => Some(outcome),
+            ClientState::AwaitM2 { .. } => None,
+        }
+    }
+
     /// Current retransmit delay (for the driver's timer).
     pub fn next_delay(&self) -> Duration {
         match &self.state {
@@ -1088,13 +1126,18 @@ impl ClientHandshake {
                 attempts,
                 next_delay,
                 m3_frags,
-                outcome,
+                ..
             } => {
                 if *attempts >= self.cfg.m3_max_attempts {
-                    // M3 budget exhausted: the client is ready (1 RTT); any
-                    // mis-keying is caught by the session layer's liveness
-                    // timeout (D15).
-                    return Ok(ClientEvent::Complete(outcome.clone()));
+                    // The M3 retransmission budget is exhausted.  This is an
+                    // **explicit failure**, never a success: the client cannot
+                    // claim the session is usable on the strength of having
+                    // spent its budget (the old code reported `Complete` here,
+                    // which made "the budget ran out" indistinguishable from
+                    // "the peer answered").  The caller tears the session down
+                    // (drop ⇒ keys zeroized, D14), reports `NotConfirmed` and
+                    // retries with a fresh sid.
+                    return Err(HandshakeV2Error::Timeout);
                 }
                 *attempts += 1;
                 *next_delay = backoff_delay(self.cfg.m1_retransmit_base, *attempts);
@@ -1194,7 +1237,12 @@ impl ClientHandshake {
             outcome,
         };
         match &self.state {
-            ClientState::M3Sent { m3_frags, .. } => Ok(ClientEvent::Emit(m3_frags.clone())),
+            ClientState::M3Sent {
+                m3_frags, outcome, ..
+            } => Ok(ClientEvent::M3Sent {
+                packets: m3_frags.clone(),
+                outcome: outcome.clone(),
+            }),
             _ => unreachable!(),
         }
     }
@@ -1204,8 +1252,9 @@ impl ClientHandshake {
 ///
 /// Draws a CSPRNG sid, sends M1 (retransmitting byte-identically with jittered
 /// backoff until M2 arrives or the budget is exhausted), then sends M3 and
-/// returns the outcome (client ready at 1 RTT — D13; implicit server
-/// confirmation + liveness is the session layer's responsibility — D15).
+/// returns the outcome (client ready at 1 RTT — D13; the *confirmation* that
+/// the peer really holds the same keys is the session layer's job, via the
+/// first authenticated server packet — D15).
 pub async fn client_handshake_v2<T: HandshakeTransport>(
     transport: &mut T,
     cfg: &ClientConfig,
@@ -1228,9 +1277,10 @@ pub async fn client_handshake_v2<T: HandshakeTransport>(
                         ClientEvent::Emit(frags) => {
                             for f in &frags { transport.send_to(f, cfg.server_addr).await?; }
                         }
-                        ClientEvent::Complete(mut out) => {
-                            out.handshake_duration = started.elapsed();
-                            return Ok(out);
+                        ClientEvent::M3Sent { packets, mut outcome } => {
+                            for f in &packets { transport.send_to(f, cfg.server_addr).await?; }
+                            outcome.handshake_duration = started.elapsed();
+                            return Ok(outcome);
                         }
                         ClientEvent::None => {}
                     },
@@ -1240,9 +1290,10 @@ pub async fn client_handshake_v2<T: HandshakeTransport>(
                 ClientEvent::Emit(frags) => {
                     for f in &frags { transport.send_to(f, cfg.server_addr).await?; }
                 }
-                ClientEvent::Complete(mut out) => {
-                    out.handshake_duration = started.elapsed();
-                    return Ok(out);
+                ClientEvent::M3Sent { packets, mut outcome } => {
+                    for f in &packets { transport.send_to(f, cfg.server_addr).await?; }
+                    outcome.handshake_duration = started.elapsed();
+                    return Ok(outcome);
                 }
                 ClientEvent::None => {}
             },
@@ -1681,6 +1732,18 @@ impl ServerHandshake {
         allowed
     }
 
+    /// The remaining handshake rate tokens for a source (test-only).
+    #[cfg(test)]
+    fn rate_tokens(&self, from: SocketAddr) -> u32 {
+        self.rate_buckets.get(&from).map(|b| b.tokens).unwrap_or(0)
+    }
+
+    /// The `last_seen` instant of a pending entry (test-only).
+    #[cfg(test)]
+    fn pending_last_seen(&self, sid: &[u8; SESSION_ID_LEN]) -> Option<Instant> {
+        self.pending.get(sid).map(|e| e.last_seen)
+    }
+
     fn on_m1_fragment(
         &mut self,
         pkt: &WirePacket,
@@ -1760,6 +1823,17 @@ impl ServerHandshake {
                     // per-source budgeted like everything else.
                     if !self.rate_ok(from) {
                         return Ok(ServerEvent::None);
+                    }
+                    // B16: the client is *actively* retransmitting its M1, so
+                    // the pending entry must not expire under it.  Without this
+                    // refresh the entry dies `pending_ttl` after the M1 even
+                    // though the client is still trying — the client then waits
+                    // out its whole confirm window for a server that has
+                    // already forgotten the exchange.  The resend is
+                    // rate-limited above, so a duplicate flood cannot keep the
+                    // entry alive for free.
+                    if let Some(entry) = self.pending.get_mut(&sid) {
+                        entry.last_seen = Instant::now();
                     }
                     let frags =
                         fragment_message(HS_TYPE_SERVER_HELLO, self.cfg.version, sid, &body)?;
@@ -1891,19 +1965,29 @@ impl ServerHandshake {
         // D13 DoS posture: the M3 path burns asymmetric work (decapsulation,
         // HKDF, HMAC) before the MAC comparison can fail; gate per source
         // exactly like the M1 path so a forged-M3 flood costs the attacker's
-        // own budget, not the server's CPU.  Gating happens before the entry
-        // lookup so a spoofed-source flood cannot even reach the map.
+        // own budget, not the server's CPU.
+        //
+        // B14: the gate runs **after** the pending-entry lookup, exactly like
+        // the data path's lookup-first ordering (D24).  A retransmitted M3 for
+        // an already-consumed sid names no live pending entry, so no work is
+        // done for it — charging the source's budget for work never performed
+        // is pure attacker-controlled state.  A packet naming an unknown sid
+        // (or one owned by another source, or one whose entry is not awaiting
+        // an M3) is therefore free.
+        let (source_ok, state_ok) = match self.pending.get(&sid) {
+            Some(entry) => (entry.source == from, entry.state == PendingState::AwaitM3),
+            None => return Ok(ServerEvent::None), // unknown sid → silent
+        };
+        if !source_ok || !state_ok {
+            return Ok(ServerEvent::None);
+        }
         if !self.rate_ok(from) {
             return Ok(ServerEvent::None);
         }
-
         let entry = match self.pending.get_mut(&sid) {
             Some(e) => e,
             None => return Ok(ServerEvent::None), // unknown sid → silent
         };
-        if entry.source != from || entry.state != PendingState::AwaitM3 {
-            return Ok(ServerEvent::None);
-        }
         let m3 = match ClientConfirm::decode(&frag.body) {
             Ok(m) => m,
             Err(_) => return Ok(ServerEvent::None),
@@ -2102,9 +2186,13 @@ pub(crate) mod tests {
         assert_eq!(server.pending_len(), 1, "pending entry held across M1→M2");
 
         let mut m3_frags = Vec::new();
+        let mut client_outcome = None;
         for f in &m2_frags {
-            if let ClientEvent::Emit(frags) = client.handle_datagram(f).expect("cli") {
-                m3_frags = frags;
+            if let ClientEvent::M3Sent { packets, outcome } =
+                client.handle_datagram(f).expect("cli")
+            {
+                m3_frags = packets;
+                client_outcome = Some(outcome);
             }
         }
         assert_eq!(
@@ -2127,14 +2215,7 @@ pub(crate) mod tests {
             "pending entry removed on completion"
         );
 
-        let mut client_outcome = None;
-        for _ in 0..=cc.m3_max_attempts {
-            if let ClientEvent::Complete(out) = client.on_timer().expect("cli") {
-                client_outcome = Some(out);
-                break;
-            }
-        }
-        let client_outcome = client_outcome.expect("client completes after M3 budget");
+        let client_outcome = client_outcome.expect("client outcome is delivered with the M3");
         (client_outcome, server_outcome)
     }
 
@@ -2163,8 +2244,8 @@ pub(crate) mod tests {
         assert_eq!(m2_frags.len(), M2_FRAG_COUNT as usize);
         let mut m3_frags = Vec::new();
         for f in &m2_frags {
-            if let ClientEvent::Emit(frags) = client.handle_datagram(f).expect("cli") {
-                m3_frags = frags;
+            if let ClientEvent::M3Sent { packets, .. } = client.handle_datagram(f).expect("cli") {
+                m3_frags = packets;
             }
         }
         assert_eq!(m3_frags.len(), M3_FRAG_COUNT as usize);
@@ -2635,8 +2716,8 @@ pub(crate) mod tests {
         // the assembler was reset and no state was poisoned (D12/D13).
         let mut got_m3 = false;
         for f in &m2_frags {
-            if let ClientEvent::Emit(frags) = client.handle_datagram(f).expect("cli") {
-                assert_eq!(frags.len(), M3_FRAG_COUNT as usize);
+            if let ClientEvent::M3Sent { packets, .. } = client.handle_datagram(f).expect("cli") {
+                assert_eq!(packets.len(), M3_FRAG_COUNT as usize);
                 got_m3 = true;
             }
         }
@@ -2661,13 +2742,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn client_m3_retransmits_byte_identical_then_completes() {
+    fn client_m3_retransmits_byte_identical_then_fails_explicitly() {
         let (cc, sc) = test_configs();
         let sid = [19u8; SESSION_ID_LEN];
         let (mut client, _, _, m3_frags) = reach_await_m3(&cc, &sc, sid);
 
-        let mut completed = false;
-        for _ in 0..=cc.m3_max_attempts {
+        // The M3 retransmissions are byte-identical (D13) …
+        for _ in 0..cc.m3_max_attempts {
             match client.on_timer().expect("cli") {
                 ClientEvent::Emit(frags) => {
                     assert_eq!(frags.len(), m3_frags.len());
@@ -2679,15 +2760,17 @@ pub(crate) mod tests {
                         );
                     }
                 }
-                ClientEvent::Complete(out) => {
-                    assert_eq!(out.session_id, sid);
-                    completed = true;
-                    break;
-                }
-                ClientEvent::None => panic!("unexpected"),
+                other => panic!("unexpected {other:?} during M3 retransmission"),
             }
         }
-        assert!(completed, "M3 budget exhaustion completes the client (D15)");
+        // … and the budget exhaustion is an **explicit failure**, never a
+        // success: "the budget ran out" must not be indistinguishable from
+        // "the peer answered" (D31 §2).  The caller tears the session down,
+        // reports `NotConfirmed` and retries with a fresh sid.
+        assert!(
+            matches!(client.on_timer(), Err(HandshakeV2Error::Timeout)),
+            "M3 budget exhaustion must be an explicit failure, not a success"
+        );
     }
 
     // -- server state machine -------------------------------------------------
@@ -2852,6 +2935,102 @@ pub(crate) mod tests {
             server.pending_len(),
             0,
             "the second M1 must not allocate a pending entry (frag 0 is gated)"
+        );
+    }
+
+    /// B14 (D24 lookup-first): a retransmitted M3 whose sid names **no live
+    /// pending entry** must not spend a rate token.
+    ///
+    /// The M3 path burns asymmetric work (decapsulation, HKDF, HMAC), so it is
+    /// rate-gated — but the gate must run *after* the pending-entry lookup,
+    /// exactly like the data path's lookup-first ordering.  A retransmitted
+    /// M3 for an already-consumed sid does no work at all, so charging the
+    /// source's budget for it is pure attacker-controlled state: an
+    /// off-path attacker who captures one M3 could drain a victim's whole
+    /// handshake budget with replays.
+    #[test]
+    fn b14_retransmitted_m3_for_a_consumed_sid_costs_no_rate_token() {
+        let (cc, mut sc) = test_configs();
+        sc.rate_limit_burst = 64;
+        let sid = [43u8; SESSION_ID_LEN];
+        let mut client = ClientHandshake::new(&cc, sid).expect("client");
+        let mut server = ServerHandshake::new(&sc);
+        let mut m2 = Vec::new();
+        for f in client.m1_frags() {
+            if let ServerEvent::Emit(frags, _) = server.handle_datagram(f, CLIENT_ADDR).expect("m1")
+            {
+                m2 = frags;
+            }
+        }
+        let mut m3 = Vec::new();
+        for f in &m2 {
+            if let ClientEvent::M3Sent { packets, .. } = client.handle_datagram(f).expect("m2") {
+                m3 = packets;
+            }
+        }
+        // The genuine M3 completes the handshake and consumes the entry.
+        assert!(matches!(
+            server.handle_datagram(&m3[0], CLIENT_ADDR).expect("m3"),
+            ServerEvent::Complete(_)
+        ));
+        assert_eq!(server.pending_len(), 0);
+
+        // The retransmitted M3 names no live entry: no work is done, so no
+        // token may be spent.
+        let before = server.rate_tokens(CLIENT_ADDR);
+        for _ in 0..4 {
+            assert!(matches!(
+                server.handle_datagram(&m3[0], CLIENT_ADDR).expect("m3 dup"),
+                ServerEvent::None
+            ));
+        }
+        assert_eq!(
+            server.rate_tokens(CLIENT_ADDR),
+            before,
+            "a retransmitted M3 must not spend a rate token (B14)"
+        );
+    }
+
+    /// B16: the pending entry must not expire while the client is actively
+    /// retransmitting its M1.
+    ///
+    /// The server answers a duplicate M1 with the cached, byte-identical M2
+    /// — proof that the client is still trying.  If that answer did not
+    /// refresh the entry, the entry would die `pending_ttl` after the M1 even
+    /// though the client is retransmitting, and the client would then wait
+    /// out its whole confirmation window for a server that has already
+    /// forgotten the exchange.
+    #[test]
+    fn b16_duplicate_m1_refreshes_the_pending_entry() {
+        let (cc, sc) = test_configs();
+        let sid = [44u8; SESSION_ID_LEN];
+        let client = ClientHandshake::new(&cc, sid).expect("client");
+        let mut server = ServerHandshake::new(&sc);
+        for f in client.m1_frags() {
+            server.handle_datagram(f, CLIENT_ADDR).expect("m1");
+        }
+        let before = server
+            .pending_last_seen(&sid)
+            .expect("the pending entry exists");
+
+        // The client retransmits its M1: the server answers with the cached
+        // M2 and refreshes the entry.
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(
+            matches!(
+                server
+                    .handle_datagram(&client.m1_frags()[0], CLIENT_ADDR)
+                    .expect("dup m1"),
+                ServerEvent::Emit(_, _)
+            ),
+            "a duplicate M1 must be answered with the cached M2"
+        );
+        let after = server
+            .pending_last_seen(&sid)
+            .expect("the pending entry still exists");
+        assert!(
+            after > before,
+            "the pending entry must be refreshed by the retransmitted M1 (B16)"
         );
     }
 

@@ -23,6 +23,13 @@ pub enum ProtocolState {
     Handshake,
     /// Active session: encrypted transport, integrity, replay and traffic
     /// management are in effect (§8.3).
+    ///
+    /// "Established" means the **session layer is live** — the keys are
+    /// derived and the nonce state is active.  It does **not** assert that the
+    /// peer holds the same master: key *confirmation* is a separate fact,
+    /// tracked by the endpoint and confirmed by the first authenticated
+    /// server packet that decrypts (D15, PROTOCOL_SPEC §8.3).  The client
+    /// manager owns that fact (D31 §1.1), not this state.
     Established,
     /// Key rotation in progress (§8 lifecycle; §13 rekeying).
     Rekey,

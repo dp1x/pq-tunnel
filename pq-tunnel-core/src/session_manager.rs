@@ -81,7 +81,7 @@
 //! removed by dropping the entry — the zeroizing `Drop`s of `WireSession` /
 //! `CipherSession` wipe keys and nonce prefixes (D14).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -117,29 +117,77 @@ pub struct SessionLimits {
     /// At capacity the least-recently-active session is evicted
     /// (`Closed{Capacity}`).
     pub max_sessions: usize,
-    /// Server only: a session whose last authenticated receive is older than
-    /// this is evicted (`Closed{IdleTimeout}`).  The client side does not idle
-    /// evict — a quiet-but-live session must not churn (Phase 7 cover traffic
-    /// provides post-confirmation liveness).
+    /// Server only: a session whose last **authenticated receive** is older
+    /// than this is evicted (`Closed{IdleTimeout}`).  Outbound traffic — the
+    /// server's own cover emissions and application replies — deliberately
+    /// does **not** refresh it: an idle timeout that the endpoint keeps
+    /// refreshing itself is not an idle timeout, and with cover enabled (the
+    /// default) it would mean abandoned sessions are never reaped (D31 §5).
+    ///
+    /// It MUST be strictly greater than [`Self::liveness_probe_interval`],
+    /// otherwise a live-but-quiet client would be evicted before its probe
+    /// arrives.  The invariant is validated at construction (fail closed).
     pub idle_timeout: Option<Duration>,
     /// Both roles: upper bound on session lifetime (D16 bounds traffic-key
-    /// exposure).  `Closed{LifetimeCap}`.
+    /// exposure).  `Closed{LifetimeCap}`.  `None` means unbounded.
+    ///
+    /// The clock starts when the session is *prepared* (the client: the
+    /// moment the M3 is transmitted; the server: the moment the M3's Finished
+    /// MAC verifies), so the two endpoints' clocks differ by ≈1 RTT rather
+    /// than by the whole M3 retransmission budget.  The `Close` message is
+    /// what makes the semantics exact — the two clocks are never assumed to
+    /// agree (D31 §6).
     pub lifetime_cap: Option<Duration>,
-    /// Client only (D15): a session that receives no authenticated server
-    /// packet within this time of establishment is mis-keyed or dead —
-    /// closed (`Closed{NotConfirmed}`) and re-established.
-    pub liveness_timeout: Option<Duration>,
+    /// Client only (D15): the **confirmation** deadline.  A prepared session
+    /// that receives no authenticated server packet within this time of the
+    /// M3 transmission is closed (`Closed{NotConfirmed}`) and re-established.
+    ///
+    /// This is the *only* deadline on the unconfirmed path.  The M3
+    /// retransmission budget is a retransmission *policy* underneath it, not
+    /// a competing deadline: with both armed, the budget (≈7.75 s) always
+    /// fires first and the probe period is dead code (D31 §5).
+    pub confirm_timeout: Option<Duration>,
+    /// Both roles: the interval between liveness probes.
+    ///
+    /// A probe is an in-session control message (sub-type `0x01`) that the
+    /// client sends to the server; the server answers with an ack
+    /// (sub-type `0x02`).  The probe is what keeps a live-but-quiet session
+    /// alive on the server (whose idle timeout only counts *authenticated
+    /// receives*) and what gives the client post-confirmation peer-loss
+    /// detection.  It **replaces** a cover slot, so the D19 cover grid's rate
+    /// is invariant (D31 §5).
+    pub liveness_probe_interval: Duration,
+    /// Client only: the number of **consecutive unanswered** liveness rounds
+    /// after which the peer is declared dead (`Closed{PeerUnresponsive}`).
+    ///
+    /// A single missed round is never fatal — UDP loss must not kill a
+    /// healthy session (D31 §8) — so the decision is made on N consecutive
+    /// rounds, not on one timeout.
+    pub liveness_rounds: u32,
     /// Client only (F6): overall deadline for a handshake attempt
     /// (`Closed{HandshakeTimeout}`); the M1 retransmit budget is enforced
     /// inside the handshake machine.
     pub handshake_timeout: Option<Duration>,
     /// Data-path failure gate: max decrypt *failures* per source per window.
+    ///
+    /// A token is consumed **only** when an AEAD decrypt actually fails
+    /// (D24).  A successful decrypt, a replayed-but-authentic packet, and an
+    /// in-session control message all consume nothing.
     pub fail_burst: u32,
     /// Data-path failure gate window.
     pub fail_window: Duration,
     /// Data-path failure gate: hard cap on per-source buckets (spoofed-source
     /// floods cannot grow the table unboundedly; stalest evicted at the cap).
     pub max_fail_buckets: usize,
+    /// Pacing interval for the **session slot**: the shortest interval at
+    /// which the endpoint may emit one queued application payload or one
+    /// liveness probe.
+    ///
+    /// The session slot is the unit that keeps the observable packet rate
+    /// invariant (D19/D22): a queued payload is flushed *through* the slot
+    /// rather than as a burst, and a liveness probe *replaces* a cover
+    /// packet instead of adding to it.
+    pub slot_interval: Duration,
 }
 
 impl Default for SessionLimits {
@@ -148,12 +196,52 @@ impl Default for SessionLimits {
             max_sessions: 64,
             idle_timeout: Some(Duration::from_secs(5 * 60)),
             lifetime_cap: None,
-            liveness_timeout: Some(Duration::from_secs(30)),
+            confirm_timeout: Some(Duration::from_secs(30)),
+            liveness_probe_interval: Duration::from_secs(5),
+            liveness_rounds: 3,
             handshake_timeout: Some(Duration::from_secs(30)),
             fail_burst: 64,
             fail_window: Duration::from_secs(10),
             max_fail_buckets: 4096,
+            slot_interval: Duration::from_millis(5),
         }
+    }
+}
+
+impl SessionLimits {
+    /// Validate the cross-field invariants.  Fail closed: an invalid
+    /// configuration is rejected at construction, never silently repaired.
+    ///
+    /// * `idle_timeout` must be strictly greater than
+    ///   `liveness_probe_interval` — otherwise the server evicts a live
+    ///   client before its probe arrives, and the client re-establishes in a
+    ///   loop.
+    /// * `liveness_rounds` must be at least 1.
+    /// * `slot_interval` must be non-zero.
+    pub fn validate(&self) -> Result<(), ManagerError> {
+        // MSRV 1.85: no let-chains (stabilized in 1.88), so the guards are
+        // expressed with `match` rather than a nested `if let`.
+        match self.idle_timeout {
+            Some(idle) if idle <= self.liveness_probe_interval => {
+                return Err(ManagerError::InvalidConfig(format!(
+                    "idle_timeout ({idle:?}) must be strictly greater than \
+                     liveness_probe_interval ({:?})",
+                    self.liveness_probe_interval
+                )));
+            }
+            _ => {}
+        }
+        if self.liveness_rounds == 0 {
+            return Err(ManagerError::InvalidConfig(
+                "liveness_rounds must be at least 1".into(),
+            ));
+        }
+        if self.slot_interval.is_zero() {
+            return Err(ManagerError::InvalidConfig(
+                "slot_interval must be non-zero".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -170,9 +258,15 @@ pub enum CloseReason {
     LifetimeCap,
     /// D16: nonce counter exhausted (rekey trigger) — close + re-establish.
     NonceExhausted,
-    /// D15: client received no authenticated server packet within
-    /// `liveness_timeout` (mis-keyed or dead session).
+    /// D15: the client received no authenticated server packet within
+    /// `confirm_timeout` (mis-keyed or dead session).
     NotConfirmed,
+    /// D31: the peer stopped answering liveness probes — `liveness_rounds`
+    /// consecutive rounds went unanswered.  Distinct from
+    /// [`CloseReason::NotConfirmed`], which is the *pre*-confirmation
+    /// failure: this one fires on a session that was confirmed and then
+    /// went silent.
+    PeerUnresponsive,
     /// Client: handshake failed (M1 budget exhausted or overall deadline).
     HandshakeTimeout,
     /// Server: evicted to make room for a new session at `max_sessions`.
@@ -191,7 +285,13 @@ pub enum CloseReason {
 /// `Closed` for the next `tick` instead.
 #[derive(Debug)]
 pub enum ManagerEvent {
-    /// Handshake fragments to emit, all to `peer` (handshake path only).
+    /// Datagrams to emit, all to `peer`.
+    ///
+    /// Carries handshake fragments (M1 retransmits, the M3) and — on the
+    /// client — the in-session liveness probe that rides along with an M3
+    /// retransmission.  The probe is a *data-path* packet, so it travels in
+    /// the same burst as the handshake fragment it accompanies; the burst is
+    /// part of the establishment phase, which is inherently off-grid.
     Send {
         packets: Vec<WirePacket>,
         peer: SocketAddr,
@@ -218,6 +318,10 @@ pub enum ManagerEvent {
         sid: [u8; SESSION_ID_LEN],
         reason: CloseReason,
     },
+    /// The bounded outbound queue dropped one or more application payloads
+    /// (overflow, or per-entry TTL expiry).  `dropped` is the **cumulative**
+    /// count since the manager was created; it never decreases.
+    OutboundDropped { dropped: u64 },
     /// Nothing to do — silent drop.
     None,
 }
@@ -247,6 +351,13 @@ pub enum ManagerNotification {
         sid: [u8; SESSION_ID_LEN],
         reason: CloseReason,
     },
+    /// The bounded outbound queue dropped one or more application payloads.
+    ///
+    /// `dropped` is the cumulative number of dropped payloads since the
+    /// manager was created.  The application learns that its data was *not*
+    /// delivered — the previous behaviour (a silent `Err(NoSession)`) lost
+    /// the data with no signal at all (D31 §7).
+    OutboundDropped { dropped: u64 },
 }
 
 /// Outbound command from the server application: send `payload` on session
@@ -483,10 +594,67 @@ impl FailGate {
 #[allow(clippy::large_enum_variant)]
 enum DataResult {
     Payload(InnerPlaintext),
+    /// An in-session control message (liveness probe / ack).  Consumed
+    /// internally: never relayed to the application, never charged to the
+    /// failure gate.
+    Control(InnerPlaintext),
     PeerClose,
     SessionDead(CloseReason),
+    /// The AEAD tag did not verify — the *only* outcome that may consume a
+    /// failure-gate token (D24).
     Failed,
+    /// The packet was rejected for a reason that is **not** an AEAD failure
+    /// (a replayed-but-authentic packet, invalid inner framing, a direction
+    /// mismatch, a wrong version byte).  No token is consumed (D24): the
+    /// rejection says nothing about the key being wrong, and charging it
+    /// would let an off-path attacker drain a victim's budget with replayed
+    /// copies of its own traffic.
+    Rejected,
 }
+
+/// In-session control sub-types carried in `payload[0]` of a
+/// [`MessageType::Handshake`] message.
+///
+/// `MessageType::Handshake` (0x00) already exists in the protocol's type
+/// space; giving it a meaning is a **semantic extension of an existing
+/// authenticated type**, not a new type and not a framing change.  No new
+/// wire bytes are introduced: the message rides the ordinary encrypted
+/// session slot (D31 §5).
+pub mod control {
+    /// Liveness probe: "are you there?".  The peer answers with
+    /// [`ACK`](super::control::ACK).
+    pub const PROBE: u8 = 0x01;
+    /// Liveness acknowledgement: "yes".  A probe that is answered also
+    /// *confirms* the key agreement (D15).
+    pub const ACK: u8 = 0x02;
+}
+
+/// A session that has been closed locally but whose `Close` notification is
+/// still being retransmitted to the peer.
+///
+/// The session object is retained (bounded, ≤ `CLOSE_RETRANSMIT_TOTAL`
+/// seconds) purely so the remaining `Close` packets can be encrypted with
+/// the same session keys.  It is **not** in the session table, so it cannot
+/// serve data, and it is dropped — zeroizing its keys (D14) — once the
+/// retransmission budget is spent.
+struct PendingClose {
+    session: WireSession,
+    peer: SocketAddr,
+    /// Retransmissions still to send.
+    attempts_left: u32,
+    /// When the next retransmission is due.
+    next_at: Instant,
+}
+
+/// Total number of `Close` packets emitted for one teardown: the first one
+/// plus `CLOSE_RETRANSMIT_TOTAL - 1` retransmissions.
+///
+/// A fire-and-forget `Close` over UDP can be lost, which would strand the
+/// peer for a whole lifetime-cap period; the retransmissions make the
+/// convergence reliable without unbounded traffic (D31 §6).
+const CLOSE_RETRANSMIT_TOTAL: u32 = 3;
+/// Base delay between `Close` retransmissions (jittered exponential backoff).
+const CLOSE_RETRANSMIT_BASE: Duration = Duration::from_secs(1);
 
 struct SessionEntry {
     session: WireSession,
@@ -507,6 +675,8 @@ pub struct ServerSessionManager {
     sessions: HashMap<[u8; SESSION_ID_LEN], SessionEntry>,
     fail_gate: FailGate,
     pending_closed: VecDeque<ManagerEvent>,
+    /// Sessions whose `Close` notification is still being retransmitted.
+    pending_closes: Vec<PendingClose>,
 }
 
 impl ServerSessionManager {
@@ -522,12 +692,15 @@ impl ServerSessionManager {
             HandshakeV2Error::InvalidConfig(msg) => ManagerError::InvalidConfig(msg),
             other => ManagerError::Handshake(other),
         })?;
+        // Cross-field limit invariants (fail closed — see `SessionLimits`).
+        limits.validate()?;
         Ok(Self {
             limits,
             hs: ServerHandshake::new(cfg),
             sessions: HashMap::new(),
             fail_gate: FailGate::new(Instant::now()),
             pending_closed: VecDeque::new(),
+            pending_closes: Vec::new(),
         })
     }
 
@@ -652,10 +825,16 @@ impl ServerSessionManager {
             return Ok(ManagerEvent::None);
         }
 
-        let result = match self.sessions.get_mut(&sid) {
+        let result: DataResult = match self.sessions.get_mut(&sid) {
             None => return Ok(ManagerEvent::None),
             Some(entry) => match entry.session.decrypt(pkt) {
                 Ok(inner) => {
+                    // B4: `last_activity` tracks **authenticated receives
+                    // only**.  The server's own cover emissions and
+                    // application replies must NOT refresh it: an idle
+                    // timeout that the endpoint refreshes itself is not an
+                    // idle timeout, and with cover enabled (the default) it
+                    // would mean abandoned sessions are never reaped.
                     entry.last_activity = now;
                     // §10 roaming: rebind only on an authenticated packet.
                     entry.peer = from;
@@ -663,10 +842,24 @@ impl ServerSessionManager {
                         MessageType::Data => DataResult::Payload(inner),
                         MessageType::Cover => DataResult::Payload(inner),
                         MessageType::Close => DataResult::PeerClose,
-                        MessageType::Handshake => DataResult::Failed,
+                        // In-session control message: consumed internally,
+                        // never relayed to the application, and never charged
+                        // to the failure gate (it decrypted successfully).
+                        MessageType::Handshake => DataResult::Control(inner),
                     }
                 }
                 Err(SessionError::RekeyRequired) => {
+                    DataResult::SessionDead(CloseReason::NonceExhausted)
+                }
+                // B9: a replayed-but-authentic packet (and every other
+                // non-AEAD rejection) must NOT consume a failure-gate
+                // token: the tag verified, so the rejection says nothing
+                // about the key being wrong (D24).
+                Err(SessionError::Codec(CodecError::Rejected)) => DataResult::Rejected,
+                // A genuine AEAD failure is the only thing that spends a
+                // token (D24).
+                Err(SessionError::Codec(CodecError::DecryptionFailed)) => DataResult::Failed,
+                Err(SessionError::Codec(CodecError::NonceExhausted { .. })) => {
                     DataResult::SessionDead(CloseReason::NonceExhausted)
                 }
                 Err(SessionError::Codec(_)) => DataResult::Failed,
@@ -680,6 +873,7 @@ impl ServerSessionManager {
                 // Cover is consumed silently (it is not application data).
                 _ => Ok(ManagerEvent::None),
             },
+            DataResult::Control(inner) => self.on_control_message(sid, inner),
             DataResult::PeerClose => {
                 self.sessions.remove(&sid);
                 Ok(ManagerEvent::Closed {
@@ -695,6 +889,59 @@ impl ServerSessionManager {
                 self.fail_gate.consume(from, now, &self.limits);
                 Ok(ManagerEvent::None)
             }
+            // Not an AEAD failure: no token is consumed (D24).
+            DataResult::Rejected => Ok(ManagerEvent::None),
+        }
+    }
+
+    /// Handle an in-session control message (liveness probe / ack).
+    ///
+    /// The message is consumed entirely inside the session layer: it is never
+    /// relayed to the application and it never touches the failure gate.  A
+    /// probe is answered with an ack; an ack and every unknown sub-type are
+    /// ignored (no state change, no charge).
+    fn on_control_message(
+        &mut self,
+        sid: [u8; SESSION_ID_LEN],
+        inner: InnerPlaintext,
+    ) -> Result<ManagerEvent, ManagerError> {
+        match inner.payload[0] {
+            control::PROBE => {
+                // Answer the probe so the client can confirm the key
+                // agreement (D15).  The ack is encrypted with the same
+                // session keys, so it is itself an authenticated packet.
+                let result = {
+                    let Some(entry) = self.sessions.get_mut(&sid) else {
+                        // The session vanished between the decrypt and here
+                        // (a concurrent teardown): a silent drop, never an
+                        // error — a peer-input condition must not take the
+                        // server down.
+                        return Ok(ManagerEvent::None);
+                    };
+                    let peer = entry.peer;
+                    let mut payload = [0u8; PAYLOAD_LEN];
+                    payload[0] = control::ACK;
+                    entry
+                        .session
+                        .encrypt(MessageType::Handshake, &payload)
+                        .map(|packet| (packet, peer))
+                };
+                match result {
+                    Ok((packet, peer)) => Ok(ManagerEvent::SendPacket { packet, peer }),
+                    Err(SessionError::RekeyRequired) => {
+                        self.sessions.remove(&sid);
+                        Ok(ManagerEvent::Closed {
+                            sid,
+                            reason: CloseReason::NonceExhausted,
+                        })
+                    }
+                    Err(e) => Err(ManagerError::Session(e)),
+                }
+            }
+            // An ack needs no answer; every other sub-type is unknown and is
+            // ignored without any state change and without touching the
+            // failure gate.
+            _ => Ok(ManagerEvent::None),
         }
     }
 
@@ -724,6 +971,13 @@ impl ServerSessionManager {
     }
 
     /// Encrypt a cover packet on `sid` (Phase 7 shaper hook).
+    ///
+    /// B4: a cover emission is **outbound** traffic and deliberately does
+    /// *not* refresh `last_activity`.  The idle timeout counts authenticated
+    /// *receives* only — an endpoint that keeps its own session alive by
+    /// talking to itself never reaps an abandoned session, and with cover
+    /// enabled (the default) that means the session table grows without
+    /// bound.
     pub fn cover_packet(
         &mut self,
         sid: &[u8; SESSION_ID_LEN],
@@ -731,10 +985,7 @@ impl ServerSessionManager {
         let entry = self.sessions.get_mut(sid).ok_or(ManagerError::NoSession)?;
         let peer = entry.peer;
         match entry.session.cover() {
-            Ok(packet) => {
-                entry.last_activity = Instant::now();
-                Ok(ManagerEvent::SendPacket { packet, peer })
-            }
+            Ok(packet) => Ok(ManagerEvent::SendPacket { packet, peer }),
             Err(SessionError::RekeyRequired) => {
                 self.sessions.remove(sid);
                 Ok(ManagerEvent::Closed {
@@ -772,10 +1023,9 @@ impl ServerSessionManager {
         let entry = self.sessions.get_mut(sid).ok_or(ManagerError::NoSession)?;
         let peer = entry.peer;
         match entry.session.encrypt(msg_type, payload) {
-            Ok(packet) => {
-                entry.last_activity = Instant::now();
-                Ok(ManagerEvent::SendPacket { packet, peer })
-            }
+            // B4: outbound traffic does not refresh `last_activity` (see
+            // `cover_packet`).
+            Ok(packet) => Ok(ManagerEvent::SendPacket { packet, peer }),
             Err(SessionError::RekeyRequired) => {
                 self.sessions.remove(sid);
                 Ok(ManagerEvent::Closed {
@@ -787,20 +1037,59 @@ impl ServerSessionManager {
         }
     }
 
-    /// Close a session at the application's request (no wire message — the
-    /// server is passive; the peer discovers it by idle timeout or the Close
-    /// the *client* sent).
+    /// Close a session at the application's request.
+    ///
+    /// B7: an encrypted `Close` is emitted to the peer **before** the session
+    /// is dropped, so the peer learns about the closure immediately instead
+    /// of discovering it by idle timeout (or, on the client, by using a dead
+    /// session for another 24 h).  The `Close` is retransmitted a bounded
+    /// number of times (see [`PendingClose`]).  The `Closed{UserClosed}`
+    /// notification is queued for the next tick (single-event invariant).
     pub fn close_session(
         &mut self,
         sid: &[u8; SESSION_ID_LEN],
     ) -> Result<ManagerEvent, ManagerError> {
-        match self.sessions.remove(sid) {
-            Some(_) => Ok(ManagerEvent::Closed {
-                sid: *sid,
-                reason: CloseReason::UserClosed,
-            }),
-            None => Err(ManagerError::NoSession),
-        }
+        let entry = self.sessions.remove(sid).ok_or(ManagerError::NoSession)?;
+        self.pending_closed.push_back(ManagerEvent::Closed {
+            sid: *sid,
+            reason: CloseReason::UserClosed,
+        });
+        Ok(self.begin_close(*sid, entry, Instant::now()))
+    }
+
+    /// Encrypt the first `Close` packet for a session that is being torn
+    /// down, and schedule the retransmissions.
+    ///
+    /// The session is moved into `pending_closes`; it is dropped (keys
+    /// zeroized, D14) once the retransmission budget is spent.
+    fn begin_close(
+        &mut self,
+        _sid: [u8; SESSION_ID_LEN],
+        entry: SessionEntry,
+        now: Instant,
+    ) -> ManagerEvent {
+        let SessionEntry {
+            mut session, peer, ..
+        } = entry;
+        let payload = [0u8; PAYLOAD_LEN];
+        // The `Close` payload is all zeros; the message *type* is what
+        // carries the meaning (§8.4).
+        let packet = match session.encrypt(MessageType::Close, &payload) {
+            Ok(packet) => packet,
+            Err(_) => {
+                // The session cannot encrypt any more (nonce exhausted): the
+                // peer will discover the closure by timeout.  Fail securely —
+                // never emit a malformed packet.
+                return ManagerEvent::None;
+            }
+        };
+        self.pending_closes.push(PendingClose {
+            session,
+            peer,
+            attempts_left: CLOSE_RETRANSMIT_TOTAL - 1,
+            next_at: now + CLOSE_RETRANSMIT_BASE,
+        });
+        ManagerEvent::SendPacket { packet, peer }
     }
 
     /// Timer tick: evict idle/expired sessions, drain queued `Closed` events.
@@ -808,26 +1097,76 @@ impl ServerSessionManager {
         let mut out = Vec::new();
         let idle = self.limits.idle_timeout;
         let life = self.limits.lifetime_cap;
-        self.sessions.retain(|sid, e| {
-            let idle_ok = idle.is_none_or(|t| now.duration_since(e.last_activity) < t);
-            let life_ok = life.is_none_or(|t| now.duration_since(e.established_at) < t);
-            if idle_ok && life_ok {
-                true
-            } else {
-                let reason = if !life_ok {
-                    CloseReason::LifetimeCap
+        // Collect the expiring sids first: the session must still be alive
+        // when its `Close` is encrypted (B7).
+        let expired: Vec<([u8; SESSION_ID_LEN], CloseReason)> = self
+            .sessions
+            .iter()
+            .filter_map(|(sid, e)| {
+                let idle_ok = idle.is_none_or(|t| now.duration_since(e.last_activity) < t);
+                let life_ok = life.is_none_or(|t| now.duration_since(e.established_at) < t);
+                if idle_ok && life_ok {
+                    None
                 } else {
-                    CloseReason::IdleTimeout
-                };
-                out.push(ManagerEvent::Closed { sid: *sid, reason });
-                false
+                    let reason = if !life_ok {
+                        CloseReason::LifetimeCap
+                    } else {
+                        CloseReason::IdleTimeout
+                    };
+                    Some((*sid, reason))
+                }
+            })
+            .collect();
+        for (sid, reason) in expired {
+            if let Some(entry) = self.sessions.remove(&sid) {
+                // B7: the peer is told before the session disappears.
+                let close = self.begin_close(sid, entry, now);
+                if !matches!(close, ManagerEvent::None) {
+                    out.push(close);
+                }
             }
-        });
+            out.push(ManagerEvent::Closed { sid, reason });
+        }
         out.extend(self.pending_closed.drain(..));
+        out.extend(self.retransmit_closes(now));
         // Off-path fail-gate housekeeping: reclaim expired buckets.  This runs
         // at most once per `fail_window` and never on the packet path, so the
         // table's reclamation cost is independent of the packet rate (D24).
         self.fail_gate.sweep(now, &self.limits);
+        out
+    }
+
+    /// Retransmit the pending `Close` packets whose backoff has elapsed.
+    ///
+    /// A `Close` that is never received strands the peer: on the client that
+    /// means using a dead session for another lifetime-cap period.  The
+    /// retransmissions are bounded (3 packets, 1 s / 2 s backoff) and the
+    /// session is dropped — keys zeroized (D14) — once they are spent.
+    fn retransmit_closes(&mut self, now: Instant) -> Vec<ManagerEvent> {
+        let mut out = Vec::new();
+        let payload = [0u8; PAYLOAD_LEN];
+
+        for pc in self.pending_closes.iter_mut() {
+            if pc.attempts_left == 0 || now < pc.next_at {
+                continue;
+            }
+            pc.attempts_left -= 1;
+            pc.next_at = now + CLOSE_RETRANSMIT_BASE * 2;
+            match pc.session.encrypt(MessageType::Close, &payload) {
+                Ok(packet) => out.push(ManagerEvent::SendPacket {
+                    packet,
+                    peer: pc.peer,
+                }),
+                Err(_) => {
+                    // The session can no longer encrypt: stop retrying.
+                    pc.attempts_left = 0;
+                }
+            }
+        }
+        // Drop the sessions whose retransmission budget is spent.  The drop
+        // zeroizes the session keys (D14).
+        self.pending_closes
+            .retain(|pc| pc.attempts_left > 0 && now < pc.next_at);
         out
     }
 }
@@ -842,24 +1181,120 @@ pub enum ClientManagerState {
     /// No handshake running and no session (before the first `begin_handshake`
     /// or between closure and re-arm).
     Idle,
-    /// A handshake is in flight.
+    /// A handshake is in flight: the M1 was sent, the M2 is awaited.  No
+    /// session exists yet.
     Handshaking,
-    /// A session is established (gated until `is_ready`, D15).
+    /// The session is **prepared but unconfirmed**: the M3 was transmitted, so
+    /// the peer is *authenticated* (its ML-DSA-65 signature over TH2 was
+    /// verified while the M2 was assembled) and the shared key material
+    /// exists — but the key agreement is **not yet confirmed**, because no
+    /// authenticated server packet has decrypted yet (D15).
+    ///
+    /// The distinction from [`ClientManagerState::Established`] is *key
+    /// confirmation*, **not** authentication: the peer is already known to be
+    /// genuine in this state.  Inbound application data is still gated (D15).
+    Unconfirmed,
+    /// The session is established **and confirmed**: an authenticated server
+    /// packet has decrypted, so the D15 gate is open.
     Established,
 }
 
+/// One application payload buffered while the client has no session.
+struct QueuedPayload {
+    payload: Vec<u8>,
+    queued_at: Instant,
+}
+
+/// Maximum number of application payloads buffered while no session exists.
+///
+/// The queue is explicitly bounded: an unbounded buffer would turn a stalled
+/// tunnel into a memory exhaustion vector (D31 §7).
+const OUTBOUND_QUEUE_CAP: usize = 64;
+/// Maximum age of a buffered application payload.
+///
+/// A stale datagram must not be injected into the tunnel long after the
+/// application sent it: the peer would answer a request whose context is
+/// long gone (D31 §7).
+const OUTBOUND_QUEUE_TTL: Duration = Duration::from_secs(2);
+/// Number of session identifiers remembered for the non-reuse invariant.
+const SID_HISTORY_CAP: usize = 64;
+/// Number of torn-down session identifiers remembered (B12 guard).
+///
+/// The set is bounded like every other growing structure in this manager: it
+/// grows by one 8-byte entry per teardown, and a teardown loop (a peer that
+/// keeps vanishing) would otherwise grow it without bound.  The bound is far
+/// above the number of teardowns a healthy deployment performs in a lifetime
+/// (one per 24 h rotation), so the guard keeps its meaning in practice.
+const RETIRED_SID_CAP: usize = 1024;
+
 /// Client-side session manager: one handshake + one session, automatic
 /// re-establishment (D16).  Pure with respect to I/O.
+///
+/// # The one-live-object invariant (D31 §2)
+///
+/// The manager never holds the handshake machine **and** a session at the
+/// same time.  The machine exists only while the M2 is awaited; the moment
+/// the M3 is emitted the manager drops it and takes ownership of
+///
+/// * the cached M3 fragments (for retransmission),
+/// * the derived outcome (the session is created from it, **unconfirmed**),
+/// * the M3 retransmission budget, and
+/// * the prepared session.
+///
+/// This is what makes `begin_handshake()` safe to call after *every* teardown
+/// path: the manager is either holding a handshake or holding a session,
+/// never both, so the "handshake already running or session established"
+/// guard can never be tripped by a legitimate transition.
 pub struct ClientSessionManager {
     cfg: ClientConfig,
     limits: SessionLimits,
+    /// The handshake machine — present **only** while `Handshaking`.
     hs: Option<ClientHandshake>,
+    /// The prepared / established session — present only once the M3 was
+    /// emitted.
     session: Option<WireSession>,
+    /// D15 gate: has an authenticated server packet decrypted?
     ready: bool,
     peer: SocketAddr,
+    /// When the current handshake attempt started (F6 deadline).
     hs_started: Option<Instant>,
-    established_at: Option<Instant>,
+    /// When the M3 was emitted: the origin of the session's lifetime clock
+    /// and of the confirmation deadline.
+    prepared_at: Option<Instant>,
+    /// Cached M3 fragments, for byte-identical retransmission.
+    m3_frags: Vec<WirePacket>,
+    /// M3 retransmissions already made.
+    m3_attempts: u32,
+    /// The M3 retransmission budget is spent (a *policy* boundary, not a
+    /// deadline — the confirmation deadline is the only deadline).
+    m3_exhausted: bool,
+    /// The next liveness-probe deadline.
+    next_probe_at: Option<Instant>,
+    /// Consecutive liveness rounds the peer failed to answer.
+    rounds_unanswered: u32,
+    /// When the last session slot was used (slot pacing).
+    last_slot_at: Option<Instant>,
+    /// Application payloads awaiting a session (bounded, TTL'd).
+    out_queue: VecDeque<QueuedPayload>,
+    /// Cumulative count of dropped application payloads.
+    dropped_outbound: u64,
+    /// When the last drop was logged (log rate limiting).
+    last_drop_log: Option<Instant>,
+    /// Every session identifier this manager has drawn (non-reuse, D13).
+    used_sids: HashSet<[u8; SESSION_ID_LEN]>,
+    /// Insertion order of `used_sids`, for the bounded history.
+    used_order: VecDeque<[u8; SESSION_ID_LEN]>,
+    /// Session identifiers whose session was torn down.  No later event may
+    /// create a session for one of these (B12).
+    retired_sids: HashSet<[u8; SESSION_ID_LEN]>,
+    /// Insertion order of `retired_sids`, so the set can be bounded.
+    retired_order: VecDeque<[u8; SESSION_ID_LEN]>,
+    /// A teardown happened and no handshake is running: the driver must
+    /// re-arm (D16).
+    rearm_requested: bool,
     pending_closed: VecDeque<ManagerEvent>,
+    /// Sessions whose `Close` notification is still being retransmitted.
+    pending_closes: Vec<PendingClose>,
 }
 
 impl ClientSessionManager {
@@ -872,6 +1307,8 @@ impl ClientSessionManager {
                 crate::codec::PROTOCOL_VERSION
             )));
         }
+        // Cross-field limit invariants (fail closed — see `SessionLimits`).
+        limits.validate()?;
         Ok(Self {
             cfg: cfg.clone(),
             limits,
@@ -880,15 +1317,34 @@ impl ClientSessionManager {
             ready: false,
             peer: cfg.server_addr,
             hs_started: None,
-            established_at: None,
+            prepared_at: None,
+            m3_frags: Vec::new(),
+            m3_attempts: 0,
+            m3_exhausted: false,
+            next_probe_at: None,
+            rounds_unanswered: 0,
+            last_slot_at: None,
+            out_queue: VecDeque::new(),
+            dropped_outbound: 0,
+            last_drop_log: None,
+            used_sids: HashSet::new(),
+            used_order: VecDeque::new(),
+            retired_sids: HashSet::new(),
+            retired_order: VecDeque::new(),
+            rearm_requested: false,
             pending_closed: VecDeque::new(),
+            pending_closes: Vec::new(),
         })
     }
 
     /// Current lifecycle state.
     pub fn state(&self) -> ClientManagerState {
         if self.session.is_some() {
-            ClientManagerState::Established
+            if self.ready {
+                ClientManagerState::Established
+            } else {
+                ClientManagerState::Unconfirmed
+            }
         } else if self.hs.is_some() {
             ClientManagerState::Handshaking
         } else {
@@ -911,27 +1367,83 @@ impl ClientSessionManager {
         self.hs.as_ref().map(|h| *h.session_id())
     }
 
+    /// The number of application payloads dropped since the manager was
+    /// created (queue overflow + TTL expiry).
+    pub fn outbound_dropped(&self) -> u64 {
+        self.dropped_outbound
+    }
+
+    /// The number of application payloads currently buffered.
+    pub fn outbound_queued(&self) -> usize {
+        self.out_queue.len()
+    }
+
+    /// A teardown happened and no handshake is running: the driver must
+    /// re-arm with a fresh handshake (D16).
+    ///
+    /// The driver calls this from its periodic tick as a backstop, so a
+    /// transient failure in the immediate re-arm cannot leave the tunnel
+    /// permanently down (D31 §2, B13).
+    pub fn needs_rearm(&self) -> bool {
+        self.rearm_requested && self.hs.is_none() && self.session.is_none()
+    }
+
     /// Start (or restart) a handshake with a fresh client-chosen sid.
     ///
     /// Allowed only from `Idle`; the driver calls this at start and after
     /// every `Closed` event (D16 re-establishment).
+    ///
+    /// The sid is drawn from the CSPRNG and is guaranteed **never to have been
+    /// used within the remembered window** (the last [`SID_HISTORY_CAP`]
+    /// draws): a 64-bit collision is improbable, but its effect is not
+    /// transient — the server silently drops a newcomer whose sid already
+    /// names a live session, so the client would never establish (D31 §2,
+    /// B15).  Independently of that window, a sid that ever *hosted* a session
+    /// is refused outright by [`Self::on_m3_sent`], so a session is never
+    /// recreated under a sid that already carried one.
     pub fn begin_handshake(&mut self) -> Result<ManagerEvent, ManagerError> {
         if self.hs.is_some() || self.session.is_some() {
             return Err(ManagerError::InvalidState(
                 "handshake already running or session established",
             ));
         }
-        let sid = random_sid()?;
+        let sid = self.fresh_sid()?;
         let hs = ClientHandshake::new(&self.cfg, sid)?;
         let packets = hs.m1_frags().to_vec();
         self.hs = Some(hs);
         self.hs_started = Some(Instant::now());
         self.ready = false;
         self.peer = self.cfg.server_addr;
+        self.rearm_requested = false;
         Ok(ManagerEvent::Send {
             packets,
             peer: self.cfg.server_addr,
         })
+    }
+
+    /// Draw a session identifier this manager has never used.
+    fn fresh_sid(&mut self) -> Result<[u8; SESSION_ID_LEN], ManagerError> {
+        for _ in 0..8 {
+            let sid = random_sid().map_err(ManagerError::Handshake)?;
+            if self.used_sids.contains(&sid) {
+                continue;
+            }
+            self.used_sids.insert(sid);
+            self.used_order.push_back(sid);
+            // Bounded history: the oldest identifiers are forgotten, so the
+            // guarantee is "never reused *within the remembered window*".
+            // With 64 remembered 64-bit identifiers the collision
+            // probability of a redraw is 64/2^64 ≈ 2^-58 per draw.
+            while self.used_order.len() > SID_HISTORY_CAP {
+                if let Some(old) = self.used_order.pop_front() {
+                    self.used_sids.remove(&old);
+                }
+            }
+            return Ok(sid);
+        }
+        Err(ManagerError::InvalidState(
+            "could not draw a fresh session identifier",
+        ))
     }
 
     /// Process one received datagram.
@@ -940,100 +1452,385 @@ impl ClientSessionManager {
         pkt: &WirePacket,
         from: SocketAddr,
     ) -> Result<ManagerEvent, ManagerError> {
-        if let Some(hs) = &mut self.hs {
-            match hs.handle_datagram(pkt) {
-                Ok(ClientEvent::Emit(packets)) => Ok(ManagerEvent::Send {
-                    packets,
-                    peer: self.cfg.server_addr,
-                }),
-                Ok(ClientEvent::Complete(outcome)) => {
-                    self.establish(outcome)?;
-                    Ok(ManagerEvent::None)
-                }
-                Ok(ClientEvent::None) => Ok(ManagerEvent::None),
-                Err(e) => Err(ManagerError::Handshake(e)),
-            }
-        } else if let Some(sid) = self.session_id() {
-            let result: DataResult =
-                match self.session.as_mut().expect("checked above").decrypt(pkt) {
-                    Ok(inner) => match inner.msg_type {
-                        MessageType::Data | MessageType::Cover => DataResult::Payload(inner),
-                        MessageType::Close => DataResult::PeerClose,
-                        MessageType::Handshake => DataResult::Failed,
-                    },
-                    Err(SessionError::RekeyRequired) => {
-                        DataResult::SessionDead(CloseReason::NonceExhausted)
-                    }
-                    Err(SessionError::Codec(_)) => DataResult::Failed,
-                    Err(e) => return Err(ManagerError::Session(e)),
-                };
-            match result {
-                DataResult::Payload(inner) => {
-                    // D15: the first authenticated server packet opens the gate.
-                    self.ready = true;
-                    // §10 roaming: rebind only on an authenticated packet.
-                    self.peer = from;
-                    match inner.msg_type {
-                        MessageType::Data => Ok(ManagerEvent::AppData { sid, inner }),
-                        _ => Ok(ManagerEvent::None),
-                    }
-                }
-                DataResult::PeerClose => {
-                    self.close_session_internal();
-                    Ok(ManagerEvent::Closed {
-                        sid,
-                        reason: CloseReason::PeerClosed,
-                    })
-                }
-                DataResult::SessionDead(reason) => {
-                    self.close_session_internal();
-                    Ok(ManagerEvent::Closed { sid, reason })
-                }
-                DataResult::Failed => Ok(ManagerEvent::None),
+        if is_handshake_fragment(pkt) {
+            // Handshake fragments reach the handshake machine **only while the
+            // M2 is awaited**.  Once the M3 has been emitted the machine is
+            // gone, so a late or duplicated M2 fragment is stale and dropped
+            // (D31 §3).
+            let peer = self.cfg.server_addr;
+            let Some(hs) = self.hs.as_mut() else {
+                return Ok(ManagerEvent::None);
+            };
+            match hs.handle_datagram(pkt)? {
+                ClientEvent::Emit(packets) => Ok(ManagerEvent::Send { packets, peer }),
+                ClientEvent::M3Sent { packets, outcome } => self.on_m3_sent(packets, outcome),
+                ClientEvent::None => Ok(ManagerEvent::None),
             }
         } else {
-            Ok(ManagerEvent::None)
+            self.on_data_packet(pkt, from)
         }
     }
 
-    /// Handshake retransmit timer tick (delegates to the client machine).
-    pub fn on_timer(&mut self) -> Result<ManagerEvent, ManagerError> {
-        let Some(hs) = &mut self.hs else {
+    /// The M3 was emitted: prepare the session and start the confirmation
+    /// window.
+    ///
+    /// The session is created **once**, here, in an *unconfirmed* state.
+    /// Creating it is safe: the master comes from an M2 whose server
+    /// signature the client verified, so only the genuine server can decrypt
+    /// what the client sends; and the server verifies the Finished MAC
+    /// before committing the session, so a forged M3 cannot make the server
+    /// commit (D31 §2).
+    ///
+    /// The session is **adopted, never recreated**: if one already exists the
+    /// outcome is refused, because recreating it would reset the send
+    /// counter and install a fresh replay window under a live sid (B12).
+    fn on_m3_sent(
+        &mut self,
+        packets: Vec<WirePacket>,
+        outcome: HandshakeOutcome,
+    ) -> Result<ManagerEvent, ManagerError> {
+        if self.session.is_some() {
+            // Refuse: never swap the key material under a live sid.
+            //
+            // Unreachable under the one-live-object invariant (the manager
+            // holds the handshake machine only *before* the M3, and the
+            // session only *after* it), but the machine is retired here
+            // anyway: leaving it in place would stall the client for the
+            // whole M3 budget with no session to work with.
+            warn!("refusing a second M3 outcome: the manager already holds a session");
+            self.hs = None;
+            self.hs_started = None;
+            self.rearm_requested = true;
+            return Ok(ManagerEvent::None);
+        }
+        // A sid whose session was torn down must never come back to life
+        // (B12): a late event must not resurrect it with a fresh replay
+        // window and a reset counter.
+        if self.retired_sids.contains(&outcome.session_id) {
+            return Ok(ManagerEvent::None);
+        }
+        let now = Instant::now();
+        let session = WireSession::established(Role::Client, &outcome)?;
+        self.session = Some(session);
+        // The handshake machine is dropped here: from now on the manager
+        // owns the M3 fragments, the outcome, the retransmission budget and
+        // the prepared session — never the machine *and* a session at once.
+        self.hs = None;
+        self.hs_started = None;
+        self.ready = false;
+        self.prepared_at = Some(now);
+        self.m3_frags = packets.clone();
+        self.m3_attempts = 0;
+        self.m3_exhausted = false;
+        self.rounds_unanswered = 0;
+        // The first *periodic* probe is due one interval from now: the
+        // probe that rides along with the M3 burst below is the immediate
+        // one.
+        self.next_probe_at = Some(now + self.limits.liveness_probe_interval);
+
+        // The M3 burst carries a liveness probe so the client can be
+        // confirmed in ≈1 RTT instead of waiting out the retransmission
+        // budget.  A probe that races ahead of the server's processing of
+        // the M3 is dropped by the server (it has no session for that sid
+        // yet) — which is exactly why the probe is repeated on every M3
+        // retransmission and then periodically.
+        let mut burst = packets;
+        if let Some(probe) = self.build_probe() {
+            burst.push(probe);
+        }
+        Ok(ManagerEvent::Send {
+            packets: burst,
+            peer: self.cfg.server_addr,
+        })
+    }
+
+    /// Build an in-session liveness probe packet.
+    fn build_probe(&mut self) -> Option<WirePacket> {
+        let session = self.session.as_mut()?;
+        let mut payload = [0u8; PAYLOAD_LEN];
+        payload[0] = control::PROBE;
+        session.encrypt(MessageType::Handshake, &payload).ok()
+    }
+
+    /// Process one inbound data-path packet.
+    fn on_data_packet(
+        &mut self,
+        pkt: &WirePacket,
+        from: SocketAddr,
+    ) -> Result<ManagerEvent, ManagerError> {
+        let Some(session) = self.session.as_ref() else {
+            // No session: the packet cannot be attributed to anything.  It is
+            // dropped without AEAD work (D24 lookup-first).
             return Ok(ManagerEvent::None);
         };
-        let sid = *hs.session_id();
-        match hs.on_timer() {
-            Ok(ClientEvent::Emit(packets)) => Ok(ManagerEvent::Send {
-                packets,
-                peer: self.cfg.server_addr,
-            }),
-            Ok(ClientEvent::Complete(outcome)) => {
-                self.establish(outcome)?;
-                Ok(ManagerEvent::None)
+        // B11: the sid is compared against the session's sid **before** the
+        // decrypt.  A packet for an unknown sid must cost no AEAD work —
+        // otherwise the previous session's cover traffic (195 pkt/s) would
+        // cost a full AEAD attempt each, forever.
+        let sid: [u8; SESSION_ID_LEN] = pkt.as_bytes()[1..1 + SESSION_ID_LEN]
+            .try_into()
+            .expect("fixed-size sid slice");
+        if sid != *session.session_id() {
+            return Ok(ManagerEvent::None);
+        }
+        let session = self.session.as_mut().expect("checked");
+        let result: DataResult = match session.decrypt(pkt) {
+            Ok(inner) => DataResult::Payload(inner),
+            Err(SessionError::RekeyRequired) => {
+                DataResult::SessionDead(CloseReason::NonceExhausted)
             }
-            Ok(ClientEvent::None) => Ok(ManagerEvent::None),
-            Err(HandshakeV2Error::Timeout) => {
-                self.hs = None;
-                self.hs_started = None;
-                Ok(ManagerEvent::Closed {
-                    sid,
-                    reason: CloseReason::HandshakeTimeout,
-                })
+            Err(SessionError::Codec(CodecError::Rejected)) => DataResult::Rejected,
+            Err(SessionError::Codec(CodecError::DecryptionFailed)) => DataResult::Failed,
+            Err(SessionError::Codec(CodecError::NonceExhausted { .. })) => {
+                DataResult::SessionDead(CloseReason::NonceExhausted)
             }
-            Err(e) => Err(ManagerError::Handshake(e)),
+            Err(SessionError::Codec(_)) => DataResult::Failed,
+            Err(e) => return Err(ManagerError::Session(e)),
+        };
+        match result {
+            DataResult::Payload(inner) => {
+                // D15: the first authenticated server packet opens the gate.
+                // A cover packet and an in-session control ack are
+                // authenticated server packets too, so they confirm as well.
+                self.ready = true;
+                // The peer answered: the liveness round counter resets.
+                self.rounds_unanswered = 0;
+                // §10 roaming: rebind only on an authenticated packet.
+                self.peer = from;
+                match inner.msg_type {
+                    MessageType::Data => Ok(ManagerEvent::AppData { sid, inner }),
+                    // Cover is consumed silently (it is not application data).
+                    MessageType::Close => {
+                        // The peer told us it is closing: no `Close` in reply
+                        // (it already knows), and the teardown is graceful.
+                        self.teardown(CloseReason::PeerClosed, Instant::now(), false);
+                        Ok(ManagerEvent::Closed {
+                            sid,
+                            reason: CloseReason::PeerClosed,
+                        })
+                    }
+                    // In-session control message: consumed internally, never
+                    // relayed, never charged.  The client is the *prober* in
+                    // this version, so an ack needs no answer and a probe is
+                    // ignored (no state change).
+                    MessageType::Handshake => Ok(ManagerEvent::None),
+                    _ => Ok(ManagerEvent::None),
+                }
+            }
+            DataResult::SessionDead(reason) => {
+                self.teardown(reason, Instant::now(), true);
+                Ok(ManagerEvent::Closed { sid, reason })
+            }
+            // The client has no per-source failure gate (it has exactly one
+            // peer), so both rejection classes are silent drops.
+            DataResult::Failed | DataResult::Rejected => Ok(ManagerEvent::None),
+            DataResult::Control(_) | DataResult::PeerClose => Ok(ManagerEvent::None),
         }
     }
 
-    /// Current retransmit delay, if a handshake is in flight (driver timer).
-    pub fn next_delay(&self) -> Option<Duration> {
-        self.hs.as_ref().map(|h| h.next_delay())
+    /// Handshake retransmit timer tick.
+    ///
+    /// Two regimes, one timer:
+    ///
+    /// * `Handshaking` — the machine retransmits the M1; when its budget is
+    ///   spent the attempt fails explicitly (`Closed{HandshakeTimeout}`).
+    /// * `Unconfirmed` — the manager retransmits the M3 (byte-identically)
+    ///   under the *retransmission policy*, never as a deadline.  When the
+    ///   budget is spent the retransmissions stop, but the session is kept:
+    ///   the confirmation deadline (D15) is the only deadline on this path.
+    pub fn on_timer(&mut self) -> Result<ManagerEvent, ManagerError> {
+        if self.hs.is_some() {
+            let peer = self.cfg.server_addr;
+            let sid = *self.hs.as_ref().expect("checked").session_id();
+            // The machine is borrowed only for the call; the borrow ends
+            // before the match, so the arms can take `&mut self`.
+            let event = {
+                let hs = self.hs.as_mut().expect("checked");
+                hs.on_timer()
+            };
+            return match event {
+                Ok(ClientEvent::Emit(packets)) => Ok(ManagerEvent::Send { packets, peer }),
+                Ok(ClientEvent::M3Sent { packets, outcome }) => {
+                    // Unreachable under the one-live-object invariant (the
+                    // machine is dropped the moment the M3 is emitted, so it
+                    // can never be in `M3Sent` here).  It is *handled* rather
+                    // than discarded: dropping the outcome would leave the
+                    // client without a session for the whole M3 budget.
+                    self.on_m3_sent(packets, outcome)
+                }
+                Ok(ClientEvent::None) => Ok(ManagerEvent::None),
+                Err(HandshakeV2Error::Timeout) => {
+                    // The M1 budget is spent: an explicit failure.
+                    self.hs = None;
+                    self.hs_started = None;
+                    self.rearm_requested = true;
+                    Ok(ManagerEvent::Closed {
+                        sid,
+                        reason: CloseReason::HandshakeTimeout,
+                    })
+                }
+                Err(e) => Err(ManagerError::Handshake(e)),
+            };
+        }
+        // Unconfirmed: retransmit the M3 (with a probe) while the budget
+        // lasts.
+        if self.session.is_none() || self.ready || self.m3_exhausted {
+            return Ok(ManagerEvent::None);
+        }
+        if self.m3_attempts >= self.cfg.m3_max_attempts {
+            // The budget is spent.  This is a *policy* boundary, not a
+            // deadline: the session stays prepared and the client keeps
+            // probing until the confirmation deadline fires.
+            self.m3_exhausted = true;
+            return Ok(ManagerEvent::None);
+        }
+        self.m3_attempts += 1;
+        let mut packets = self.m3_frags.clone();
+        if let Some(probe) = self.build_probe() {
+            packets.push(probe);
+        }
+        Ok(ManagerEvent::Send {
+            packets,
+            peer: self.cfg.server_addr,
+        })
     }
 
-    /// Timer tick: overall handshake deadline (F6), D15 liveness timeout,
-    /// D16 lifetime cap; drains queued `Closed` events.
+    /// Current retransmit delay, if a handshake or an M3 retransmission is
+    /// pending (driver timer).
+    pub fn next_delay(&self) -> Option<Duration> {
+        if let Some(hs) = &self.hs {
+            return Some(hs.next_delay());
+        }
+        if self.session.is_some() && !self.ready && !self.m3_exhausted {
+            return Some(self.m3_delay());
+        }
+        None
+    }
+
+    /// The M3 retransmission delay: the jittered backoff the machine would
+    /// have used.
+    fn m3_delay(&self) -> Duration {
+        crate::handshake_v2::backoff_delay(self.cfg.m1_retransmit_base, self.m3_attempts)
+    }
+
+    /// When the next **session slot** is due, if any.
+    ///
+    /// The session slot is the unit that keeps the observable packet rate
+    /// invariant: a queued application payload is flushed *through* the slot
+    /// (never as a burst) and a liveness probe *replaces* a cover packet
+    /// (never adds to it).
+    pub fn next_slot_delay(&self) -> Option<Duration> {
+        self.session.as_ref()?;
+        let now = Instant::now();
+        let pace = self
+            .last_slot_at
+            .map(|l| l + self.limits.slot_interval)
+            .unwrap_or(now);
+        let mut next: Option<Instant> = None;
+        if !self.out_queue.is_empty() {
+            next = Some(pace);
+        }
+        if let Some(probe) = self.next_probe_at {
+            let due = probe.max(pace);
+            next = Some(next.map_or(due, |n| n.min(due)));
+        }
+        next.map(|n| n.saturating_duration_since(now))
+    }
+
+    /// Take the next session-slot payload, if one is due.
+    ///
+    /// Priority: a buffered application payload first (so the application's
+    /// data is not starved by the heartbeat), then a due liveness probe.
+    /// Nothing else: the caller emits cover traffic in that case, so the
+    /// slot's packet rate is unchanged.
+    pub fn take_slot(&mut self, now: Instant) -> Option<ManagerEvent> {
+        self.session.as_ref()?;
+        // Pacing: at most one slot packet per `slot_interval`.
+        match self.last_slot_at {
+            Some(last) if now.duration_since(last) < self.limits.slot_interval => return None,
+            _ => {}
+        }
+        if let Some(ev) = self.take_queued_payload(now) {
+            self.last_slot_at = Some(now);
+            return Some(ev);
+        }
+        if let Some(ev) = self.take_probe(now) {
+            self.last_slot_at = Some(now);
+            return Some(ev);
+        }
+        None
+    }
+
+    /// Pop the oldest buffered application payload and encrypt it.
+    fn take_queued_payload(&mut self, now: Instant) -> Option<ManagerEvent> {
+        self.expire_queued(now);
+        let queued = self.out_queue.pop_front()?;
+        let mut padded = [0u8; PAYLOAD_LEN];
+        let n = queued.payload.len().min(PAYLOAD_LEN);
+        padded[..n].copy_from_slice(&queued.payload[..n]);
+        // A local failure here is a session fault (e.g. nonce exhaustion),
+        // which `send_encrypted` already turns into a `Closed` event.
+        match self.send_encrypted(MessageType::Data, &padded) {
+            Ok(ev) => Some(ev),
+            Err(ManagerError::Session(e)) => {
+                // Fail securely: the payload cannot be encrypted, so it is
+                // lost — but the session fault is surfaced, never swallowed.
+                warn!("outbound flush failed: {e}");
+                Some(ManagerEvent::None)
+            }
+            Err(e) => {
+                warn!("outbound flush failed: {e}");
+                Some(ManagerEvent::None)
+            }
+        }
+    }
+
+    /// Build a liveness probe if one is due.
+    fn take_probe(&mut self, now: Instant) -> Option<ManagerEvent> {
+        let due = self.next_probe_at?;
+        if now < due {
+            return None;
+        }
+        // The deadline is advanced **unconditionally**, before the probe is
+        // built: if the local session cannot encrypt (a session fault), the
+        // slot must not spin at the poll rate waiting for a probe that will
+        // never be built.
+        self.next_probe_at = Some(now + self.limits.liveness_probe_interval);
+        let packet = self.build_probe()?;
+        // Only a *confirmed* session counts liveness rounds: before the
+        // confirmation the single confirmation deadline governs.
+        if self.ready {
+            self.rounds_unanswered = self.rounds_unanswered.saturating_add(1);
+        }
+        let peer = self.peer;
+        Some(ManagerEvent::SendPacket { packet, peer })
+    }
+
+    /// Whether the **confirmation** deadline (D15) has elapsed.
+    ///
+    /// Pre-confirmation only: a confirmed session is governed by the
+    /// liveness rounds, not by this deadline.
+    fn confirm_deadline_passed(&self, now: Instant) -> bool {
+        if self.ready {
+            return false;
+        }
+        match self.prepared_at {
+            Some(prepared_at) => self
+                .limits
+                .confirm_timeout
+                .is_some_and(|t| now.duration_since(prepared_at) >= t),
+            None => false,
+        }
+    }
+
+    /// Timer tick: the handshake deadline (F6), the confirmation deadline
+    /// (D15), the post-confirmation liveness decision, the session lifetime
+    /// cap (D16), the outbound queue's TTL, and the queued `Close`
+    /// retransmissions.
     pub fn tick(&mut self, now: Instant) -> Vec<ManagerEvent> {
         let mut out = Vec::new();
 
+        // 1. The overall handshake deadline (F6).
         if self.hs.is_some() {
             let past_deadline = self
                 .limits
@@ -1043,6 +1840,7 @@ impl ClientSessionManager {
                 let sid = *self.hs.as_ref().expect("checked").session_id();
                 self.hs = None;
                 self.hs_started = None;
+                self.rearm_requested = true;
                 out.push(ManagerEvent::Closed {
                     sid,
                     reason: CloseReason::HandshakeTimeout,
@@ -1050,40 +1848,57 @@ impl ClientSessionManager {
             }
         }
 
-        if let Some(sid) = self.session_id() {
-            let not_confirmed = self.limits.liveness_timeout.is_some_and(|t| {
-                !self.ready
-                    && self
-                        .established_at
-                        .is_some_and(|e| now.duration_since(e) >= t)
-            });
-            if not_confirmed {
-                self.close_session_internal();
-                out.push(ManagerEvent::Closed {
-                    sid,
-                    reason: CloseReason::NotConfirmed,
-                });
-            } else {
-                let past_cap = self.limits.lifetime_cap.is_some_and(|t| {
-                    self.established_at
-                        .is_some_and(|e| now.duration_since(e) >= t)
-                });
-                if past_cap {
-                    self.close_session_internal();
-                    out.push(ManagerEvent::Closed {
-                        sid,
-                        reason: CloseReason::LifetimeCap,
-                    });
-                }
+        // 2. The lifetime cap (D16).  The clock starts when the M3 was
+        //    emitted, so the two endpoints' clocks differ by ≈1 RTT; the
+        //    `Close` message is what makes the semantics exact.
+        if let Some(prepared_at) = self.prepared_at {
+            let past_cap = self
+                .limits
+                .lifetime_cap
+                .is_some_and(|t| now.duration_since(prepared_at) >= t);
+            // The session is taken from the manager by `teardown`, so the
+            // identifier is read *before* the teardown.  A missing session is
+            // not a panic: an inconsistent local state must fail securely
+            // (skip the event), never abort the driver (AGENTS.md, "Invalid
+            // state -> do not guess").
+            if past_cap {
+                self.close_now(CloseReason::LifetimeCap, now, &mut out);
             }
         }
 
+        // 3. The confirmation deadline (D15) — the *only* deadline on the
+        //    unconfirmed path.
+        if self.confirm_deadline_passed(now) {
+            // The peer is told, so the server does not accumulate an
+            // orphan session for a client that never came up.
+            self.close_now(CloseReason::NotConfirmed, now, &mut out);
+        }
+
+        // 4. The post-confirmation liveness decision: N *consecutive*
+        //    unanswered rounds.  A single missed round is never fatal.
+        if self.ready && self.rounds_unanswered >= self.limits.liveness_rounds {
+            self.close_now(CloseReason::PeerUnresponsive, now, &mut out);
+        }
+
+        // 5. The outbound queue's per-entry TTL.
+        if self.expire_queued(now) > 0 {
+            out.push(ManagerEvent::OutboundDropped {
+                dropped: self.dropped_outbound,
+            });
+        }
+
         out.extend(self.pending_closed.drain(..));
+        out.extend(self.retransmit_closes(now));
         out
     }
 
     /// Encrypt application data into a `SendPacket` (zero-pads to the fixed
-    /// slot).  Not gated on `is_ready` — see module docs (D15 reading).
+    /// slot).  Not gated on `is_ready` — see the module docs (D15 reading).
+    ///
+    /// When no session exists yet the payload is **buffered** in the bounded
+    /// outbound queue instead of being silently dropped: the application
+    /// asked for it, and losing it with no signal was a data-loss bug
+    /// (D31 §7, B10).
     pub fn app_outbound(&mut self, payload: &[u8]) -> Result<ManagerEvent, ManagerError> {
         if payload.len() > PAYLOAD_LEN {
             return Err(ManagerError::Session(SessionError::Codec(
@@ -1096,7 +1911,58 @@ impl ClientSessionManager {
         }
         let mut padded = [0u8; PAYLOAD_LEN];
         padded[..payload.len()].copy_from_slice(payload);
+        if self.session.is_none() {
+            return self.enqueue(padded.to_vec());
+        }
         self.send_encrypted(MessageType::Data, &padded)
+    }
+
+    /// Buffer an application payload for a session that does not exist yet.
+    ///
+    /// Overflow policy: **drop-newest**.  The oldest request is the one the
+    /// application is still waiting for, so it is never the one discarded.
+    fn enqueue(&mut self, payload: Vec<u8>) -> Result<ManagerEvent, ManagerError> {
+        if self.out_queue.len() >= OUTBOUND_QUEUE_CAP {
+            self.dropped_outbound = self.dropped_outbound.saturating_add(1);
+            self.log_drop();
+            return Ok(ManagerEvent::OutboundDropped {
+                dropped: self.dropped_outbound,
+            });
+        }
+        self.out_queue.push_back(QueuedPayload {
+            payload,
+            queued_at: Instant::now(),
+        });
+        Ok(ManagerEvent::None)
+    }
+
+    /// Drop the buffered payloads whose TTL has elapsed; returns how many
+    /// were dropped.
+    fn expire_queued(&mut self, now: Instant) -> u64 {
+        let before = self.out_queue.len();
+        self.out_queue
+            .retain(|q| now.duration_since(q.queued_at) < OUTBOUND_QUEUE_TTL);
+        let dropped = (before - self.out_queue.len()) as u64;
+        if dropped > 0 {
+            self.dropped_outbound = self.dropped_outbound.saturating_add(dropped);
+            self.log_drop();
+        }
+        dropped
+    }
+
+    /// Log the drop counter, rate-limited: a stalled tunnel would otherwise
+    /// log once per dropped payload.
+    fn log_drop(&mut self) {
+        let now = Instant::now();
+        match self.last_drop_log {
+            Some(last) if now.duration_since(last) < Duration::from_secs(1) => return,
+            _ => {}
+        }
+        self.last_drop_log = Some(now);
+        warn!(
+            "outbound queue dropped application payloads (cumulative {})",
+            self.dropped_outbound
+        );
     }
 
     /// Encrypt a cover packet (Phase 7 shaper hook).
@@ -1107,7 +1973,7 @@ impl ClientSessionManager {
         match session.cover() {
             Ok(packet) => Ok(ManagerEvent::SendPacket { packet, peer }),
             Err(SessionError::RekeyRequired) => {
-                self.close_session_internal();
+                self.teardown(CloseReason::NonceExhausted, Instant::now(), true);
                 Ok(ManagerEvent::Closed {
                     sid,
                     reason: CloseReason::NonceExhausted,
@@ -1117,39 +1983,128 @@ impl ClientSessionManager {
         }
     }
 
-    /// App-driven close: emit a fire-and-forget `Close` packet (§8.4), drop
-    /// the session, and queue `Closed{UserClosed}` for the next tick.
+    /// App-driven close: emit an encrypted `Close` packet (§8.4), drop the
+    /// session, and queue `Closed{UserClosed}` for the next tick.
+    ///
+    /// The `Close` is retransmitted a bounded number of times: a
+    /// fire-and-forget `Close` over UDP can be lost, which would leave the
+    /// peer using a dead session.
     pub fn close(&mut self) -> Result<ManagerEvent, ManagerError> {
         let Some(sid) = self.session_id() else {
             return Ok(ManagerEvent::None);
         };
-        match self.send_encrypted(MessageType::Close, &[0u8; PAYLOAD_LEN]) {
-            Ok(ManagerEvent::SendPacket { packet, peer }) => {
-                self.close_session_internal();
-                self.pending_closed.push_back(ManagerEvent::Closed {
-                    sid,
-                    reason: CloseReason::UserClosed,
-                });
-                Ok(ManagerEvent::SendPacket { packet, peer })
+        let now = Instant::now();
+        let close = self.teardown(CloseReason::UserClosed, now, true);
+        self.pending_closed.push_back(ManagerEvent::Closed {
+            sid,
+            reason: CloseReason::UserClosed,
+        });
+        Ok(close.unwrap_or(ManagerEvent::None))
+    }
+
+    /// Tear the session down and report the closure to the driver.
+    ///
+    /// The identifier is read **before** the teardown, because the teardown
+    /// takes the session out of the manager.  An inconsistent local state (a
+    /// session that has already been torn down) is **not** a panic: the event
+    /// is skipped and the driver continues (fail securely — AGENTS.md, "Invalid
+    /// state -> do not guess").  A panic here would abort the driver and take
+    /// the whole tunnel down.
+    fn close_now(&mut self, reason: CloseReason, now: Instant, out: &mut Vec<ManagerEvent>) {
+        let Some(sid) = self.session_id() else {
+            return;
+        };
+        if let Some(ev) = self.teardown(reason, now, true) {
+            out.push(ev);
+        }
+        out.push(ManagerEvent::Closed { sid, reason });
+    }
+
+    /// Retire a session identifier: no later event may create a session for
+    /// it (B12).
+    ///
+    /// The set is bounded (`RETIRED_SID_CAP`), oldest-first, so a teardown
+    /// loop cannot grow it without limit.  The eviction is safe because a
+    /// retired sid can only be re-drawn after `SID_HISTORY_CAP` further
+    /// handshakes, and the bound is far larger than that window.
+    fn retire_sid(&mut self, sid: [u8; SESSION_ID_LEN]) {
+        if !self.retired_sids.insert(sid) {
+            return;
+        }
+        self.retired_order.push_back(sid);
+        while self.retired_order.len() > RETIRED_SID_CAP {
+            if let Some(old) = self.retired_order.pop_front() {
+                self.retired_sids.remove(&old);
             }
-            // send_encrypted already removed the session (NonceExhausted).
-            other => other,
         }
     }
 
-    fn establish(&mut self, outcome: HandshakeOutcome) -> Result<(), ManagerError> {
-        let session = WireSession::established(Role::Client, &outcome)?;
-        self.hs = None;
-        self.hs_started = None;
-        self.session = Some(session);
+    /// Tear the session down.
+    ///
+    /// The session is dropped (its keys zeroized on drop, D14) and its sid is
+    /// retired: no later event may create a session for it (B12).  When
+    /// `send_close` is set, an encrypted `Close` is emitted and its
+    /// retransmissions are scheduled — the `Close` is the convergence
+    /// mechanism for a teardown, so the peer is never left with a session it
+    /// believes is alive (B7).
+    fn teardown(
+        &mut self,
+        _reason: CloseReason,
+        now: Instant,
+        send_close: bool,
+    ) -> Option<ManagerEvent> {
+        let mut session = self.session.take()?;
+        let sid = *session.session_id();
         self.ready = false;
-        self.established_at = Some(Instant::now());
-        Ok(())
+        self.prepared_at = None;
+        self.m3_frags.clear();
+        self.m3_attempts = 0;
+        self.m3_exhausted = true;
+        self.next_probe_at = None;
+        self.rounds_unanswered = 0;
+        self.rearm_requested = true;
+        self.retire_sid(sid);
+        if !send_close {
+            return None;
+        }
+        let payload = [0u8; PAYLOAD_LEN];
+        let packet = session.encrypt(MessageType::Close, &payload).ok()?;
+        let peer = self.peer;
+        self.pending_closes.push(PendingClose {
+            session,
+            peer,
+            attempts_left: CLOSE_RETRANSMIT_TOTAL - 1,
+            next_at: now + CLOSE_RETRANSMIT_BASE,
+        });
+        Some(ManagerEvent::SendPacket { packet, peer })
     }
 
-    fn close_session_internal(&mut self) {
-        self.session = None;
-        self.ready = false;
+    /// Retransmit the pending `Close` packets whose backoff has elapsed.
+    fn retransmit_closes(&mut self, now: Instant) -> Vec<ManagerEvent> {
+        let mut out = Vec::new();
+        let payload = [0u8; PAYLOAD_LEN];
+        for pc in self.pending_closes.iter_mut() {
+            if pc.attempts_left == 0 || now < pc.next_at {
+                continue;
+            }
+            pc.attempts_left -= 1;
+            pc.next_at = now + CLOSE_RETRANSMIT_BASE * 2;
+            match pc.session.encrypt(MessageType::Close, &payload) {
+                Ok(packet) => out.push(ManagerEvent::SendPacket {
+                    packet,
+                    peer: pc.peer,
+                }),
+                Err(_) => {
+                    // The session can no longer encrypt: stop retrying.
+                    pc.attempts_left = 0;
+                }
+            }
+        }
+        // Drop the sessions whose retransmission budget is spent.  The drop
+        // zeroizes the session keys (D14).
+        self.pending_closes
+            .retain(|pc| pc.attempts_left > 0 && now < pc.next_at);
+        out
     }
 
     fn send_encrypted(
@@ -1157,17 +2112,15 @@ impl ClientSessionManager {
         msg_type: MessageType,
         payload: &[u8],
     ) -> Result<ManagerEvent, ManagerError> {
-        let sid = *self
-            .session
-            .as_ref()
-            .ok_or(ManagerError::NoSession)?
-            .session_id();
-        let session = self.session.as_mut().expect("checked");
+        let Some(session) = self.session.as_mut() else {
+            return Err(ManagerError::NoSession);
+        };
+        let sid = *session.session_id();
         let peer = self.peer;
         match session.encrypt(msg_type, payload) {
             Ok(packet) => Ok(ManagerEvent::SendPacket { packet, peer }),
             Err(SessionError::RekeyRequired) => {
-                self.close_session_internal();
+                self.teardown(CloseReason::NonceExhausted, Instant::now(), true);
                 Ok(ManagerEvent::Closed {
                     sid,
                     reason: CloseReason::NonceExhausted,
@@ -1256,6 +2209,7 @@ pub async fn run_server_manager<T: HandshakeTransport>(
                             .map_err(|_| ManagerError::AppClosed)?;
                     }
                     ManagerEvent::None => {}
+                    ManagerEvent::OutboundDropped { .. } => {}
                     }
                 },
             },
@@ -1287,11 +2241,17 @@ pub async fn run_server_manager<T: HandshakeTransport>(
             },
             _ = ticker.tick() => {
                 for ev in manager.tick(Instant::now()) {
-                    if let ManagerEvent::Closed { sid, reason } = ev {
-                        app_tx
-                            .send(ManagerNotification::Closed { sid, reason })
-                            .await
-                            .map_err(|_| ManagerError::AppClosed)?;
+                    match ev {
+                        ManagerEvent::SendPacket { packet, peer } => {
+                            transport.send_to(&packet, peer).await?;
+                        }
+                        ManagerEvent::Closed { sid, reason } => {
+                            app_tx
+                                .send(ManagerNotification::Closed { sid, reason })
+                                .await
+                                .map_err(|_| ManagerError::AppClosed)?;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1347,6 +2307,10 @@ pub async fn run_client_manager<T: HandshakeTransport>(
     let mut cover_sched = CoverScheduler::new(cover);
     let cover_arm = cover_sleep(&cover_sched);
     tokio::pin!(cover_arm);
+    // The session-slot arm carries the liveness probe and the outbound queue
+    // flush while the cover schedule is not running (D31 §5).
+    let slot_arm = client_slot_timer(manager, false);
+    tokio::pin!(slot_arm);
     // The handshake retransmit timer is created ONCE and advanced only when it
     // fires (or the manager re-arms after a Close). Recomputing it from
     // `next_delay()` on *every* iteration lets continuous application data
@@ -1366,6 +2330,15 @@ pub async fn run_client_manager<T: HandshakeTransport>(
             was_ready = true;
             cover_sched.start(Instant::now());
             cover_arm.set(cover_sleep(&cover_sched));
+            // If the cover schedule is running, the cover arm owns the
+            // session slot: the slot arm goes inert so a liveness probe
+            // *replaces* a cover packet instead of adding to the observable
+            // grid.  With cover disabled the cover arm never fires, so the
+            // slot arm must stay live — otherwise the probe would stop.
+            slot_arm.set(client_slot_timer(
+                manager,
+                cover_sched.next_deadline().is_some(),
+            ));
             if let Some(sid) = manager.session_id() {
                 app_tx
                     .send(ManagerNotification::Ready { sid })
@@ -1394,6 +2367,14 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                 Err(e) => return Err(ManagerError::Handshake(e)),
                 Ok((pkt, from)) => {
                     reset_noticed = false;
+                    // The M1 retransmit deadline is stale the moment the M3
+                    // is emitted, so the M3 schedule must be re-based on the
+                    // transition.  It is re-armed **once**, at the
+                    // transition — never on every datagram, or a busy peer
+                    // would postpone the M3 retransmit indefinitely (the
+                    // same defect class the pinned M1 timer exists to
+                    // avoid).
+                    let was_unconfirmed = manager.state() == ClientManagerState::Unconfirmed;
                     match manager.handle_datagram(&pkt, from)? {
                     ManagerEvent::Send { packets, peer } => {
                         for p in &packets {
@@ -1412,6 +2393,8 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                     ManagerEvent::Closed { sid, reason } => {
                         was_ready = false;
                         cover_sched.stop();
+                        cover_arm.set(cover_sleep(&cover_sched));
+                        slot_arm.set(client_slot_timer(manager, false));
                         app_tx
                             .send(ManagerNotification::Closed { sid, reason })
                             .await
@@ -1420,7 +2403,22 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                         retransmit.set(client_retransmit_timer(manager));
                     }
                     ManagerEvent::Established { .. } | ManagerEvent::None => {}
+                    ManagerEvent::OutboundDropped { .. } => {}
                     }
+                    // The M3 was just emitted: the M1 retransmit deadline is
+                    // stale, so the M3 schedule is re-based on *now*.  The
+                    // timer is re-armed **once**, at the transition — never on
+                    // every datagram, or a busy peer would postpone the M3
+                    // retransmit indefinitely (the defect class the pinned
+                    // M1 timer exists to avoid).
+                    if !was_unconfirmed && manager.state() == ClientManagerState::Unconfirmed {
+                        retransmit.set(client_retransmit_timer(manager));
+                    }
+                    // The session may have just been prepared (the M3 was
+                    // emitted): re-arm the session-slot arm so the periodic
+                    // liveness probe starts flowing.  The delay is recomputed
+                    // from the current time, so this cannot starve the arm.
+                    slot_arm.set(client_slot_timer(manager, cover_sched.next_deadline().is_some()));
                 },
             },
             cmd = app_rx.recv() => {
@@ -1432,6 +2430,8 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                             Ok(ManagerEvent::Closed { sid, reason }) => {
                                 was_ready = false;
                                 cover_sched.stop();
+                                cover_arm.set(cover_sleep(&cover_sched));
+                                slot_arm.set(client_slot_timer(manager, false));
                                 app_tx
                                     .send(ManagerNotification::Closed { sid, reason })
                                     .await
@@ -1439,18 +2439,37 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                                 rearm_client(transport, manager).await?;
                                 retransmit.set(client_retransmit_timer(manager));
                             }
+                            // The payload was buffered (no session yet) or
+                            // was dropped by the bounded queue: the
+                            // application is told, so the data is never lost
+                            // silently (D31 §7, B10).
+                            Ok(ManagerEvent::OutboundDropped { dropped }) => {
+                                app_tx
+                                    .send(ManagerNotification::OutboundDropped { dropped })
+                                    .await
+                                    .map_err(|_| ManagerError::AppClosed)?;
+                            }
+                        Ok(_) => {
+                            // The payload may have been buffered: re-arm the
+                            // session-slot arm so the flush starts flowing.
+                            slot_arm.set(client_slot_timer(
+                                manager,
+                                cover_sched.next_deadline().is_some(),
+                            ));
+                        }
                             // Local condition only (app pushed data while the client
+
                             // is Handshaking / re-establishing). Do not tear down the
                             // tunnel; the app can retry once Ready arrives.
                             Err(ManagerError::NoSession) => {}
-                            // Oversized app payload: benign local over-send into the
-                            // fixed payload slot; drop silently (tunnel stays up).
-                            Err(ManagerError::Session(SessionError::Codec(
-                                CodecError::WrongLength { .. },
-                            ))) => {}
-                            Err(e) => return Err(e),
-                            _ => {}
-                        },
+                        // Oversized app payload: benign local over-send into the
+                        // fixed payload slot; drop silently (tunnel stays up).
+                        Err(ManagerError::Session(SessionError::Codec(
+                            CodecError::WrongLength { .. },
+                        ))) => {}
+                        Err(e) => return Err(e),
+                    },
+
                     None => return Ok(()),
                 }
             },
@@ -1464,6 +2483,8 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                 ManagerEvent::Closed { sid, reason } => {
                     was_ready = false;
                     cover_sched.stop();
+                    cover_arm.set(cover_sleep(&cover_sched));
+                    slot_arm.set(client_slot_timer(manager, false));
                     app_tx
                         .send(ManagerNotification::Closed { sid, reason })
                         .await
@@ -1475,27 +2496,15 @@ pub async fn run_client_manager<T: HandshakeTransport>(
             },
             _ = ticker.tick() => {
                 for ev in manager.tick(Instant::now()) {
-                    if let ManagerEvent::Closed { sid, reason } = ev {
-                        was_ready = false;
-                        cover_sched.stop();
-                        app_tx
-                            .send(ManagerNotification::Closed { sid, reason })
-                            .await
-                            .map_err(|_| ManagerError::AppClosed)?;
-                        rearm_client(transport, manager).await?;
-                        retransmit.set(client_retransmit_timer(manager));
-                    }
-                }
-            }
-            _ = &mut cover_arm => {
-                if cover_sched.on_deadline(Instant::now()) {
-                    match manager.cover_packet() {
-                        Ok(ManagerEvent::SendPacket { packet, peer }) => {
+                    match ev {
+                        ManagerEvent::SendPacket { packet, peer } => {
                             transport.send_to(&packet, peer).await?;
                         }
-                        Ok(ManagerEvent::Closed { sid, reason }) => {
+                        ManagerEvent::Closed { sid, reason } => {
                             was_ready = false;
                             cover_sched.stop();
+                            cover_arm.set(cover_sleep(&cover_sched));
+                            slot_arm.set(client_slot_timer(manager, false));
                             app_tx
                                 .send(ManagerNotification::Closed { sid, reason })
                                 .await
@@ -1503,18 +2512,103 @@ pub async fn run_client_manager<T: HandshakeTransport>(
                             rearm_client(transport, manager).await?;
                             retransmit.set(client_retransmit_timer(manager));
                         }
-                        // Session not (yet) established: never churn over it.
-                        Err(ManagerError::NoSession) => {}
-                        // A cover emission is real encrypted traffic: any other
-                        // fault is a session fault and must surface (fail-secure).
-                        Err(e) => return Err(e),
+                        ManagerEvent::OutboundDropped { dropped } => {
+                            app_tx
+                                .send(ManagerNotification::OutboundDropped { dropped })
+                                .await
+                                .map_err(|_| ManagerError::AppClosed)?;
+                        }
+                        _ => {}
+                    }
+                }
+                // Backstop: a teardown that left the manager idle (a failed
+                // re-arm, say) must not leave the tunnel down forever
+                // (D31 §2, B13).
+                if manager.needs_rearm() {
+                    rearm_client(transport, manager).await?;
+                    retransmit.set(client_retransmit_timer(manager));
+                }
+            }
+            _ = &mut slot_arm => {
+                // The cover schedule is not running: this arm owns the
+                // session slot, so the liveness probe and the outbound queue
+                // flush still flow.
+                // NB: the body uses a match, never an if-let: tokio's select
+                // macro parses an if at the top of an arm as its
+                // precondition clause, so an if-let inside an arm body is a
+                // macro syntax error.
+                match manager.take_slot(Instant::now()) {
+                    Some(ManagerEvent::SendPacket { packet, peer }) => {
+                        transport.send_to(&packet, peer).await?;
+                    }
+                    Some(ManagerEvent::Closed { sid, reason }) => {
+                        was_ready = false;
+                        cover_sched.stop();
+                        cover_arm.set(cover_sleep(&cover_sched));
+                        slot_arm.set(client_slot_timer(manager, false));
+                        app_tx
+                            .send(ManagerNotification::Closed { sid, reason })
+                            .await
+                            .map_err(|_| ManagerError::AppClosed)?;
+                        rearm_client(transport, manager).await?;
+                        retransmit.set(client_retransmit_timer(manager));
+                    }
+                    _ => {}
+                }
+                slot_arm.set(client_slot_timer(manager, cover_sched.next_deadline().is_some()));
+            }
+            _ = &mut cover_arm => {
+                if cover_sched.on_deadline(Instant::now()) {
+                    // One packet per slot: a buffered application payload or
+                    // a due liveness probe *replaces* this cover packet, so
+                    // the observable grid rate is unchanged (D19/D22).
+                    let ev = match manager.take_slot(Instant::now()) {
+                        Some(ev) => Some(ev),
+                        None => match manager.cover_packet() {
+                            Ok(ev) => Some(ev),
+                            // Session not (yet) established: never churn over it.
+                            Err(ManagerError::NoSession) => None,
+                            // A cover emission is real encrypted traffic: any other
+                            // fault is a session fault and must surface (fail-secure).
+                            Err(e) => return Err(e),
+                        },
+                    };
+                    match ev {
+                        Some(ManagerEvent::SendPacket { packet, peer }) => {
+                            transport.send_to(&packet, peer).await?;
+                        }
+                        Some(ManagerEvent::Closed { sid, reason }) => {
+                            was_ready = false;
+                            cover_sched.stop();
+                            cover_arm.set(cover_sleep(&cover_sched));
+                            slot_arm.set(client_slot_timer(manager, false));
+                            app_tx
+                                .send(ManagerNotification::Closed { sid, reason })
+                                .await
+                                .map_err(|_| ManagerError::AppClosed)?;
+                            rearm_client(transport, manager).await?;
+                            retransmit.set(client_retransmit_timer(manager));
+                        }
                         _ => {}
                     }
                 }
                 cover_arm.set(cover_sleep(&cover_sched));
-            }
+            },
         }
     }
+}
+
+/// The session-slot arm: when the cover schedule owns the slot (cover
+/// enabled and the session confirmed), this arm is inert so a liveness probe
+/// *replaces* a cover packet instead of adding to the observable grid.
+fn client_slot_timer(manager: &ClientSessionManager, cover_owns_slot: bool) -> tokio::time::Sleep {
+    if cover_owns_slot {
+        return tokio::time::sleep(Duration::MAX);
+    }
+    manager
+        .next_slot_delay()
+        .map(tokio::time::sleep)
+        .unwrap_or_else(|| tokio::time::sleep(Duration::MAX))
 }
 
 /// The handshake retransmit timer, computed once per phase — NOT refreshed on
@@ -1685,13 +2779,34 @@ mod cover_clock {
 }
 
 /// Re-establish: start a fresh handshake (fresh sid, D16) after a close.
+///
+/// A failed re-arm is **never** fatal to the tunnel: the manager's own
+/// `needs_rearm()` backstop retries on the next tick, so a transient
+/// refusal cannot leave the tunnel down (D31 §2, B13).  The old code
+/// propagated the error with `?`, which made the whole client process exit
+/// and the tunnel stay down.
 async fn rearm_client<T: HandshakeTransport>(
     transport: &mut T,
     manager: &mut ClientSessionManager,
 ) -> Result<(), ManagerError> {
-    if let ManagerEvent::Send { packets, peer } = manager.begin_handshake()? {
-        for p in &packets {
-            transport.send_to(p, peer).await?;
+    match manager.begin_handshake() {
+        Ok(ManagerEvent::Send { packets, peer }) => {
+            for p in &packets {
+                transport.send_to(p, peer).await?;
+            }
+        }
+        Ok(_) => {}
+        Err(ManagerError::InvalidState(_)) => {
+            // The manager still holds a handshake or a session: the re-arm
+            // is not needed yet.  The tick backstop will try again.
+        }
+        Err(e) => {
+            // The re-arm failed for any other reason (a local CSPRNG fault,
+            // for instance).  It must **never** kill the driver: the tunnel
+            // staying up with a retrying handshake is strictly better than
+            // the process exiting and the tunnel going down (B13).  The
+            // `needs_rearm()` backstop retries on the next tick.
+            warn!("client re-arm failed, will retry on the next tick: {e}");
         }
     }
     Ok(())
@@ -1726,6 +2841,22 @@ mod tests {
         }
     }
 
+    /// The `Closed` events in a tick result.
+    ///
+    /// A tick may also carry `SendPacket` events: when a session is evicted
+    /// (lifetime cap, idle timeout) the endpoint sends an encrypted `Close`
+    /// to the peer **before** dropping the session, so the peer converges
+    /// without relying on synchronised clocks (D31 §6, B7).
+    fn closed_events(events: &[ManagerEvent]) -> Vec<([u8; SESSION_ID_LEN], CloseReason)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ManagerEvent::Closed { sid, reason } => Some((*sid, *reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// One identity pair shared by every test: the server manager's roster
     /// must contain the client key used in each test's handshake.
     fn shared_configs() -> (ClientConfig, ServerConfig) {
@@ -1740,17 +2871,16 @@ mod tests {
     }
 
     /// Drive the client machine to completion; returns its session + outcome.
+    ///
+    /// The client machine's success signal is the M3 emission: the derived
+    /// outcome is available from the machine once the M3 was sent (D31 §2).
     fn client_established(
         client: &mut ClientHandshake,
-        cc: &ClientConfig,
+        _cc: &ClientConfig,
     ) -> (WireSession, HandshakeOutcome) {
-        for _ in 0..=cc.m3_max_attempts {
-            if let ClientEvent::Complete(out) = client.on_timer().expect("cli") {
-                let ws = WireSession::established(Role::Client, &out).expect("ws");
-                return (ws, out);
-            }
-        }
-        panic!("client machine never completed");
+        let out = client.outcome().expect("the M3 was emitted").clone();
+        let ws = WireSession::established(Role::Client, &out).expect("ws");
+        (ws, out)
     }
 
     /// Run a full exchange through the server manager: returns the client
@@ -1774,7 +2904,7 @@ mod tests {
         assert_eq!(m2.len(), M2_FRAG_COUNT as usize, "full M2 emitted");
         let mut m3 = Vec::new();
         for f in &m2 {
-            if let ClientEvent::Emit(packets) = client.handle_datagram(f).expect("cli") {
+            if let ClientEvent::M3Sent { packets, .. } = client.handle_datagram(f).expect("cli") {
                 m3 = packets;
             }
         }
@@ -1995,7 +3125,7 @@ mod tests {
         }
         let mut m3 = Vec::new();
         for f in &m2 {
-            if let ClientEvent::Emit(packets) = attacker.handle_datagram(f).expect("cli") {
+            if let ClientEvent::M3Sent { packets, .. } = attacker.handle_datagram(f).expect("cli") {
                 m3 = packets;
             }
         }
@@ -2075,16 +3205,18 @@ mod tests {
         );
         assert_eq!(manager.session_count(), 1);
 
-        // Idle past the timeout evicts.
+        // Idle past the timeout evicts (and tells the peer with a `Close`).
         let events = manager.tick(Instant::now() + Duration::from_secs(2 * 3600));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ManagerEvent::Closed { sid, reason } => {
-                assert_eq!(*sid, SID);
-                assert_eq!(*reason, CloseReason::IdleTimeout);
-            }
-            other => panic!("expected Closed{{IdleTimeout}}, got {other:?}"),
-        }
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].0, SID);
+        assert_eq!(closes[0].1, CloseReason::IdleTimeout);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ManagerEvent::SendPacket { .. })),
+            "the eviction must tell the peer with an encrypted Close (D31 §6)"
+        );
         assert_eq!(manager.session_count(), 0);
     }
 
@@ -2098,13 +3230,9 @@ mod tests {
         established_client_session(&mut manager, &cc, SID);
 
         let events = manager.tick(Instant::now() + Duration::from_secs(90 * 60));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ManagerEvent::Closed { reason, .. } => {
-                assert_eq!(*reason, CloseReason::LifetimeCap);
-            }
-            other => panic!("expected Closed{{LifetimeCap}}, got {other:?}"),
-        }
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].1, CloseReason::LifetimeCap);
         assert_eq!(manager.session_count(), 0);
     }
 
@@ -2206,13 +3334,22 @@ mod tests {
         let mut manager = server_manager(SessionLimits::default());
         established_client_session(&mut manager, &cc, SID);
 
+        // D31 §6 (B7): the app-driven close tells the peer with an encrypted
+        // `Close` before the session disappears, so the peer does not keep
+        // using a dead session until its idle timeout.
         match manager.close_session(&SID).unwrap() {
-            ManagerEvent::Closed { sid, reason } => {
-                assert_eq!(sid, SID);
-                assert_eq!(reason, CloseReason::UserClosed);
+            ManagerEvent::SendPacket { packet, peer } => {
+                assert_eq!(peer, CLIENT_ADDR);
+                assert_eq!(packet.parse_header().unwrap().session_id, SID);
             }
-            other => panic!("expected Closed{{UserClosed}}, got {other:?}"),
+            other => panic!("expected SendPacket(Close), got {other:?}"),
         }
+        // The `Closed{UserClosed}` notification is queued for the next tick
+        // (single-event invariant).
+        let closes = closed_events(&manager.tick(Instant::now()));
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].0, SID);
+        assert_eq!(closes[0].1, CloseReason::UserClosed);
         assert_eq!(manager.session_count(), 0);
     }
 
@@ -2312,14 +3449,22 @@ mod tests {
             }
         }
         assert_eq!(m2.len(), M2_FRAG_COUNT as usize);
-        let mut m3 = Vec::new();
+        let mut burst = Vec::new();
         for f in &m2 {
             if let ManagerEvent::Send { packets, .. } =
                 manager.handle_datagram(f, from).expect("cli")
             {
-                m3 = packets;
+                burst = packets;
             }
         }
+        // The M3 burst carries the M3 fragment *and* the in-session liveness
+        // probe (D31 §5): only the handshake fragment goes to the server
+        // machine.
+        let m3: Vec<WirePacket> = burst
+            .iter()
+            .filter(|p| is_handshake_fragment(p))
+            .cloned()
+            .collect();
         assert_eq!(m3.len(), M3_FRAG_COUNT as usize);
         let mut outcome = None;
         for f in &m3 {
@@ -2328,28 +3473,14 @@ mod tests {
             }
         }
         let outcome = outcome.expect("server completes at M3");
-        // The client reaches Established via its retransmit timer once the M3
-        // budget is exhausted (1 RTT; the server has the same keys by then).
-        let budget = {
-            let (cc, _sc) = shared_configs();
-            cc.m3_max_attempts
-        };
-        for _ in 0..=budget {
-            if matches!(manager.state(), ClientManagerState::Established) {
-                break;
-            }
-            match manager.on_timer().expect("cli") {
-                ManagerEvent::Send { packets, .. } => {
-                    let _ = packets; // M3 retransmits: ignored by the test
-                }
-                ManagerEvent::None => {}
-                other => panic!("unexpected {other:?} while advancing the timer"),
-            }
-        }
-        assert!(matches!(manager.state(), ClientManagerState::Established));
+        // The client is `Unconfirmed`: the M3 was emitted, so the session
+        // exists and the peer is *authenticated* (its signature over TH2 was
+        // verified), but the key agreement is not yet confirmed — no
+        // authenticated server packet has decrypted yet (D15).
+        assert!(matches!(manager.state(), ClientManagerState::Unconfirmed));
         assert!(
             !manager.is_ready(),
-            "D15: gate closed until first server packet"
+            "D15: gate closed until the first authenticated server packet"
         );
         (
             WireSession::established(Role::Server, &outcome).expect("srv session"),
@@ -2437,14 +3568,17 @@ mod tests {
 
         // No authenticated server packet ever arrives (mis-keyed / dead).
         let events = manager.tick(Instant::now() + Duration::from_secs(31));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            ManagerEvent::Closed { sid: cs, reason } => {
-                assert_eq!(*cs, sid);
-                assert_eq!(*reason, CloseReason::NotConfirmed);
-            }
-            other => panic!("expected Closed{{NotConfirmed}}, got {other:?}"),
-        }
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        let (cs, reason) = closes[0];
+        assert_eq!(cs, sid);
+        assert_eq!(reason, CloseReason::NotConfirmed);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ManagerEvent::SendPacket { .. })),
+            "the teardown must tell the peer with an encrypted Close (D31 §6)"
+        );
         assert!(matches!(manager.state(), ClientManagerState::Idle));
         assert!(!manager.is_ready());
 
@@ -2697,7 +3831,7 @@ mod tests {
             manager.handle_datagram(&forged, SERVER_ADDR).unwrap(),
             ManagerEvent::None
         ));
-        assert!(matches!(manager.state(), ClientManagerState::Established));
+        assert!(matches!(manager.state(), ClientManagerState::Unconfirmed));
         let _ = sid;
     }
 
@@ -2761,7 +3895,8 @@ mod tests {
         for _ in 0..M2_FRAG_COUNT {
             let (pkt, from) = client_t.recv().await.unwrap();
             assert_eq!(from, SERVER_ADDR);
-            if let ClientEvent::Emit(pkts) = client.handle_datagram(&pkt).unwrap() {
+            if let ClientEvent::M3Sent { packets: pkts, .. } = client.handle_datagram(&pkt).unwrap()
+            {
                 m3 = pkts;
             }
         }
@@ -2866,11 +4001,18 @@ mod tests {
             other => panic!("expected Ready, got {other:?}"),
         }
 
-        // App data client → server.
+        // App data client → server.  The client also emits liveness probes
+        // and M3 retransmissions, so skip everything that is not
+        // application data (D31 §5).
         data_tx.send(vec![0x77; 64]).await.unwrap();
-        let (pkt, from) = server_t.recv().await.unwrap();
-        assert_eq!(from, CLIENT_ADDR);
-        let inner = srv_ws.decrypt(&pkt).unwrap();
+        let inner = loop {
+            let (pkt, from) = server_t.recv().await.unwrap();
+            assert_eq!(from, CLIENT_ADDR);
+            match srv_ws.decrypt(&pkt) {
+                Ok(inner) if inner.msg_type == MessageType::Data => break inner,
+                _ => {}
+            }
+        };
         assert_eq!(&inner.payload[..64], &[0x77; 64][..]);
 
         // Server → client data reaches the app channel.
@@ -3013,7 +4155,7 @@ mod tests {
         // the helper advances the client machine's timer to Complete).
         let (_ws, outcome) = client_handshake_with_server(&mut manager, &mut server, CLIENT_ADDR);
         let old_sid = manager.session_id().expect("established");
-        assert_eq!(manager.state(), ClientManagerState::Established);
+        assert_eq!(manager.state(), ClientManagerState::Unconfirmed);
         assert!(!manager.is_ready()); // D15: no server packet seen yet
 
         // Forge a server→client packet at the nonce-exhaustion threshold, built
@@ -3066,7 +4208,7 @@ mod tests {
         }
         // No state change.
         assert_eq!(manager.session_id(), Some(sid));
-        assert_eq!(manager.state(), ClientManagerState::Established);
+        assert_eq!(manager.state(), ClientManagerState::Unconfirmed);
         assert!(!manager.is_ready());
         let _ = fresh; // keep the client machine around (exercise drop zeroization path)
     }
@@ -3340,7 +4482,9 @@ mod tests {
             assert_eq!(m2.len(), M2_FRAG_COUNT as usize, "full M2 emitted");
             let mut m3 = Vec::new();
             for f in &m2 {
-                if let ClientEvent::Emit(pkts) = client.handle_datagram(f).unwrap() {
+                if let ClientEvent::M3Sent { packets: pkts, .. } =
+                    client.handle_datagram(f).unwrap()
+                {
                     m3 = pkts;
                 }
             }
@@ -3475,7 +4619,7 @@ mod tests {
                 client_handshake_with_server(&mut manager, &mut server, CLIENT_ADDR);
             assert_eq!(
                 manager.state(),
-                ClientManagerState::Established,
+                ClientManagerState::Unconfirmed,
                 "cycle {i}"
             );
             assert!(
@@ -3508,7 +4652,7 @@ mod tests {
         }
         // Fresh handshake after the soak must still succeed (Phase 7 recovery gate).
         let (_ws, _outcome) = client_handshake_with_server(&mut manager, &mut server, CLIENT_ADDR);
-        assert_eq!(manager.state(), ClientManagerState::Established);
+        assert_eq!(manager.state(), ClientManagerState::Unconfirmed);
     }
 
     // -----------------------------------------------------------------------
@@ -3800,7 +4944,7 @@ mod tests {
             // M2: reverse + duplicate, then M3.
             let mut seen_m3 = Vec::new();
             for &idx in [4usize, 3, 2, 1, 0, 2].iter().take(seen_m2.len()) {
-                if let ClientEvent::Emit(packets) =
+                if let ClientEvent::M3Sent { packets, .. } =
                     client.handle_datagram(&seen_m2[idx]).expect("m2")
                 {
                     seen_m3 = packets;
@@ -3844,7 +4988,7 @@ mod tests {
         let mut cm = client_manager();
         let mut server = server_machine();
         let (_ws, _outcome) = client_handshake_with_server(&mut cm, &mut server, CLIENT_ADDR);
-        assert_eq!(cm.state(), ClientManagerState::Established);
+        assert_eq!(cm.state(), ClientManagerState::Unconfirmed);
 
         let big: Vec<u8> = vec![0u8; PAYLOAD_LEN + 1];
         let res = cm.app_outbound(&big);
@@ -3858,7 +5002,7 @@ mod tests {
         );
         assert_eq!(
             cm.state(),
-            ClientManagerState::Established,
+            ClientManagerState::Unconfirmed,
             "client session survives oversized send"
         );
         assert!(cm.session_id().is_some(), "client sid survives");
@@ -4217,10 +5361,10 @@ mod tests {
         // +15s real (idle since +9s activity; strictly between the 10s idle
         // timeout and the 20s lifetime cap) → idle timeout fires.
         let evs = manager.tick(t0 + Duration::from_secs(15));
-        assert_eq!(evs.len(), 1, "idle timeout must fire once at +15s");
-        assert!(
-            matches!(&evs[0], ManagerEvent::Closed { sid, reason: CloseReason::IdleTimeout } if *sid == SID)
-        );
+        let closes = closed_events(&evs);
+        assert_eq!(closes.len(), 1, "idle timeout must fire once at +15s");
+        assert_eq!(closes[0].0, SID);
+        assert_eq!(closes[0].1, CloseReason::IdleTimeout);
         assert_eq!(manager.session_count(), 0);
 
         // lifetime precedence: a session that lives to lifetime_cap is evicted with
@@ -5195,7 +6339,8 @@ mod tests {
         for _ in 0..M2_FRAG_COUNT {
             let (pkt, from) = client_t.recv().await.unwrap();
             assert_eq!(from, SERVER_ADDR);
-            if let ClientEvent::Emit(pkts) = client.handle_datagram(&pkt).unwrap() {
+            if let ClientEvent::M3Sent { packets: pkts, .. } = client.handle_datagram(&pkt).unwrap()
+            {
                 m3 = pkts;
             }
         }
@@ -5377,9 +6522,19 @@ mod tests {
         let (second_sid, _outcome2, mut srv_ws2) = {
             let mut server = ServerHandshake::new(&sc);
             let mut m2 = Vec::new();
-            for _ in 0..M1_FRAG_COUNT {
+            // The client emits its `Close` (and the close retransmissions)
+            // and its M3 retransmissions before it re-arms, so skip
+            // everything that is not an M1 fragment (D31 §6).
+            let mut m1_seen = 0u8;
+            while m1_seen < M1_FRAG_COUNT {
                 let (pkt, from) = server_t.recv().await.unwrap();
                 assert_eq!(from, CLIENT_ADDR);
+                if pkt.as_bytes()[crate::codec::VERSION_LEN + SESSION_ID_LEN]
+                    != crate::handshake_v2::HS_TYPE_CLIENT_HELLO
+                {
+                    continue;
+                }
+                m1_seen += 1;
                 if let ServerEvent::Emit(frags, peer) = server.handle_datagram(&pkt, from).unwrap()
                 {
                     assert_eq!(peer, CLIENT_ADDR);
@@ -5417,11 +6572,17 @@ mod tests {
             other => panic!("expected Ready (leg 2), got {other:?}"),
         }
 
-        // Application data continues, both directions.
+        // Application data continues, both directions.  Skip the liveness
+        // probes and the M3 retransmissions the client also emits.
         data_tx.send(vec![0x77; 64]).await.unwrap();
-        let (pkt, from) = server_t.recv().await.unwrap();
-        assert_eq!(from, CLIENT_ADDR);
-        let inner = srv_ws2.decrypt(&pkt).unwrap();
+        let inner = loop {
+            let (pkt, from) = server_t.recv().await.unwrap();
+            assert_eq!(from, CLIENT_ADDR);
+            match srv_ws2.decrypt(&pkt) {
+                Ok(inner) if inner.msg_type == MessageType::Data => break inner,
+                _ => {}
+            }
+        };
         assert_eq!(&inner.payload[..64], &[0x77; 64][..]);
 
         let reply = srv_ws2
@@ -5472,7 +6633,8 @@ mod tests {
         for _ in 0..M2_FRAG_COUNT {
             let (pkt, from) = client_t.recv().await.unwrap();
             assert_eq!(from, SERVER_ADDR);
-            if let ClientEvent::Emit(pkts) = client.handle_datagram(&pkt).unwrap() {
+            if let ClientEvent::M3Sent { packets: pkts, .. } = client.handle_datagram(&pkt).unwrap()
+            {
                 m3 = pkts;
             }
         }
@@ -5507,7 +6669,9 @@ mod tests {
         for _ in 0..M2_FRAG_COUNT {
             let (pkt, from) = client_t.recv().await.unwrap();
             assert_eq!(from, SERVER_ADDR);
-            if let ClientEvent::Emit(pkts) = client2.handle_datagram(&pkt).unwrap() {
+            if let ClientEvent::M3Sent { packets: pkts, .. } =
+                client2.handle_datagram(&pkt).unwrap()
+            {
                 m3 = pkts;
             }
         }
@@ -5571,5 +6735,820 @@ mod tests {
         tokio::pin!(arm);
         let fired = tokio::time::timeout(Duration::from_millis(60), &mut arm).await;
         assert!(fired.is_err(), "inert cover arm must not fire");
+    }
+
+    // -----------------------------------------------------------------------
+    // D31 — the client lifecycle, liveness and the lifetime cap
+    // -----------------------------------------------------------------------
+
+    /// A client manager and a server manager, wired through their public
+    /// APIs.  `ServerSessionManager` is the *real* peer: it answers the
+    /// in-session liveness probe with an ack, so the client's confirmation
+    /// path is genuinely exercised.
+    fn client_server_pair(limits: SessionLimits) -> (ClientSessionManager, ServerSessionManager) {
+        let (cc, sc) = shared_configs();
+        (
+            ClientSessionManager::new(&cc, limits.clone()).expect("client manager"),
+            ServerSessionManager::new(&sc, limits).expect("server manager"),
+        )
+    }
+
+    /// Start a handshake and return the M1 fragments.
+    fn start_handshake(client: &mut ClientSessionManager) -> Vec<WirePacket> {
+        match client.begin_handshake().unwrap() {
+            ManagerEvent::Send { packets, .. } => packets,
+            other => panic!("expected Send(M1), got {other:?}"),
+        }
+    }
+
+    /// Complete a handshake between the two managers: the M2 the server
+    /// answers with, the client's M3 burst and the server's replies (the
+    /// ack for the liveness probe).
+    fn finish_handshake(
+        client: &mut ClientSessionManager,
+        server: &mut ServerSessionManager,
+        m1: &[WirePacket],
+    ) -> (Vec<WirePacket>, Vec<WirePacket>) {
+        let mut m2 = Vec::new();
+        for f in m1 {
+            if let ManagerEvent::Send { packets, .. } =
+                server.handle_datagram(f, CLIENT_ADDR).unwrap()
+            {
+                m2 = packets;
+            }
+        }
+        assert_eq!(
+            m2.len(),
+            M2_FRAG_COUNT as usize,
+            "the server answers the M1"
+        );
+        let mut burst = Vec::new();
+        for f in &m2 {
+            if let ManagerEvent::Send { packets, .. } =
+                client.handle_datagram(f, SERVER_ADDR).unwrap()
+            {
+                burst = packets;
+            }
+        }
+        assert_eq!(
+            burst.len(),
+            M3_FRAG_COUNT as usize + 1,
+            "the M3 burst carries the M3 fragment and the liveness probe"
+        );
+        let mut established = false;
+        let mut replies = Vec::new();
+        for f in &burst {
+            match server.handle_datagram(f, CLIENT_ADDR).unwrap() {
+                ManagerEvent::Established { .. } => established = true,
+                ManagerEvent::SendPacket { packet, .. } => replies.push(packet),
+                _ => {}
+            }
+        }
+        assert!(established, "the server must establish at the M3");
+        (burst, replies)
+    }
+
+    /// Run one handshake between the two managers.
+    ///
+    /// Returns the client's M3 burst (the M3 fragment plus the liveness
+    /// probe) and the server's replies (the ack for the probe).
+    fn handshake_pair(
+        client: &mut ClientSessionManager,
+        server: &mut ServerSessionManager,
+    ) -> (Vec<WirePacket>, Vec<WirePacket>) {
+        let m1 = start_handshake(client);
+        finish_handshake(client, server, &m1)
+    }
+
+    /// D31 §2 (test 1): the session is created at M3 transmission, in the
+    /// **unconfirmed** state; the first authenticated server packet confirms
+    /// it.
+    #[test]
+    fn client_m3_sent_yields_unconfirmed_then_established() {
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let (_burst, replies) = handshake_pair(&mut client, &mut server);
+
+        // The session exists, but the key agreement is not confirmed: the
+        // peer is authenticated (its signature over TH2 was verified) while
+        // the client has not yet decrypted an authenticated server packet.
+        assert!(client.session_id().is_some(), "the M3 creates the session");
+        assert!(matches!(client.state(), ClientManagerState::Unconfirmed));
+        assert!(!client.is_ready(), "D15: the gate is still closed");
+
+        // The server answered the probe: that is an authenticated server
+        // packet, so it confirms the key agreement and opens the gate.
+        assert_eq!(replies.len(), 1, "the server answers the liveness probe");
+        match client.handle_datagram(&replies[0], SERVER_ADDR).unwrap() {
+            ManagerEvent::None => {}
+            other => panic!("the ack is consumed internally, got {other:?}"),
+        }
+        assert!(client.is_ready(), "the ack opens the D15 gate");
+        assert!(matches!(client.state(), ClientManagerState::Established));
+    }
+
+    /// D31 §7 (test 2): application data pushed before the session exists is
+    /// **buffered**, not lost, and it is delivered once the session is up.
+    #[test]
+    fn application_data_before_confirmation_is_buffered_not_lost() {
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        for i in 0..3u8 {
+            let ev = client.app_outbound(&[i; 16]).unwrap();
+            assert!(
+                matches!(ev, ManagerEvent::None),
+                "the payload is buffered, not dropped: {ev:?}"
+            );
+        }
+        assert_eq!(client.outbound_queued(), 3);
+        assert_eq!(client.outbound_dropped(), 0, "nothing is dropped yet");
+
+        handshake_pair(&mut client, &mut server);
+
+        // The queue is flushed through the session slot, one payload per
+        // slot (rate-paced, never a burst).
+        let mut now = Instant::now();
+        let mut flushed = 0usize;
+        for _ in 0..3 {
+            now += client.limits.slot_interval;
+            match client.take_slot(now) {
+                Some(ManagerEvent::SendPacket { packet, .. }) => {
+                    match server.handle_datagram(&packet, CLIENT_ADDR).unwrap() {
+                        ManagerEvent::AppData { inner, .. } => {
+                            assert_eq!(inner.msg_type, MessageType::Data);
+                            flushed += 1;
+                        }
+                        other => panic!("expected AppData, got {other:?}"),
+                    }
+                }
+                other => panic!("expected a flushed payload, got {other:?}"),
+            }
+        }
+        assert_eq!(flushed, 3, "every buffered payload is delivered");
+        assert_eq!(client.outbound_queued(), 0);
+        assert_eq!(client.outbound_dropped(), 0);
+    }
+
+    /// D31 §5 (test 3): a lost, delayed, duplicated or reordered confirmation
+    /// is handled without a state change that breaks the lifecycle.
+    #[test]
+    fn confirmation_lost_delayed_duplicated_and_reordered() {
+        // (a) LOST: the client stays unconfirmed until the confirmation
+        //     deadline, then fails closed with `NotConfirmed`.
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let (_burst, _replies) = handshake_pair(&mut client, &mut server);
+        assert!(!client.is_ready());
+        // The ack never arrives.
+        let events = client.tick(Instant::now() + Duration::from_secs(31));
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].1, CloseReason::NotConfirmed);
+        assert!(matches!(client.state(), ClientManagerState::Idle));
+
+        // (b) DELAYED: the ack arrives after several probe rounds — it still
+        //     confirms.
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let (_burst, replies) = handshake_pair(&mut client, &mut server);
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            now += Duration::from_secs(6);
+            let _ = client.take_slot(now); // a probe goes out, unanswered
+        }
+        client.handle_datagram(&replies[0], SERVER_ADDR).unwrap();
+        assert!(client.is_ready(), "the late ack still confirms");
+
+        // (c) DUPLICATED: the same ack twice — the second is a replay and is
+        //     rejected silently, with no state change.
+        let before = client.state();
+        let ev = client.handle_datagram(&replies[0], SERVER_ADDR).unwrap();
+        assert!(
+            matches!(ev, ManagerEvent::None),
+            "a replay is a silent drop"
+        );
+        assert_eq!(client.state(), before, "a replay changes no state");
+        assert!(client.is_ready(), "a replay does not close the gate");
+
+        // (d) REORDERED: a data packet that arrives before the ack confirms
+        //     the session just the same.
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let (_burst, _replies) = handshake_pair(&mut client, &mut server);
+        // The server's application data reaches the client before the ack.
+        let data = server
+            .app_outbound(&client.session_id().expect("sid"), &[0x42; PAYLOAD_LEN])
+            .unwrap();
+        let ManagerEvent::SendPacket { packet, peer } = data else {
+            panic!("expected SendPacket");
+        };
+        assert_eq!(peer, CLIENT_ADDR);
+        match client.handle_datagram(&packet, SERVER_ADDR).unwrap() {
+            ManagerEvent::AppData { .. } => {}
+            other => panic!("expected AppData, got {other:?}"),
+        }
+        assert!(client.is_ready(), "a data packet confirms too");
+    }
+
+    /// D31 §2 (test 4): the M3 retransmission budget is a *policy*, not a
+    /// deadline; when it is spent the client never reports success, and the
+    /// confirmation deadline produces an explicit `NotConfirmed` with a safe
+    /// cleanup and a retry on a **fresh** sid.
+    #[test]
+    fn m3_budget_exhaustion_is_never_a_success_and_retries_fresh() {
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let (_burst, _replies) = handshake_pair(&mut client, &mut server);
+        let first_sid = client.session_id().expect("session");
+
+        // Spend the M3 retransmission budget.
+        let mut retransmits = 0u32;
+        loop {
+            match client.on_timer().unwrap() {
+                ManagerEvent::Send { .. } => retransmits += 1,
+                ManagerEvent::None => break,
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(retransmits <= 16, "the budget must be bounded");
+        }
+        assert!(
+            retransmits > 0,
+            "the M3 must be retransmitted at least once"
+        );
+        // The budget is spent: the client is still unconfirmed, and the
+        // session is still there (the budget is not a deadline).
+        assert!(matches!(client.state(), ClientManagerState::Unconfirmed));
+        assert!(!client.is_ready());
+
+        // The confirmation deadline is the only deadline: it fires and the
+        // client fails closed.
+        let events = client.tick(Instant::now() + Duration::from_secs(31));
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].1, CloseReason::NotConfirmed);
+        assert_eq!(closes[0].0, first_sid);
+        // Safe cleanup: the session is gone, the keys are zeroized (D14).
+        assert!(client.session_id().is_none());
+        assert!(matches!(client.state(), ClientManagerState::Idle));
+
+        // The retry uses a fresh sid: never a reused one (D13, B15).
+        match client.begin_handshake().unwrap() {
+            ManagerEvent::Send { packets, .. } => {
+                let fresh: [u8; SESSION_ID_LEN] = packets[0].as_bytes()[1..9].try_into().unwrap();
+                assert_ne!(fresh, first_sid, "the retry must use a fresh sid");
+            }
+            other => panic!("expected Send(M1), got {other:?}"),
+        }
+    }
+
+    /// D31 §5 (test 5): with cover disabled, a dead peer is detected within
+    /// the liveness bound (N consecutive unanswered rounds) — the client
+    /// never sits in a black hole.
+    #[test]
+    fn dead_peer_is_detected_within_the_liveness_bound() {
+        let mut limits = SessionLimits::default();
+        limits.liveness_probe_interval = Duration::from_secs(1);
+        limits.liveness_rounds = 3;
+        let (mut client, mut server) = client_server_pair(limits);
+        let (_burst, replies) = handshake_pair(&mut client, &mut server);
+        // The session is confirmed: the peer answered the probe.
+        client.handle_datagram(&replies[0], SERVER_ADDR).unwrap();
+        assert!(client.is_ready());
+
+        // The peer is now dead: no answer ever arrives.
+        let mut now = Instant::now();
+        for _ in 0..3 {
+            now += Duration::from_secs(2);
+            let _ = client.take_slot(now); // a probe goes out, unanswered
+        }
+        // The liveness decision is made on N consecutive unanswered rounds.
+        let events = client.tick(now + Duration::from_secs(1));
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1, "the dead peer must be detected");
+        assert_eq!(closes[0].1, CloseReason::PeerUnresponsive);
+        assert!(matches!(client.state(), ClientManagerState::Idle));
+        // And the tunnel recovers: a fresh handshake is possible.
+        assert!(client.begin_handshake().is_ok());
+    }
+
+    /// D31 §6 (test 7): at the lifetime cap the client sends an encrypted
+    /// `Close` to the peer and re-establishes; the peer converges (it sees
+    /// the `Close` and drops the session).
+    #[test]
+    fn lifetime_cap_closes_and_both_endpoints_converge() {
+        let mut limits = SessionLimits::default();
+        limits.lifetime_cap = Some(Duration::from_secs(3600));
+        let (mut client, mut server) = client_server_pair(limits);
+        handshake_pair(&mut client, &mut server);
+        let sid = client.session_id().expect("session");
+
+        // The cap fires.
+        let events = client.tick(Instant::now() + Duration::from_secs(3600));
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].1, CloseReason::LifetimeCap);
+        let close_packet = events
+            .iter()
+            .find_map(|e| match e {
+                ManagerEvent::SendPacket { packet, .. } => Some(packet.clone()),
+                _ => None,
+            })
+            .expect("the cap must send an encrypted Close");
+        assert!(client.session_id().is_none(), "the session is gone");
+
+        // The peer converges: it decrypts the `Close` and drops the session.
+        match server.handle_datagram(&close_packet, CLIENT_ADDR).unwrap() {
+            ManagerEvent::Closed { sid: cs, reason } => {
+                assert_eq!(cs, sid);
+                assert_eq!(reason, CloseReason::PeerClosed);
+            }
+            other => panic!("expected Closed{{PeerClosed}}, got {other:?}"),
+        }
+        assert_eq!(server.session_count(), 0, "the peer dropped the session");
+    }
+
+    /// D31 §6: the exposure bound is only meaningful if **both** endpoints
+    /// enforce the cap.  This is the path that proves it: the client's `Close`
+    /// is lost entirely, and the **server's own cap** fires and converges.
+    ///
+    /// Without this test, "both ends enforce the cap ⇒ the traffic-key
+    /// exposure is bounded" is an assertion nobody checks, and a lost `Close`
+    /// would silently leave the peer's session alive for a whole cap period.
+    #[test]
+    fn a_lost_close_is_covered_by_the_peers_own_cap() {
+        let mut limits = SessionLimits::default();
+        limits.lifetime_cap = Some(Duration::from_secs(3600));
+        let (mut client, mut server) = client_server_pair(limits);
+        handshake_pair(&mut client, &mut server);
+        assert_eq!(server.session_count(), 1);
+
+        // The client's cap fires and its `Close` is **lost** (never
+        // delivered to the server).
+        let events = client.tick(Instant::now() + Duration::from_secs(3600));
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1);
+        assert_eq!(closes[0].1, CloseReason::LifetimeCap);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ManagerEvent::SendPacket { .. })),
+            "the client must have tried to tell the peer"
+        );
+        assert_eq!(
+            server.session_count(),
+            1,
+            "the lost Close leaves the peer's session alive — that is the case this test covers"
+        );
+
+        // The server's **own** cap fires and converges: it tells the peer and
+        // drops the session, so the exposure is bounded even though the
+        // client's Close never arrived.
+        let server_events = server.tick(Instant::now() + Duration::from_secs(3600));
+        let server_closes = closed_events(&server_events);
+        assert_eq!(server_closes.len(), 1);
+        assert_eq!(server_closes[0].1, CloseReason::LifetimeCap);
+        assert!(
+            server_events
+                .iter()
+                .any(|e| matches!(e, ManagerEvent::SendPacket { .. })),
+            "the server's own cap must send a Close to the peer"
+        );
+        assert_eq!(server.session_count(), 0, "the server dropped the session");
+    }
+
+    /// D31 §4: the traffic-key exposure bound is `cap + ≈4 s` — the 1 Hz tick
+    /// granularity plus the `Close`-retransmission window during which the
+    /// session (and therefore its keys) is still held.
+    ///
+    /// This pins that window: the keys must be **released** once the
+    /// retransmission budget is spent.  Without it, a regression that kept
+    /// the session alive indefinitely would still pass every other test.
+    #[test]
+    fn the_session_keys_are_released_after_the_close_retransmission_budget() {
+        let mut limits = SessionLimits::default();
+        limits.lifetime_cap = Some(Duration::from_secs(3600));
+        let (mut client, mut server) = client_server_pair(limits);
+        handshake_pair(&mut client, &mut server);
+        assert!(client.session_id().is_some());
+
+        // The cap fires: the session is torn down, but it is retained for the
+        // `Close` retransmissions.
+        let events = client.tick(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(closed_events(&events).len(), 1);
+        assert_eq!(
+            client.pending_closes.len(),
+            1,
+            "the session is retained until its Close is delivered"
+        );
+
+        // The retransmission budget is spent: the session (and its keys) is
+        // dropped and zeroized (D14).  The budget spans the `Close`
+        // retransmission backoff, so the clock is advanced past each step.
+        let mut t = Instant::now() + Duration::from_secs(3600);
+        for _ in 0..8 {
+            t += Duration::from_secs(5);
+            let _ = client.tick(t);
+            if client.pending_closes.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            client.pending_closes.is_empty(),
+            "the retained session must be dropped once the Close budget is spent, \
+             so the traffic keys are released (D31 §4)"
+        );
+    }
+
+    /// D31 §6 (test 8a): a *lost* `Close` is retried a bounded number of
+    /// times, and the peer converges on one of the retransmissions.
+    #[test]
+    fn lost_close_is_retransmitted_and_the_peer_converges() {
+        let mut limits = SessionLimits::default();
+        limits.lifetime_cap = Some(Duration::from_secs(3600));
+        let (mut client, mut server) = client_server_pair(limits);
+        handshake_pair(&mut client, &mut server);
+
+        // The cap fires; the first `Close` is "lost" (not delivered).
+        let events = client.tick(Instant::now() + Duration::from_secs(3600));
+        let mut closes: Vec<WirePacket> = events
+            .iter()
+            .filter_map(|e| match e {
+                ManagerEvent::SendPacket { packet, .. } => Some(packet.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes.len(), 1, "the first Close is sent immediately");
+
+        // The retransmissions follow the backoff.
+        let mut now = Instant::now() + Duration::from_secs(3600);
+        for _ in 0..2 {
+            now += Duration::from_secs(1);
+            let evs = client.tick(now);
+            closes.extend(evs.iter().filter_map(|e| match e {
+                ManagerEvent::SendPacket { packet, .. } => Some(packet.clone()),
+                _ => None,
+            }));
+        }
+        assert!(
+            closes.len() >= 2,
+            "the Close must be retransmitted, got {}",
+            closes.len()
+        );
+        // The peer converges on one of them.
+        let mut converged = false;
+        for c in &closes {
+            if let ManagerEvent::Closed { .. } = server.handle_datagram(c, CLIENT_ADDR).unwrap() {
+                converged = true;
+            }
+        }
+        assert!(
+            converged,
+            "the peer must converge on a Close retransmission"
+        );
+        assert_eq!(server.session_count(), 0);
+    }
+
+    /// D31 §5/§6 (test 8b): a lost *confirmation* does not kill a healthy
+    /// session — the next probe round re-confirms it.
+    #[test]
+    fn lost_confirmation_is_recovered_by_the_next_probe_round() {
+        let mut limits = SessionLimits::default();
+        limits.liveness_probe_interval = Duration::from_secs(1);
+        let (mut client, mut server) = client_server_pair(limits);
+        let (_burst, replies) = handshake_pair(&mut client, &mut server);
+        // The first ack is lost.
+        assert!(!client.is_ready());
+        // The client probes again; the server answers again.
+        let mut now = Instant::now();
+        now += Duration::from_secs(2);
+        let probe = client.take_slot(now).expect("a probe is due");
+        let ManagerEvent::SendPacket { packet, .. } = probe else {
+            panic!("expected a probe packet");
+        };
+        let ack = match server.handle_datagram(&packet, CLIENT_ADDR).unwrap() {
+            ManagerEvent::SendPacket { packet, .. } => packet,
+            other => panic!("expected the ack, got {other:?}"),
+        };
+        client.handle_datagram(&ack, SERVER_ADDR).unwrap();
+        assert!(client.is_ready(), "the next round confirms the session");
+        let _ = replies;
+    }
+
+    /// D31 §2 / B2 / B12 (test 9): the client's session exists from the M3
+    /// transmission, so the server's first authenticated packet can no longer
+    /// be swallowed by the handshake machine (B2 — the baseline hole).  A
+    /// replay of an already-accepted packet is rejected, and a late event
+    /// can never create a second session for the same sid (B12).
+    #[test]
+    fn replayed_server_packet_is_rejected_and_nonce_state_is_never_reset() {
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        handshake_pair(&mut client, &mut server);
+        let sid = client.session_id().expect("session");
+
+        // The server's data packet is delivered: the session existed at the
+        // M3, so nothing is swallowed (B2 fixed).
+        let data = server.app_outbound(&sid, &[0x11; PAYLOAD_LEN]).unwrap();
+        let ManagerEvent::SendPacket { packet, .. } = data else {
+            panic!("expected SendPacket");
+        };
+        match client.handle_datagram(&packet, SERVER_ADDR).unwrap() {
+            ManagerEvent::AppData { .. } => {}
+            other => panic!("expected AppData, got {other:?}"),
+        }
+
+        // The replay is rejected: the packet is not delivered twice, and the
+        // replay window is not reset by it.
+        let ev = client.handle_datagram(&packet, SERVER_ADDR).unwrap();
+        assert!(
+            matches!(ev, ManagerEvent::None),
+            "a replay must be rejected"
+        );
+        assert!(client.session_id().is_some(), "the session survives");
+        assert!(client.is_ready(), "the gate stays open");
+
+        // A late duplicate of the M2 cannot create a second session for the
+        // same sid (B12): the handshake machine is gone, so the fragment is
+        // stale and dropped.
+        assert_eq!(client.session_id(), Some(sid), "the session is unchanged");
+        assert!(
+            client.handshake_sid().is_none(),
+            "the handshake machine is dropped at the M3 (one live object)"
+        );
+    }
+
+    /// D31 §7 (test 10): the bounded outbound queue drops the **newest**
+    /// payload on overflow, counts the drops exactly, expires stale entries,
+    /// and survives a re-establishment.
+    #[test]
+    fn outbound_queue_is_bounded_drops_newest_and_expires() {
+        let (mut client, _server) = client_server_pair(SessionLimits::default());
+        // Overflow: the queue holds 64 entries; the 65th is dropped.
+        for i in 0..64u8 {
+            let ev = client.app_outbound(&[i; 8]).unwrap();
+            assert!(matches!(ev, ManagerEvent::None));
+        }
+        assert_eq!(client.outbound_queued(), 64);
+        assert_eq!(client.outbound_dropped(), 0);
+        let ev = client.app_outbound(&[0xFF; 8]).unwrap();
+        match ev {
+            ManagerEvent::OutboundDropped { dropped } => assert_eq!(dropped, 1),
+            other => panic!("expected OutboundDropped, got {other:?}"),
+        }
+        assert_eq!(client.outbound_dropped(), 1, "the count is exact");
+        assert_eq!(
+            client.outbound_queued(),
+            64,
+            "the newest is dropped, the oldest are kept"
+        );
+
+        // Expiry: the per-entry TTL removes the stale entries and counts
+        // them.
+        let events = client.tick(Instant::now() + Duration::from_secs(3));
+        let dropped = events
+            .iter()
+            .filter_map(|e| match e {
+                ManagerEvent::OutboundDropped { dropped } => Some(*dropped),
+                _ => None,
+            })
+            .max()
+            .expect("the expiry must be reported");
+        assert_eq!(dropped, 65, "64 expired + 1 overflowed");
+        assert_eq!(client.outbound_queued(), 0);
+        assert_eq!(client.outbound_dropped(), 65);
+    }
+
+    /// D31 §5 (test 12): the client is ready in ≈1 RTT, not after the M3
+    /// retransmission budget.  The assertion is on *observable state
+    /// transitions*, not on wall-clock time.
+    #[test]
+    fn readiness_is_one_round_trip_not_the_m3_budget() {
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let (_burst, replies) = handshake_pair(&mut client, &mut server);
+        // The session exists at the M3 — no retransmission has happened yet.
+        assert!(client.session_id().is_some());
+        assert!(!client.is_ready());
+        // The very first authenticated server packet (the ack to the probe
+        // that rode along with the M3) confirms the session: one round trip.
+        client.handle_datagram(&replies[0], SERVER_ADDR).unwrap();
+        assert!(client.is_ready());
+        // The M3 retransmission budget was never touched: the client did
+        // not have to spend it to become ready.
+        assert_eq!(client.m3_attempts, 0, "no M3 retransmission was needed");
+    }
+
+    /// D24 (test 13): a successfully decrypted in-session control message
+    /// consumes **no** failure-gate token, and neither does a replayed
+    /// authentic packet.
+    #[test]
+    fn control_message_and_replay_consume_no_failure_token() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.fail_burst = 2;
+        let mut manager = server_manager(limits);
+        let (_client, mut ws) = established_client_session(&mut manager, &cc, SID);
+
+        // A control probe: decrypted successfully, answered with an ack, and
+        // it must not touch the failure gate.
+        let mut payload = [0u8; PAYLOAD_LEN];
+        payload[0] = control::PROBE;
+        let probe = ws.encrypt(MessageType::Handshake, &payload).unwrap();
+        match manager.handle_datagram(&probe, CLIENT_ADDR).unwrap() {
+            ManagerEvent::SendPacket { packet, .. } => {
+                let inner = ws.decrypt(&packet).expect("the ack decrypts");
+                assert_eq!(inner.msg_type, MessageType::Handshake);
+                assert_eq!(inner.payload[0], control::ACK);
+            }
+            other => panic!("expected the ack, got {other:?}"),
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "a successful control message must not allocate a failure bucket"
+        );
+
+        // A replayed authentic packet: rejected, and it must not touch the
+        // failure gate either (D24: only an AEAD failure may).
+        assert!(matches!(
+            manager.handle_datagram(&probe, CLIENT_ADDR).unwrap(),
+            ManagerEvent::None
+        ));
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "a replay must not allocate a failure bucket"
+        );
+
+        // A genuine AEAD failure *does* allocate one — the control above is
+        // what proves the difference.
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+        assert!(matches!(
+            manager
+                .handle_datagram(&tampered(&good), CLIENT_ADDR)
+                .unwrap(),
+            ManagerEvent::None
+        ));
+        assert_eq!(
+            manager.fail_bucket_count(),
+            1,
+            "an AEAD failure is the only thing that spends a token"
+        );
+    }
+
+    /// B4 (test 14): the server's idle timeout counts **authenticated
+    /// receives** only.  The server's own cover traffic and application
+    /// replies do not keep a session alive, so a departed peer is reaped;
+    /// a live-but-quiet peer (kept alive by the client's liveness probe) is
+    /// not.
+    #[test]
+    fn server_idle_eviction_counts_receives_only() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.idle_timeout = Some(Duration::from_secs(60));
+        limits.lifetime_cap = None;
+        let mut manager = server_manager(limits);
+        let (_client, mut ws) = established_client_session(&mut manager, &cc, SID);
+
+        // The server's *own* outbound traffic (cover) must not refresh the
+        // idle clock.
+        let cover = manager.cover_packet(&SID).unwrap();
+        assert!(matches!(cover, ManagerEvent::SendPacket { .. }));
+        let app = manager.app_outbound(&SID, &[0u8; PAYLOAD_LEN]).unwrap();
+        assert!(matches!(app, ManagerEvent::SendPacket { .. }));
+
+        // The peer is gone: the session is reaped within the idle timeout.
+        let events = manager.tick(Instant::now() + Duration::from_secs(61));
+        let closes = closed_events(&events);
+        assert_eq!(closes.len(), 1, "a departed peer must be reaped");
+        assert_eq!(closes[0].1, CloseReason::IdleTimeout);
+        assert_eq!(manager.session_count(), 0);
+        let _ = &mut ws;
+    }
+
+    /// D31 §5: a live-but-quiet peer — one that only sends liveness probes —
+    /// is **not** reaped: the probe is an authenticated receive, and the
+    /// idle timeout counts authenticated receives.
+    #[test]
+    fn a_live_but_quiet_peer_is_not_reaped() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.idle_timeout = Some(Duration::from_secs(600));
+        limits.lifetime_cap = None;
+        let mut manager = server_manager(limits);
+        let (_client, mut ws) = established_client_session(&mut manager, &cc, SID);
+
+        // The peer keeps itself alive with probes only.
+        let mut payload = [0u8; PAYLOAD_LEN];
+        payload[0] = control::PROBE;
+        let mut last = Instant::now();
+        for _ in 0..5 {
+            last += Duration::from_secs(30);
+            let probe = ws.encrypt(MessageType::Handshake, &payload).unwrap();
+            match manager.handle_datagram(&probe, CLIENT_ADDR).unwrap() {
+                ManagerEvent::SendPacket { .. } => {}
+                other => panic!("expected the ack, got {other:?}"),
+            }
+            // The tick between the probes must not evict the session.
+            assert!(
+                closed_events(&manager.tick(last)).is_empty(),
+                "a probe-driven session must not be reaped"
+            );
+        }
+        assert_eq!(manager.session_count(), 1, "the session is still alive");
+    }
+
+    /// D31 §4: a **simultaneous close** — both endpoints cap at once, both
+    /// send a `Close`, and each receives a `Close` for a session it has
+    /// already closed.  That must be a graceful silent drop: not an error,
+    /// and not charged to the failure gate.
+    #[test]
+    fn simultaneous_close_is_graceful() {
+        let mut limits = SessionLimits::default();
+        limits.lifetime_cap = Some(Duration::from_secs(3600));
+        let (mut client, mut server) = client_server_pair(limits);
+        handshake_pair(&mut client, &mut server);
+        let sid = client.session_id().expect("session");
+
+        // Both sides cap at the same moment: each sends a `Close`.
+        let client_events = client.tick(Instant::now() + Duration::from_secs(3600));
+        let server_events = server.tick(Instant::now() + Duration::from_secs(3600));
+        let client_close = client_events
+            .iter()
+            .find_map(|e| match e {
+                ManagerEvent::SendPacket { packet, .. } => Some(packet.clone()),
+                _ => None,
+            })
+            .expect("the client sends a Close");
+        let server_close = server_events
+            .iter()
+            .find_map(|e| match e {
+                ManagerEvent::SendPacket { packet, .. } => Some(packet.clone()),
+                _ => None,
+            })
+            .expect("the server sends a Close");
+
+        // The client receives the server's `Close` for a session it has
+        // already closed: a graceful, silent drop.
+        let ev = client.handle_datagram(&server_close, SERVER_ADDR).unwrap();
+        assert!(
+            matches!(ev, ManagerEvent::None),
+            "a Close for an already-closed session is a silent drop, got {ev:?}"
+        );
+        // The server receives the client's `Close` likewise.
+        let ev = server.handle_datagram(&client_close, CLIENT_ADDR).unwrap();
+        assert!(
+            matches!(ev, ManagerEvent::None),
+            "a Close for an already-closed session is a silent drop, got {ev:?}"
+        );
+        assert_eq!(server.session_count(), 0);
+        assert_eq!(
+            server.fail_bucket_count(),
+            0,
+            "a simultaneous close must not be charged to the failure gate"
+        );
+        let _ = sid;
+    }
+
+    /// B13 (test 15): `begin_handshake()` succeeds after **every** teardown
+    /// path, and it always yields a fresh sid.
+    #[test]
+    fn begin_handshake_succeeds_after_every_teardown_path() {
+        let (mut client, mut server) = client_server_pair(SessionLimits::default());
+        let mut sids: Vec<[u8; SESSION_ID_LEN]> = Vec::new();
+
+        // Path 1: the confirmation deadline (NotConfirmed).
+        handshake_pair(&mut client, &mut server);
+        sids.push(client.session_id().expect("session"));
+        let events = client.tick(Instant::now() + Duration::from_secs(31));
+        assert_eq!(closed_events(&events).len(), 1);
+        assert!(client.needs_rearm(), "the manager must ask for a re-arm");
+        let m1 = start_handshake(&mut client);
+        sids.push(m1[0].as_bytes()[1..9].try_into().unwrap());
+
+        // Path 2: the peer's `Close` (PeerClosed).
+        let (_burst, _replies) = finish_handshake(&mut client, &mut server, &m1);
+        let sid = client.session_id().expect("session");
+        let close = server.close_session(&sid).unwrap();
+        let ManagerEvent::SendPacket { packet, .. } = close else {
+            panic!("the server must send a Close");
+        };
+        match client.handle_datagram(&packet, SERVER_ADDR).unwrap() {
+            ManagerEvent::Closed { reason, .. } => assert_eq!(reason, CloseReason::PeerClosed),
+            other => panic!("expected Closed{{PeerClosed}}, got {other:?}"),
+        }
+        assert!(client.session_id().is_none(), "the session is gone");
+        let m1 = start_handshake(&mut client);
+        sids.push(m1[0].as_bytes()[1..9].try_into().unwrap());
+
+        // Path 3: the lifetime cap (LifetimeCap).
+        let mut limits = SessionLimits::default();
+        limits.lifetime_cap = Some(Duration::from_secs(3600));
+        let (mut client, mut server) = client_server_pair(limits);
+        let m1 = start_handshake(&mut client);
+        finish_handshake(&mut client, &mut server, &m1);
+        sids.push(client.session_id().expect("session"));
+        let events = client.tick(Instant::now() + Duration::from_secs(3600));
+        assert_eq!(closed_events(&events).len(), 1);
+        let m1 = start_handshake(&mut client);
+        sids.push(m1[0].as_bytes()[1..9].try_into().unwrap());
+
+        // Every sid is distinct: a session identifier is never reused (D13).
+        let mut sorted = sids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), sids.len(), "the sids must be distinct");
     }
 }

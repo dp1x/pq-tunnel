@@ -57,27 +57,19 @@ fn server_mgr(sc: &HandshakeV2ServerConfig, limits: SessionLimits) -> ServerSess
     ServerSessionManager::new(sc, limits).expect("server session manager init")
 }
 
-/// Drive a client machine to `Complete`.  Against a passive server the client
-/// converges on `Complete` once its M3 budget is spent (no M4 exists), so a
-/// small bounded loop is the deterministic way to reach it.
-fn client_established(client: &mut ClientHandshake) -> HandshakeOutcome {
-    for _ in 0..16 {
-        if let ClientEvent::Complete(outcome) = client.on_timer().expect("client timer") {
-            return outcome;
-        }
-    }
-    panic!("client handshake never completed");
-}
-
 /// Run M1 and M2 to completion and park the client machine in `M3Sent`.
 ///
 /// Returning *before* the M3 fragments are handed to the server is what lets a
 /// test revoke a key inside the handshake window (D27 §4).
+///
+/// The client machine's success signal is the M3 emission: `M3Sent` carries
+/// the derived outcome (the session master), so the test never has to spend
+/// the retransmission budget to obtain it (D31 §2).
 fn paused_before_m3(
     mgr: &mut ServerSessionManager,
     cc: &HandshakeV2ClientConfig,
     sid: [u8; 8],
-) -> (ClientHandshake, Vec<WirePacket>) {
+) -> (ClientHandshake, Vec<WirePacket>, HandshakeOutcome) {
     let mut client = ClientHandshake::new(cc, sid).expect("client handshake");
     let mut m2: Vec<WirePacket> = Vec::new();
     for f in client.m1_frags() {
@@ -88,12 +80,24 @@ fn paused_before_m3(
         }
     }
     assert!(!m2.is_empty(), "server must emit M2 once M1 authenticates");
+    let mut m3: Vec<WirePacket> = Vec::new();
+    let mut outcome = None;
     for f in &m2 {
-        client.handle_datagram(f).expect("client accepts M2");
+        if let ClientEvent::M3Sent {
+            packets,
+            outcome: o,
+        } = client.handle_datagram(f).expect("cli")
+        {
+            m3 = packets;
+            outcome = Some(o);
+        }
     }
-    let m3 = client.m3_frags().to_vec();
     assert!(!m3.is_empty(), "client must be parked in M3Sent");
-    (client, m3)
+    (
+        client,
+        m3,
+        outcome.expect("the M3 carries the derived outcome"),
+    )
 }
 
 /// Full handshake through the manager; returns a usable client-side session.
@@ -102,7 +106,7 @@ fn established(
     cc: &HandshakeV2ClientConfig,
     sid: [u8; 8],
 ) -> (ClientHandshake, WireSession) {
-    let (mut client, m3) = paused_before_m3(mgr, cc, sid);
+    let (client, m3, outcome) = paused_before_m3(mgr, cc, sid);
     let mut ok = false;
     for f in &m3 {
         if let ManagerEvent::Established { .. } = mgr.handle_datagram(f, client_addr()).unwrap() {
@@ -110,22 +114,39 @@ fn established(
         }
     }
     assert!(ok, "server must establish at M3");
-    let outcome = client_established(&mut client);
     let ws = WireSession::established(Role::Client, &outcome).expect("client session");
     (client, ws)
 }
 
 /// The single `Closed` reason from a `tick`, panicking on anything else.
+///
+/// A `tick` may also carry `SendPacket` events: when the lifetime cap (or
+/// the idle timeout) fires, the endpoint sends an encrypted `Close` to the
+/// peer **before** dropping the session (D31 §6, B7), so the peer converges
+/// without relying on synchronised clocks.  Those packets are filtered out
+/// here; the `Closed` event is the assertion's subject.
 fn only_close_reason(events: &[ManagerEvent]) -> CloseReason {
+    let closes: Vec<&ManagerEvent> = events
+        .iter()
+        .filter(|e| matches!(e, ManagerEvent::Closed { .. }))
+        .collect();
     assert_eq!(
-        events.len(),
+        closes.len(),
         1,
         "expected exactly one eviction, got {events:?}"
     );
-    match &events[0] {
+    match closes[0] {
         ManagerEvent::Closed { reason, .. } => *reason,
         other => panic!("expected a Closed event, got {other:?}"),
     }
+}
+
+/// The `Close` packets a `tick` emitted (the D31 §4 convergence signal).
+fn close_packets(events: &[ManagerEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, ManagerEvent::SendPacket { .. }))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -158,14 +179,20 @@ fn lifetime_cap_fires_and_yields_closed_lifetime_cap() {
     );
     assert_eq!(mgr.session_count(), 1);
 
-    // At the cap: evicted.
-    let reason = only_close_reason(&mgr.tick(Instant::now() + Duration::from_secs(3600)));
+    // At the cap: evicted, and the peer is told (D31 §4: the `Close` is the
+    // convergence mechanism between the two endpoints).
+    let events = mgr.tick(Instant::now() + Duration::from_secs(3600));
+    let reason = only_close_reason(&events);
     assert_eq!(
         reason,
         CloseReason::LifetimeCap,
         "expiry must be reported as LifetimeCap"
     );
     assert_eq!(mgr.session_count(), 0, "an evicted session is removed");
+    assert!(
+        close_packets(&events) >= 1,
+        "the cap must send an encrypted Close to the peer, not just drop the session"
+    );
 }
 
 /// The client role enforces the same cap: at the cap it closes the session so
@@ -178,11 +205,11 @@ fn client_side_lifetime_cap_closes_and_re_arms() {
     let f = fixture();
     let limits = SessionLimits {
         lifetime_cap: Some(Duration::from_secs(60)),
-        // The client also carries a liveness timeout (default 30 s, D15). It
-        // only applies while a session is unconfirmed, and this session is
+        // The client also carries a confirmation deadline (D15, default 30 s).
+        // It only applies while a session is unconfirmed, and this session is
         // never confirmed (no server packet ever reaches it), so it is
         // disabled here to isolate the cap as the single bound under test.
-        liveness_timeout: None,
+        confirm_timeout: None,
         ..SessionLimits::default()
     };
     let mut cm = ClientSessionManager::new(&f.cc, limits).expect("client mgr");
@@ -198,10 +225,15 @@ fn client_side_lifetime_cap_closes_and_re_arms() {
         "no close before the cap"
     );
 
-    let reason = only_close_reason(&cm.tick(Instant::now() + Duration::from_secs(60)));
+    let events = cm.tick(Instant::now() + Duration::from_secs(60));
+    let reason = only_close_reason(&events);
     assert_eq!(reason, CloseReason::LifetimeCap);
     assert_eq!(cm.session_id(), None, "the capped session must be gone");
     assert_eq!(cm.state(), ClientManagerState::Idle);
+    assert!(
+        close_packets(&events) >= 1,
+        "the cap must send an encrypted Close to the peer, not just drop the session"
+    );
 
     // Re-establishment is legal from the resulting Idle state — the D16 path a
     // revoked client would drive. It must use a FRESH sid.
@@ -210,7 +242,7 @@ fn client_side_lifetime_cap_closes_and_re_arms() {
     assert_ne!(new_sid, sid, "D16 re-establishment must draw a fresh sid");
 }
 
-/// Drive a `ClientSessionManager` to `Established` against a `ServerHandshake`
+/// Drive a `ClientSessionManager` to `Unconfirmed` against a `ServerHandshake`
 /// machine, moving M1/M2/M3 through the public `handle_datagram` API.
 fn client_mgr_handshake(
     cm: &mut ClientSessionManager,
@@ -236,18 +268,11 @@ fn client_mgr_handshake(
         cm.handle_datagram(frag, client_addr())
             .expect("client accepts M2");
     }
-    // The client is now in M3Sent; its session exists once the M3 budget
-    // converges (v2 has no M4, so the client completes once it stops
-    // retransmitting).
-    for _ in 0..16 {
-        cm.on_timer().expect("client timer");
-        if cm.session_id().is_some() {
-            break;
-        }
-    }
+    // The client is now `Unconfirmed`: the M3 was emitted and the session
+    // exists, but no authenticated server packet has decrypted yet (D15).
     assert!(
         cm.session_id().is_some(),
-        "client must hold a session after the M3 budget converges"
+        "client must hold a session once the M3 was emitted"
     );
 }
 
@@ -368,7 +393,7 @@ fn midflight_revocation_blocks_m3_completion() {
     let mut mgr = server_mgr(&f.sc, SessionLimits::default());
 
     // M1 has already authenticated at complete_m1 against the ORIGINAL roster.
-    let (_client, m3) = paused_before_m3(&mut mgr, &f.cc, SID);
+    let (_client, m3, _outcome) = paused_before_m3(&mut mgr, &f.cc, SID);
 
     // Revoke the client's key while M3 is in flight.
     mgr.set_roster(vec![keep.public_key()])

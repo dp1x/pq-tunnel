@@ -23,6 +23,7 @@ pub mod v2_server;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use pq_tunnel_core::scheduler::{MAX_COVER_RATE_BPS, MIN_COVER_INTERVAL_NANOS};
@@ -121,6 +122,20 @@ pub struct ServerArgs {
     /// where the production roster has a single entry.
     #[arg(long, default_value_t = HandshakeV2ServerConfig::DEFAULT_MAX_ROSTER_SIZE)]
     pub max_roster_size: usize,
+
+    /// Session lifetime cap in seconds (`0` = unbounded).
+    ///
+    /// D16 bounds the traffic-key exposure of a session: with cover traffic
+    /// enabled (the default) the lifetime cap is the *only* bound on
+    /// exposure, because the server's idle timeout counts authenticated
+    /// *receives* only (D27 §1.3).  When the cap fires the endpoint sends an
+    /// encrypted `Close` to the peer before dropping the session, so both
+    /// ends converge without relying on synchronised clocks.
+    ///
+    /// The default is 24 h (86400 s).  See `v2_server::run` for the
+    /// integration-sign-off marker.
+    #[arg(long, default_value_t = 86_400)]
+    pub lifetime_cap_secs: u64,
 }
 
 /// `pq-tunnel client` arguments.
@@ -154,6 +169,19 @@ pub struct ClientArgs {
     /// cover never silently turns off, PROTOCOL_SPEC §12.2).
     #[arg(long)]
     pub no_cover: bool,
+
+    /// Session lifetime cap in seconds (`0` = unbounded).
+    ///
+    /// D16 bounds the traffic-key exposure of a session.  When the cap fires
+    /// the client sends an encrypted `Close` to the server, tears the session
+    /// down (fresh sid, fresh ephemerals, fresh master on re-establishment)
+    /// and re-establishes.  The server, which enforces the same cap, tears
+    /// the session down and stays down for that sid.
+    ///
+    /// The default is 24 h (86400 s).  See `v2_client::run` for the
+    /// integration-sign-off marker.
+    #[arg(long, default_value_t = 86_400)]
+    pub lifetime_cap_secs: u64,
 }
 
 /// Largest `--cover-mbps` value whose bitrate is representable in a `u64`:
@@ -230,6 +258,20 @@ pub fn cover_policy_from_args(no_cover: bool, mbps: u64) -> Result<CoverPolicy, 
         enabled: true,
         interval: interval_from_rate_bps(bps),
     })
+}
+
+/// Build the session-lifetime cap from the CLI flag.
+///
+/// `0` means **unbounded** (the cap is disabled); any other value is the
+/// session lifetime in seconds.  D27 §1's human decision gate names 24 h as
+/// the recommended default and `--lifetime-cap-secs` with `0` meaning
+/// "unbounded" as the CLI spelling — this is that spelling.
+pub fn lifetime_cap_from_secs(secs: u64) -> Option<Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
 }
 
 /// Program entry point: tracing init, then dispatch on the subcommand.
@@ -356,5 +398,80 @@ mod tests {
         let off = cover_policy_from_args(true, u64::MAX).expect("--no-cover ignores --cover-mbps");
         assert!(!off.enabled);
         assert_eq!(off.interval, CoverPolicy::default().interval);
+    }
+
+    /// The lifetime-cap CLI spelling (D27 §1's human decision gate):
+    /// `--lifetime-cap-secs` with `0` meaning "unbounded" and the default
+    /// being 24 h.
+    #[test]
+    fn lifetime_cap_zero_is_unbounded_and_the_default_is_24h() {
+        assert_eq!(lifetime_cap_from_secs(0), None, "0 means unbounded");
+        assert_eq!(
+            lifetime_cap_from_secs(86_400),
+            Some(Duration::from_secs(24 * 60 * 60)),
+            "the default is 24 h"
+        );
+        assert_eq!(lifetime_cap_from_secs(1), Some(Duration::from_secs(1)));
+    }
+
+    /// The **shipped** lifetime-cap default is 24 h, on both roles.
+    ///
+    /// The value above only pins the helper; this pins the *product surface*:
+    /// the `default_value_t` on the two CLI flags is the single line that
+    /// decides whether the shipped binaries enforce D16's exposure bound.
+    /// Nothing else in the tree would notice a change to it, so it is pinned
+    /// here.  Reverting the shipped default to "unbounded" is a deliberate
+    /// act: it must fail this test (see `docs/design/D31-client-lifecycle-and-liveness.md`).
+    #[test]
+    fn shipped_lifetime_cap_default_is_24h_on_both_roles() {
+        use clap::Parser;
+
+        let cli = Cli::parse_from(["pq-tunnel", "client", "--remote", "127.0.0.1:4433"]);
+        let Command::Client(args) = cli.command else {
+            panic!("expected the client subcommand");
+        };
+        assert_eq!(
+            args.lifetime_cap_secs, 86_400,
+            "the shipped client must enforce a 24 h session lifetime by default"
+        );
+        assert_eq!(
+            lifetime_cap_from_secs(args.lifetime_cap_secs),
+            Some(Duration::from_secs(24 * 60 * 60))
+        );
+
+        let cli = Cli::parse_from(["pq-tunnel", "server"]);
+        let Command::Server(args) = cli.command else {
+            panic!("expected the server subcommand");
+        };
+        assert_eq!(
+            args.lifetime_cap_secs, 86_400,
+            "the shipped server must enforce a 24 h session lifetime by default"
+        );
+    }
+
+    /// `--lifetime-cap-secs 0` must actually mean "unbounded" on the CLI, and
+    /// it must be an *explicit* choice: the flag exists so the reduction is
+    /// visible rather than silent.
+    #[test]
+    fn lifetime_cap_zero_flag_yields_an_unbounded_session() {
+        use clap::Parser;
+
+        let cli = Cli::parse_from([
+            "pq-tunnel",
+            "client",
+            "--remote",
+            "127.0.0.1:4433",
+            "--lifetime-cap-secs",
+            "0",
+        ]);
+        let Command::Client(args) = cli.command else {
+            panic!("expected the client subcommand");
+        };
+        assert_eq!(args.lifetime_cap_secs, 0);
+        assert_eq!(
+            lifetime_cap_from_secs(args.lifetime_cap_secs),
+            None,
+            "0 must mean unbounded"
+        );
     }
 }

@@ -401,7 +401,10 @@ mod tests {
     fn wrong_direction_rejected() {
         let (mut client, _server) = established_pair();
         // A second *client* with the same master must not be able to read the
-        // first client's packets (direction separation).
+        // first client's packets (direction separation).  The per-direction
+        // keys differ, so the AEAD tag does not verify: this is a genuine
+        // AEAD failure (`DecryptionFailed`), which is the only per-packet
+        // rejection that may spend a data-path failure-gate token (D24).
         let master = test_master();
         let mut other = WireSession::new(Role::Client, &master, test_sid()).unwrap();
         other.begin_handshake().unwrap();

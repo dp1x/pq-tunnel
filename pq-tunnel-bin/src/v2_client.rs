@@ -48,7 +48,18 @@ pub async fn run(args: &ClientArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = HandshakeV2ClientConfig::new(args.remote, keypair, server_key);
     let cover = crate::cover_policy_from_args(args.no_cover, args.cover_mbps)?;
-    let mut manager = ClientSessionManager::new(&cfg, SessionLimits::default())
+    // The 24 h session-lifetime cap (D31 §4, D16): the cap is implemented and
+    // tested end-to-end, and the CLI default is 86400 s (24 h).  The **core**
+    // default stays `None` so library users are unaffected.  To revert the
+    // shipped binary to an unbounded lifetime, change the CLI default in
+    // `lib.rs` to `0` -- that is the single line.  The exposure bound is
+    // `cap + ~4 s` per side (D31 §4.1); it is a hard bound only while *both*
+    // endpoints enforce the cap.
+    let limits = SessionLimits {
+        lifetime_cap: crate::lifetime_cap_from_secs(args.lifetime_cap_secs),
+        ..SessionLimits::default()
+    };
+    let mut manager = ClientSessionManager::new(&cfg, limits)
         .map_err(|e| format!("client session manager init failed: {e}"))?;
     let mut udp = UdpTransport::connect(args.remote)
         .await

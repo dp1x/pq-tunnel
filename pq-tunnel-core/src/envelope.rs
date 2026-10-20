@@ -45,12 +45,29 @@
 //!
 //! On the receive path every per-packet failure — wrong version (§15), replay,
 //! AEAD tag mismatch (tamper/corruption), wrong direction (§12), or unknown inner
-//! framing (§14) — collapses to the single [`CodecError::DecryptionFailed`]
-//! variant.  Callers MUST treat any `Err` as "silently drop the packet"
-//! (PROTOCOL_SPEC §14: reject invalid packets, no insecure fallback, **no
-//! observable distinction** between failure reasons on the wire — no
-//! `format!`-carrying counters/directions escape in the returned error; operators
-//! debug via `tracing::debug!` locally).
+//! framing (§14) — results in the packet being **dropped**.  Callers MUST treat
+//! any `Err` as "silently drop the packet" (PROTOCOL_SPEC §14: reject invalid
+//! packets, no insecure fallback, **no observable distinction** between failure
+//! reasons on the wire — no `format!`-carrying counters/directions escape in the
+//! returned error; operators debug via `tracing::debug!` locally).
+//!
+//! # The one distinction that is local, not on the wire
+//!
+//! The *error value* distinguishes two classes, and the distinction never
+//! reaches the wire:
+//!
+//! - [`CodecError::DecryptionFailed`] — the **AEAD tag did not verify**.  This
+//!   is the only class that may consume a data-path failure-gate token
+//!   (D24: "a token is consumed only when an AEAD decrypt actually fails").
+//! - [`CodecError::Rejected`] — everything else: a replayed counter, invalid
+//!   inner framing, a direction mismatch, a wrong version byte.  Either the
+//!   packet was produced by a key holder, or the rejection was decided on the
+//!   cleartext header before any AEAD work — in neither case does it indicate
+//!   a wrong key, so it must not spend the source's failure budget.
+//!
+//! The observable behaviour is identical for both classes (silent drop, no
+//! reply, no error datagram), so the "uniform rejection" property of the wire
+//! is preserved exactly.
 //!
 //! Two deliberate, cheap *pre-filters* run before AEAD: the version byte
 //! (`PacketHeader::parse_header`, §15 downgrade detection) and the replay
@@ -310,11 +327,12 @@ impl CipherSession {
     /// direction).  Any failure returns `Err`; callers MUST drop the packet silently (§14).
     pub fn decrypt(&mut self, packet: &WirePacket) -> Result<InnerPlaintext, CodecError> {
         // §15: version pre-filter (cheap; also AAD-authenticated so a tampered
-        // version fails AEAD too).  Collapsed to the generic per-packet result so
-        // no failure-type distinction leaks (§14).
+        // version fails AEAD too).  A wrong version is not an AEAD failure, so
+        // it is reported as `Rejected` — the data-path failure gate must not
+        // spend a source's budget on a cleartext-header mismatch.
         let header = packet.parse_header().map_err(|e| {
             tracing::debug!(err=%e, "decrypt: header rejected");
-            CodecError::DecryptionFailed
+            CodecError::Rejected
         })?;
         let counter = header.packet_nonce;
 
@@ -350,10 +368,15 @@ impl CipherSession {
         // The sliding window (1024-bit, per DIRECTION) tolerates out-of-order
         // delivery within the window while rejecting replays (PROTOCOL_SPEC §5.6).
         // Scrub the recovered plaintext (replay is a replayed *authentic* packet).
-        if let Err(e) = self.replay.accept(counter) {
+        //
+        // A replay is NOT an AEAD failure: the tag verified, so the packet was
+        // produced by a key holder.  It is reported as `Rejected` so the
+        // data-path failure gate does not spend the source's budget on it
+        // (D24 — see the module docs).
+        if self.replay.accept(counter).is_err() {
             tracing::debug!(counter, recv_highest=?self.replay.highest(), "decrypt: replay rejected");
             plaintext.zeroize();
-            return Err(e);
+            return Err(CodecError::Rejected);
         }
 
         if plaintext.len() != INNER_PLAINTEXT_LEN {
@@ -365,14 +388,14 @@ impl CipherSession {
                 "decrypt: unexpected plaintext length"
             );
             plaintext.zeroize();
-            return Err(CodecError::DecryptionFailed);
+            return Err(CodecError::Rejected);
         }
         let inner = match InnerPlaintext::decode(&plaintext) {
             Ok(i) => i,
             Err(e) => {
                 tracing::debug!(err=%e, "decrypt: inner framing rejected");
                 plaintext.zeroize();
-                return Err(CodecError::DecryptionFailed);
+                return Err(CodecError::Rejected);
             }
         };
         // AEAD returned a heap `Vec<u8>`; `Vec::drop` does NOT zeroize
@@ -382,7 +405,8 @@ impl CipherSession {
 
         if inner.direction != self.role.recv_direction() {
             tracing::debug!(expected=?self.role.recv_direction(), got=?inner.direction, "decrypt: direction mismatch");
-            return Err(CodecError::DecryptionFailed);
+            // Authenticated but from the wrong role: not an AEAD failure.
+            return Err(CodecError::Rejected);
         }
 
         Ok(inner)
@@ -459,10 +483,13 @@ mod tests {
             .encrypt(MessageType::Data, &[0xAA; PAYLOAD_LEN])
             .unwrap();
         server.decrypt(&pkt).expect("first decrypt");
-        // Same packet again -> replay -> rejected (§5.6).
+        // Same packet again -> replay -> rejected (§5.6).  A replay is
+        // *authenticated* (the tag verified), so it is reported as `Rejected`,
+        // NOT as an AEAD failure: the data-path failure gate must not spend a
+        // source's budget on a replayed-but-authentic packet (D24).
         let second = server.decrypt(&pkt);
         assert!(
-            matches!(second, Err(CodecError::DecryptionFailed)),
+            matches!(second, Err(CodecError::Rejected)),
             "replay must be rejected"
         );
     }
@@ -492,7 +519,7 @@ mod tests {
         // Replay: counter 0 again — already in the window bitmap → rejected.
         let replay = server.decrypt(&p1);
         assert!(
-            matches!(replay, Err(CodecError::DecryptionFailed)),
+            matches!(replay, Err(CodecError::Rejected)),
             "replay must be rejected"
         );
     }
@@ -547,7 +574,8 @@ mod tests {
         let res = other_client.decrypt(&pkt);
         assert!(
             matches!(res, Err(CodecError::DecryptionFailed)),
-            "direction mismatch must be rejected"
+            "direction mismatch must be rejected: the per-direction keys differ, \
+             so the AEAD tag does not verify"
         );
     }
 
@@ -785,15 +813,36 @@ mod tests {
             "sanity: the tampered packet must still carry the forged version"
         );
 
-        // (c) The receive path does not stop at the version gate, so the
-        // rejection happens later — at the AEAD, the only gate left.
+        // (c) The receive path rejects the forged version at the §15
+        // pre-filter, *before* any AEAD work.  That rejection is **not** an
+        // AEAD failure, so it is reported as `Rejected`: a data-path
+        // failure gate must not spend a source's budget on a cleartext
+        // header mismatch (D24).
         assert!(
             !matches!(server.decrypt(&bad), Err(CodecError::InvalidVersion { .. })),
             "CipherSession::decrypt must not reject on the version pre-filter alone; \
              a version-derived rejection here would not demonstrate AAD coverage"
         );
         assert!(
-            matches!(server.decrypt(&bad), Err(CodecError::DecryptionFailed)),
+            matches!(server.decrypt(&bad), Err(CodecError::Rejected)),
+            "the version pre-filter must reject a forged version byte before the AEAD"
+        );
+
+        // (d) The AAD coverage itself is demonstrated directly: the forged
+        // header *is* the AAD, so an AEAD verification over it must fail
+        // even though the AEAD region is untouched.  (The pre-filter hides
+        // this through the public `decrypt`; the primitive does not.)
+        let key = derive_server_to_client_key(&master, &test_sid()).unwrap();
+        let prefix = derive_nonce_prefix_s2c(&master, &test_sid()).unwrap();
+        let nonce = AeadNonce::from_bytes(build_session_nonce(&prefix, 0));
+        assert!(
+            aead_decrypt(
+                &AeadKey::from_bytes(key),
+                &nonce,
+                bad.aead_region(),
+                bad.header_bytes()
+            )
+            .is_err(),
             "flipping only the version byte (AAD byte 0) must fail AEAD verification"
         );
     }
@@ -835,7 +884,7 @@ mod tests {
         // counter 2 is now below the high-water and was already seen -> replay rejected.
         let two = saved_two.unwrap();
         assert!(
-            matches!(server.decrypt(&two), Err(CodecError::DecryptionFailed)),
+            matches!(server.decrypt(&two), Err(CodecError::Rejected)),
             "out-of-order lower counter must be rejected"
         );
         // The next in-order counter (5) is still accepted.
@@ -917,9 +966,10 @@ mod tests {
         }
     }
 
-    /// `decrypt` must collapse ALL failure types to `DecryptionFailed` except
-    /// `NonceExhausted` (rekey trigger).  No error variant other than these
-    /// two should ever escape.
+    /// `decrypt` must collapse ALL failure types to `DecryptionFailed` (AEAD
+    /// tag mismatch) or `Rejected` (every non-AEAD rejection), except
+    /// `NonceExhausted` (the rekey trigger).  No other error variant may ever
+    /// escape.
     #[test]
     fn fuzz_decrypt_error_uniformity() {
         let master = test_master();
@@ -932,13 +982,14 @@ mod tests {
                 match server.decrypt(&pkt) {
                     Ok(_) => {}
                     Err(e) => {
-                        // Must be DecryptionFailed, NonceExhausted, or InvalidVersion
-                        // (InvalidVersion is collapsed to DecryptionFailed by the version
-                        // pre-filter, so it should not appear here).
+                        // Must be DecryptionFailed (AEAD), Rejected (non-AEAD
+                        // rejection), or NonceExhausted (rekey trigger).
                         assert!(
                             matches!(
                                 e,
-                                CodecError::DecryptionFailed | CodecError::NonceExhausted { .. }
+                                CodecError::DecryptionFailed
+                                    | CodecError::Rejected
+                                    | CodecError::NonceExhausted { .. }
                             ),
                             "unexpected error variant from decrypt: {:?}",
                             e
@@ -964,8 +1015,8 @@ mod tests {
         bytes[0] = 0; // version 0 (should be 1)
         let bad = WirePacket::from_bytes(&bytes).unwrap();
         assert!(
-            matches!(server.decrypt(&bad), Err(CodecError::DecryptionFailed)),
-            "tampered version must be rejected (collapsed to DecryptionFailed)"
+            matches!(server.decrypt(&bad), Err(CodecError::Rejected)),
+            "tampered version must be rejected (a header pre-filter, not an AEAD failure)"
         );
     }
 
@@ -1061,7 +1112,8 @@ mod tests {
                 other_client.decrypt(&pkt),
                 Err(CodecError::DecryptionFailed)
             ),
-            "direction mismatch must be rejected"
+            "direction mismatch must be rejected: the per-direction keys differ, \
+             so the AEAD tag does not verify"
         );
     }
 }

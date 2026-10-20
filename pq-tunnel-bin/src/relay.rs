@@ -294,6 +294,13 @@ async fn tunnel_to_app_loop(
             Some(ManagerNotification::Ready { .. }) => {
                 // D15: the session is confirmed live; nothing to do here.
             }
+            Some(ManagerNotification::OutboundDropped { dropped }) => {
+                // The bounded outbound queue dropped application payloads
+                // (overflow or TTL expiry).  The data was *not* delivered:
+                // the application is told so the loss is never silent
+                // (D31 §7).
+                warn!("Outbound queue dropped application payloads (cumulative {dropped})");
+            }
         }
     }
 }

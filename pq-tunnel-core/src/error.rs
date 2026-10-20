@@ -3,11 +3,26 @@
 ///
 /// Every variant represents a packet that is malformed or violates the protocol and
 /// must be rejected (PROTOCOL_SPEC §14 — reject invalid packets, never fall back to
-/// insecure behaviour).  On the receive path, `Envelope::decrypt`-level failures are
-/// collapsed to [`CodecError::DecryptionFailed`] so that an attacker observes no
-/// distinguishable semantics (no replay-vs-tamper-vs-direction distinction leaks via
-/// error handling — see the envelope "Failure is rejection" docs).  Callers
-/// translate these into a silent drop.
+/// insecure behaviour).  On the receive path, per-packet failures are collapsed so
+/// that an attacker observes no distinguishable semantics (no replay-vs-tamper-vs-
+/// direction distinction leaks via error handling — see the envelope "Failure is
+/// rejection" docs).  Callers translate these into a silent drop.
+///
+/// # The one distinction that is *not* collapsed
+///
+/// [`CodecError::DecryptionFailed`] means **the AEAD tag did not verify**.  Every
+/// other per-packet rejection — a replayed counter, invalid inner framing, a
+/// direction mismatch, a wrong version byte — is reported as
+/// [`CodecError::Rejected`].
+///
+/// The distinction is **local only**: the rejected packet is dropped identically
+/// in both cases (no reply, no error datagram, no on-wire signal), so the
+/// "uniform rejection" property of the wire is preserved.  It exists solely so
+/// the data-path failure gate can apply the D24 accounting rule — *a token is
+/// consumed only when an AEAD decrypt actually fails*.  Charging a token for a
+/// replayed-but-authentic packet would let an off-path attacker who captures
+/// copies of the victim's traffic drain the victim's failure budget and get its
+/// legitimate traffic dropped for a whole window (D24 violation).
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
     #[error("truncated or oversized field `{field}`: needed {min} bytes, got {got}")]
@@ -54,13 +69,31 @@ pub enum CodecError {
     #[error("rekey rejected: {reason}")]
     RekeyRejected { reason: &'static str },
 
-    /// Uniform "drop this packet" result for every per-packet decryption failure:
-    /// replay, AEAD tag mismatch (tamper/corruption), version mismatch, wrong
-    /// direction, or malformed inner framing.  Carries no internal state so that no
-    /// side channel can distinguish failure reasons (PROTOCOL_SPEC §14).  Operators
-    /// debug via `tracing::debug!` at the call site, never via the returned value.
+    /// Uniform "drop this packet" result for an **AEAD tag mismatch**
+    /// (tamper/corruption).  Carries no internal state so that no side channel
+    /// can distinguish failure reasons (PROTOCOL_SPEC §14).  Operators debug via
+    /// `tracing::debug!` at the call site, never via the returned value.
+    ///
+    /// This is the **only** per-packet rejection that may consume a data-path
+    /// failure-gate token (D24: a token is consumed only when an AEAD decrypt
+    /// actually fails).  Every other rejection is [`CodecError::Rejected`].
     #[error("packet rejected: decryption/validation failed")]
     DecryptionFailed,
+
+    /// The packet was rejected **without an AEAD failure**.
+    ///
+    /// Covers every per-packet rejection that is decided *after* the AEAD tag
+    /// verified (a replayed counter, invalid inner framing, a direction that
+    /// does not match the receiver's role) as well as the ones decided on the
+    /// cleartext header before any AEAD work (a wrong version byte).
+    ///
+    /// Wire behaviour is identical to [`CodecError::DecryptionFailed`]: the
+    /// packet is dropped silently, no reply is emitted, nothing distinguishes
+    /// the two on the wire.  The distinction is local, and exists only so the
+    /// data-path failure gate can charge a token **only** for a genuine AEAD
+    /// failure (D24).  See the module docs.
+    #[error("packet rejected: not an AEAD failure")]
+    Rejected,
 
     /// Wraps a `pq_crypto` failure (KDF/key-setup errors).  These are fatal/local —
     /// not per-packet peer input — so the structured error is preserved for logging.

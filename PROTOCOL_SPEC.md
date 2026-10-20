@@ -422,6 +422,51 @@ During an active session Tunnel provides:
 - replay protection
 - traffic management
 
+The `ESTABLISHED` state means **the session layer is live**: the keys are
+derived, the nonce state is active, and the encrypted transport may carry
+payloads.  It does **not** by itself assert that the peer holds the same
+master.  Key **confirmation** — that the peer derived the same keys — is a
+separate fact, tracked by the endpoint, and is confirmed by the first
+authenticated server packet that decrypts (D15).  A client MUST NOT deliver
+inbound application data before an authenticated server packet has decrypted;
+an endpoint that has not yet seen one MUST enforce a confirmation deadline
+that closes the mis-keyed session (fail closed, §5.7).  See §8.3.1 and
+`docs/design/D31-client-lifecycle-and-liveness.md`.
+
+### 8.3.1 In-session control messages
+
+An established session MAY carry **in-session control messages** in the
+encrypted payload, using the `MessageType::Handshake` (0x00) type.  This is
+a *semantic extension of an existing authenticated type*: it introduces **no
+new wire bytes, no new framing, and no change** to the AAD, the nonce
+construction, the key schedule, the transcript or the replay window.
+
+The first payload byte is the control sub-type:
+
+| Sub-type | Name | Meaning |
+|---|---|---|
+| `0x01` | liveness probe | "are you there?" — the peer answers with an ack. |
+| `0x02` | liveness ack | "yes" — it also confirms the key agreement. |
+| any other | — | **MUST be ignored**, with no state change. |
+
+A control message:
+
+- MUST NOT be relayed to the application;
+- MUST NOT be treated as a decrypt failure (a control message that decrypts
+  successfully consumes no failure-gate budget — D24);
+- MUST be authenticated exactly like any other payload: it is protected by
+  the session's AEAD and is subject to the same replay protection.
+
+The probe is the liveness signal of the session: it confirms the key
+agreement and it keeps a live-but-quiet session from being reaped by an
+idle timeout.  An endpoint MUST NOT answer a probe it has not
+authenticated.
+
+> **Note (D31 §7):** `PROTOCOL_VERSION` is unchanged by this extension.
+> A peer that does not know the meaning of sub-type `0x01` ignores the
+> message; the mixed-build behaviour is documented in
+> `docs/design/D31-client-lifecycle-and-liveness.md`.
+
 ---
 
 ## 8.4 Closed State

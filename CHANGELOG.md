@@ -14,6 +14,48 @@ stable 1.0 release.
 
 ### Security
 
+- **The client session lifecycle is corrected.**  The client no longer waits
+  out the M3 retransmission budget (6.25-9.22 s) before it has a session: the
+  session is created at the M3 transmission, in an *unconfirmed* state, and
+  confirmed by the first authenticated server packet that decrypts (D15).
+  The peer is authenticated at the M2 (D12); what the confirmation gate
+  covers is *key agreement*, not identity.  Consequences: the tunnel comes up
+  in approximately one RTT instead of 6-9 s, application data pushed during
+  establishment is buffered (bounded, TTL'd, drop-newest, reported to the
+  application) instead of being dropped silently, and the client can no
+  longer end up in an endless re-handshake loop with no liveness signal.
+  See `docs/design/D31-client-lifecycle-and-liveness.md`.
+- **Post-confirmation peer-loss detection now exists** and works with
+  `--no-cover`.  A session that was confirmed and then went silent is closed
+  (`Closed{PeerUnresponsive}`) after N consecutive unanswered liveness
+  rounds, and the client re-establishes with a fresh sid, fresh ephemerals
+  and a fresh master.  Liveness uses the **already-reserved**
+  `MessageType::Handshake` (0x00) as an in-session control message: no new
+  message type, no new framing, and no change to the AAD, the nonce
+  construction, the key schedule, the transcript or the replay window.
+- **The server reaps abandoned sessions again.**  The server's idle clock
+  tracked the server's *own outbound* traffic, so with cover enabled (the
+  default) it never evicted anything and the session table grew without
+  bound.  It now tracks authenticated *receives* only, so a departed peer's
+  session is reaped after `idle_timeout` and a live-but-quiet peer is kept
+  alive by its liveness probe.
+- **The data-path failure gate now matches D24 literally.**  A token is spent
+  only when an AEAD decrypt *actually fails*.  A successfully decrypted
+  in-session control message and a replayed-but-authentic packet no longer
+  spend one: the old behaviour let an off-path attacker who captured traffic
+  drain a victim's budget and get its legitimate traffic dropped for a whole
+  `fail_window` at about 6 packets/s of attacker effort.  The distinction is
+  **local only** -- the wire behaviour (silent drop, no reply, no error
+  datagram) is unchanged, so PROTOCOL_SPEC §14's "no observable distinction"
+  property is preserved.
+- **A session-lifetime cap is enforced by default.**  `--lifetime-cap-secs`
+  (default 86400 = 24 h, `0` = unbounded) on both the client and the server.
+  When the cap fires the endpoint sends an encrypted `Close` to the peer
+  before dropping the session, so the two endpoints converge on the intended
+  lifetime semantics without relying on synchronised clocks.  The `Close` is
+  retransmitted a bounded number of times, because a fire-and-forget `Close`
+  over UDP can be lost.  The core `SessionLimits::default().lifetime_cap`
+  stays `None`, so library users are unaffected.
 - The server's UDP forwarding backend now applies an **egress guard**: it
   refuses destination port 0, IPv4/IPv6 loopback (including IPv4-embedded and
   IPv4-mapped representations), unspecified addresses, multicast, limited
@@ -52,11 +94,48 @@ stable 1.0 release.
 
 ### Fixed
 
+- The handshake source rate limiter no longer charges a source's budget for an
+  M3 that names a sid with no live pending entry: the entry is resolved
+  first, then the rate gate applies (the data path's lookup-first
+  ordering).  A retransmitted M3 for an already-consumed session is now
+  free.
+- The server's pending-handshake entry no longer expires while the client is
+  actively retransmitting its M1: the cached-M2 resend refreshes the entry's
+  last-seen instant.
+- The client compares the session id **before** the AEAD decrypt, so a
+  datagram naming another session costs no decrypt work.  The server already
+  did this.
+- The client now compares the session id before the decrypt on **both** roles
+  and never re-creates a session for a live or previously retired session
+  id: the send counter and the replay window are never reset under a
+  session id that already carried a session.
+- A failed client re-arm no longer terminates the client driver.  The
+  re-arm is retried from the periodic tick instead.
 - The project documentation no longer claims a 192-bit ChaCha20-Poly1305
   nonce (the construction uses the RFC 8439 96-bit nonce), no longer cites
   an unreachable commit for the D16 driver E2E, and no longer mis-states the
   1280-byte record as fitting a 1280-byte-MTU path (it is a UDP payload; the
   outer packet is 1308/1328 bytes).
+
+### Documentation
+
+- `docs/design/D31-client-lifecycle-and-liveness.md` — the client
+  lifecycle, the liveness mechanism, the lifetime-cap semantics, the
+  bounded outbound queue, and the compatibility analysis.
+- `docs/design/D32-runtime-revocation.md` and the D27 amendment — the
+  runtime roster-reload design, and the verified findings that runtime reload
+  was never wired into the shipped server, that the shipped
+  roster-atomicity test is vacuous with respect to the swap, and that the
+  roster handle's clone is pinned to a stale generation.
+- `docs/design/D33-corrected-tun-architecture.md` and the D30 amendment —
+  the corrected system-wide TUN/IP data plane, with the byte and MTU
+  arithmetic re-derived from the code, and the corrections to D30's
+  claims.  **Research only**: no TUN code was written.
+- `THREAT_MODEL.md` §13.7 — the establishment window now collapses to about
+  one RTT, the M3 budget is no longer a deadline and therefore no longer an
+  establishment fingerprint, the liveness probe period is the new periodic
+  observable, and the server's session reaping is observable again.  The
+  §13.6 lab campaign has **not** been re-run.
 
 ### Added (M10)
 

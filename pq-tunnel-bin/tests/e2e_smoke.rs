@@ -143,7 +143,9 @@ async fn e2e_smoke_forwarding_roundtrip() {
                     forwarder.handle(sid, &inner.payload).await;
                 }
                 ManagerNotification::Closed { sid, .. } => forwarder.on_session_closed(sid),
-                ManagerNotification::Established { .. } | ManagerNotification::Ready { .. } => {}
+                ManagerNotification::Established { .. }
+                | ManagerNotification::Ready { .. }
+                | ManagerNotification::OutboundDropped { .. } => {}
             }
         }
         forwarder.shutdown();

@@ -696,3 +696,66 @@ intra-run reconnection (20 extra default-config samples); server.csv
 is echo-mixed in e1-e5 and was not used beyond the e0 clean
 single-session capture (M2 5-fragment burst + immediate cover,
 confirming the §13.5 asymmetry).
+
+---
+
+## 13.7 Wave 2 — the establishment window collapses, and the probe becomes the new fingerprint (2026-10-21)
+
+**This section supersedes parts of §13.6.**  The lifecycle rework (D31)
+changed the client handshake from "the session exists only after the M3
+retransmission budget is spent" to "the session exists at the M3
+transmission, confirmed by the first authenticated server packet".  The
+measured establishment window in §13.6 described the **old** behaviour and no
+longer describes the shipped one.  The claims below are derived from the
+code, not re-measured: **the lab campaign in §13.6 has not been re-run**, and
+that is stated as an open item below.
+
+**Establishment window (H1) — collapsed, and no longer M3-budget shaped.**
+The client now prepares its session at the M3 transmission and confirms it
+with an in-session liveness probe, so the window is ≈1 RTT plus the server's
+M3-processing latency, instead of the 6.25-9.22 s band §13.6 measured.  The
+M3 retransmission budget is now a **retransmission policy, not a deadline**:
+it no longer determines when the session comes up, and the confirmation
+deadline (`confirm_timeout`, 30 s) is the only deadline on that path.
+
+**M3-budget distinguishability (H2-adjacent) — no longer present in the
+old form.**  §13.6 measured the establishment duration as an
+implementation fingerprint (median 7.78 s for budget 4 vs 0.76 s for budget 1
+vs 0.27 s for budget 0, 60/60 correct classification).  That fingerprint was
+an artefact of *the budget being the establishment deadline*.  With the
+budget demoted to a retransmission policy, the duration no longer tracks the
+budget, so the classification described in §13.6 no longer applies.  A new,
+weaker fingerprint replaces it: the client emits a **liveness probe every
+5 s** (in the confirmed state, replacing a cover slot in the
+client-to-server direction), and the **server answers with an ack every
+5 s** (additive, in the server-to-client direction).  The probe period is
+therefore a new observable constant.  It is a *period*, not a *duration*: it
+does not distinguish a session that transferred a large payload from one that
+transferred none, and it is the same for every session.
+
+**Retransmit schedule (H4) — amended.**  §13.6 verified the post-M3 gaps
+against `jittered(500, 1000, 2000, 4000)` with the once-armed M1 timer
+semantics, and noted the single race in which the M1 timer fired before the
+M2 arrived.  The M3 retransmit schedule is now **re-based on the M3**: the
+first M3 retransmission is `jittered(250 ms)` after the M3 transmission
+rather than after the M1, so the gap band is `jittered(250, 500, 1000, 2000,
+4000)` and the M1/M2 race no longer distorts it.  The previous measurement
+does not describe the current schedule.
+
+**Server-side session reaping — a new observable, and a security
+improvement.**  Before D31 the server refreshed its idle clock on its **own
+outbound** traffic, so with cover enabled (the default) it never reaped a
+session at all and its session table grew without bound.  The idle clock now
+tracks **authenticated receives only**, so the client's 5 s probe keeps a
+live-but-quiet session alive and a departed peer's session is reaped after
+`idle_timeout` (5 min).  Two consequences: the server's traffic-key retention
+is bounded again (it was not), and the session *count* is now an observable
+that **drops** after a peer disappears (it previously only ever rose).  A
+passive observer can therefore see a session disappear; that was already
+visible in the §13.6 "session liveness ... visible by construction" list, so
+no new class of information is exposed.
+
+**Open item.**  The §13.6 lab campaign should be re-run against the new
+lifecycle before the establishment-window numbers are quoted anywhere.  The
+figures in this section are code-derived and are marked as such; the
+measurement is outstanding.
