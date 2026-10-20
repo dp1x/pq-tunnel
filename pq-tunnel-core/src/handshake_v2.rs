@@ -2339,6 +2339,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mixed_version_handshake_fragment_rejected() {
+        // A v1 peer's handshake fragment must not be accepted by a v2 stack:
+        // the wire version is checked before any handshake state is touched.
+        let sid = [1u8; SESSION_ID_LEN];
+        let mut dg = [0u8; PACKET_SIZE];
+        dg[0] = 1; // legacy protocol version 1
+        dg[1..1 + SESSION_ID_LEN].copy_from_slice(&sid);
+        dg[9] = HS_TYPE_CLIENT_HELLO;
+        dg[11] = M1_FRAG_COUNT;
+        let wp = WirePacket::from_bytes(&dg).expect("right size");
+        assert!(
+            wp.parse_header().is_err(),
+            "v1-versioned handshake fragment must be rejected by v2 codec"
+        );
+    }
+
+    #[test]
     fn is_handshake_fragment_dispatch() {
         let sid = [2u8; SESSION_ID_LEN];
         for hs_type in [

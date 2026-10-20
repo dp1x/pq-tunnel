@@ -14,6 +14,11 @@ stable 1.0 release.
 
 ### Security
 
+- **Protocol version bumped from 1 to 2.**  `PROTOCOL_VERSION` is now 2
+  (D33 §7) so that a TUN-unaware (v1) peer fails the handshake with an
+  explicit version mismatch instead of becoming a silent data-plane black
+  hole.  Mixed-version peers are rejected, fail closed.  KDF/test vectors
+  updated to the v2 derivation.
 - **The client session lifecycle is corrected.**  The client no longer waits
   out the M3 retransmission budget (6.25-9.22 s) before it has a session: the
   session is created at the M3 transmission, in an *unconfirmed* state, and

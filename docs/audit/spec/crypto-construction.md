@@ -33,7 +33,7 @@
 | Field | Value |
 |---|---|
 | Profile version | ✅ `v0.2.0-alpha` — `CRYPTO_PROFILE.md:422` |
-| Applies to protocol version | ✅ `1` — `codec.rs:81` |
+| Applies to protocol version | ✅ `2` — `codec.rs:81` |
 | Profile identity | `[TO BE AUTHORED]` — how does a peer know which profile is in use? Answer today: it does not negotiate; the version byte is the only selector (`DESIGN_DECISIONS.md:605-607`). Is that sufficient? |
 | Agility policy | ✅ "algorithm replacement may require a protocol version change" ⚠️ `CRYPTO_PROFILE.md:414-417` |
 

@@ -79,7 +79,7 @@ use crate::error::CodecError;
 /// communication and downgrade attacks.  Packets carrying a version other than
 /// this value are rejected by [`PacketHeader::decode`].  Bumping this constant
 /// signals an incompatible wire-format change.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Number of bytes occupied by the version field.
 pub const VERSION_LEN: usize = 1;

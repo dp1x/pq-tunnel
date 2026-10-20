@@ -31,7 +31,7 @@
 
 | Field | Value |
 |---|---|
-| Protocol version | **1** ✅ (`codec.rs:81` → `PROTOCOL_VERSION: u8 = 1`) |
+| Protocol version | **2** ✅ (`codec.rs:81` → `PROTOCOL_VERSION: u8 = 2`) |
 | Wire version history | `[TO BE AUTHORED]` — what was version 0, and does version 0 exist on the wire? |
 | Version-negotiation rule | Strict equality; no negotiation ✅ (`codec.rs:296-301`) |
 | Change policy | "Bumping this constant signals an incompatible wire-format change" ✅ (`codec.rs:80`) — but the *process* is `[TO BE AUTHORED]` |
@@ -409,7 +409,7 @@ destination header is invisible to an observer because it is inside the AEAD.
 
 ## 11. Open questions for the author
 
-1. **Is `version = 1` currently the only version ever emitted?** If a v0
+1. **Is `version = 2` currently the only version ever emitted?** If a v1
    existed on the wire, the downgrade story needs a sentence.
 2. **Should `frag_total` be pinned per `hs_type`, or is a version-2
    renegotiation planned?** Currently pinned (`handshake_v2.rs:262-265`).

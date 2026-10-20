@@ -613,10 +613,10 @@ mod tests {
         }),
     ];
 
-    /// Protocol version byte used by the separation matrix. Pinned to `1`
+    /// Protocol version byte used by the separation matrix. Pinned to `2`
     /// (the codec's `PROTOCOL_VERSION`) so the matrix does not silently track
     /// a future version bump without review.
-    const PROTOCOL_VERSION_FOR_KDF_TESTS: u8 = 1;
+    const PROTOCOL_VERSION_FOR_KDF_TESTS: u8 = 2;
 
     /// Every pair of distinct labels must yield distinct keying material from
     /// the same master. Cross-label separation is the whole point of the

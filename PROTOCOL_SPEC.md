@@ -462,7 +462,8 @@ agreement and it keeps a live-but-quiet session from being reaped by an
 idle timeout.  An endpoint MUST NOT answer a probe it has not
 authenticated.
 
-> **Note (D31 §7):** `PROTOCOL_VERSION` is unchanged by this extension.
+> **Note (D31 §7 / D33 §7):** `PROTOCOL_VERSION` is 2 as of the TUN
+> extension (D33 §7).  The liveness extension (D31) itself did not bump it.
 > A peer that does not know the meaning of sub-type `0x01` ignores the
 > message; the mixed-build behaviour is documented in
 > `docs/design/D31-client-lifecycle-and-liveness.md`.
@@ -612,6 +613,10 @@ Errors MUST NOT cause insecure fallback behaviour.
 # 15. Versioning
 
 Tunnel MUST support protocol version identification.
+
+The current protocol version is **2** (`PROTOCOL_VERSION = 2` in
+`pq-tunnel-core/src/codec.rs`).  Packets carrying any other version byte are
+rejected at decode time (fail closed, §5.7).
 
 Version negotiation MUST:
 

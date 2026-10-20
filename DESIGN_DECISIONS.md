@@ -603,8 +603,10 @@ A 3-message client-initiated flow over uniform 1280-byte datagrams.
 ### Versioning, sid, failure behaviour
 
 - The version byte is the full profile selector: strict equality both
-  directions, no negotiation, mismatch → silent drop. Version, SID, and all
-  key material are inside every digest and the master `info` (§15, D11).
+  directions, no negotiation, mismatch → silent drop. The current value is
+  2 (bumped from 1 by D33 §7 so a TUN-unaware peer fails the handshake
+  instead of becoming a silent black hole). Version, SID, and all key
+  material are inside every digest and the master `info` (§15, D11).
 - `sid`: client-chosen, 8 bytes, CSPRNG-mandatory; the server echoes it and
   the client verifies the echo before crypto; collision → reject newcomer;
   never reused; one session per sid (D4).

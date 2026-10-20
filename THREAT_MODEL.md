@@ -426,6 +426,8 @@ The threat model requires Tunnel to consider:
 - authenticated communication,
 - replay protection,
 - downgrade resistance,
+- protocol version pinning (current version 2; mixed-version peers are
+  rejected, fail closed),
 - fail-secure behaviour.
 
 ## User Control
