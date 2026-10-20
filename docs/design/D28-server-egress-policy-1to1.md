@@ -2,9 +2,12 @@
 
 ## Status
 
-**Proposed** — design direction decided, not implemented. No code has been
-written. Nothing in this document changes current behaviour until the change
-plan in §6 is executed and the decision gates in §9 are cleared.
+**Proposed design; a MINIMAL subset is implemented.** The full policy below is
+a **design proposal** — none of the table in §4, and none of the CLI flags in
+§5, has shipped. What *has* shipped is a deliberately small guard that closes
+the highest-severity hole (cloud-credential theft via the instance metadata
+plane). See **§0 — What actually shipped** below for the exact list, and
+§4/§5 for what did **not**.
 
 > Scope note: this document is written against a **1:1 deployment** — one
 > server, one client identity. It deliberately contains no multi-tenant
@@ -12,6 +15,67 @@ plan in §6 is executed and the decision gates in §9 are cleared.
 > capability tokens, no plugin sandboxing. Where a future multi-tenant design
 > would need a different structure, that is recorded as DEFERRED in §7, not
 > built.
+
+---
+
+## 0. What actually shipped (fact-checked against the tree)
+
+A **minimal** server-side egress guard is implemented in
+`pq-tunnel-bin/src/forward.rs` (module `egress`). It is a pure function of the
+destination address and port — no I/O, no DNS, no state — and it is evaluated
+**before any socket is created**, so a denied destination produces no outbound
+datagram and no client-visible reply; the frame is dropped exactly like an
+unroutable one. Denials are visible to the operator only through a bounded,
+non-sensitive per-rule counter, never through per-destination logging.
+
+### Shipped
+
+| Rule | Denied | Notes |
+|---|---|---|
+| `port_zero` | destination port 0 | Not a port. The OS accepts it on some platforms, so the tunnel refuses it itself. |
+| `v4_loopback` | `127.0.0.0/8` | |
+| `v6_loopback` | `::1/128` | |
+| `v4_unspecified` | `0.0.0.0/8` | "this network" / unspecified (RFC 1122). |
+| `v6_unspecified` | `::/128` | |
+| `v4_multicast` | `224.0.0.0/4` | |
+| `v6_multicast` | `ff00::/8` | |
+| `v4_broadcast` | `255.255.255.255/32` | limited broadcast. |
+| `metadata_imds_v4` | `169.254.169.254` | AWS / GCP / Azure IMDS. |
+| `metadata_alibaba_v4` | `100.100.100.200` | Alibaba ECS IMDS. |
+| `metadata_aws_v6` | `fd00:ec2::254` | AWS IMDS over IPv6. |
+| `metadata_gcp_v6` | `fd20:ce::254` | GCP metadata over IPv6. |
+
+Two ordering properties matter and are implemented as such:
+
+- The four **exact** metadata hosts are evaluated **before any range rule**,
+  so they are denied even though their enclosing ranges (`169.254.0.0/16`,
+  `100.64.0.0/10`) are **not** denied.
+- IPv4-embedded IPv6 forms are normalised to IPv4 **before** the IPv4 rules
+  run, so `::ffff:127.0.0.1` cannot be used to reach the IPv4 loopback behind
+  the IPv4 rules.
+
+### NOT shipped
+
+- **The full §4 table.** Rows 8/9 (link-local `169.254.0.0/16` and
+  `fe80::/10`), row 16 (`100.64.0.0/10` CGNAT), row 18/19/20 (6to4, Teredo,
+  NAT64), row 22 (subnet-directed broadcast), row 23 (`240.0.0.0/4`
+  reserved), row 24 (DNS on the operator's LAN) and the rest of the table are
+  **not enforced**.
+- **The §5 CLI flags.** `--allow-cidr` and `--allow-all-egress` do not exist.
+- **The §4 defaults "deny `100.64.0.0/10`" and "deny the operator's LAN
+  DNS".** Neither is implemented, and neither should be taken as-is: both are
+  **product-breaking for a VPN** whose purpose is reaching private networks
+  and resolving names on the operator's LAN. RFC1918, ULA, CGNAT, link-local
+  and port 53 all remain reachable **by design** in the shipped guard.
+- **The raw-IP / TUN egress policy.** Under the product's end state
+  (system-wide TUN egress) the destination space is total, and the policy
+  must be revisited for it. That is deferred to the TUN milestone; this
+  document's table is written for the shipped relay's destination set.
+
+The scope note in §4 — that the client can already name any destination under
+the relay — remains accurate. The shipped guard reduces the blast radius; it
+does not turn the forwarding backend into something other than a
+server-side egress path for an authenticated remote party.
 
 ---
 
@@ -500,7 +564,9 @@ Ordered. Each step marked **LOW-RISK** (mechanical, no design judgement),
 | 12 | **Investigate only:** confirm whether `to_ipv4_mapped()` alone is sufficient or whether IPv4-compatible addresses need separate handling. Do **not** add IPv4-compatible handling speculatively. | — | **RESEARCH-ONLY** |
 
 Gate commands after steps 1–10 (per AGENTS.md, `--target x86_64-pc-windows-msvc`
-is mandatory; the ARM64 host cannot build `aws-lc-sys`):
+is the canonical target; note that the "ARM64 host cannot build `aws-lc-sys`"
+reason formerly quoted here is stale — `aws-lc-sys` is not in the dependency
+tree at all):
 
 ```sh
 cargo fmt --check

@@ -21,7 +21,7 @@ measured it is written **NOT MEASURED** with the reason.
 | RAM | 19.996 GiB total; 10.43 GiB free at the start of the run |
 | OS | Microsoft Windows 11 IoT Enterprise LTSC Evaluation, 10.0.26100 (build 26100), ARM 64-bit |
 | `rustc` | `rustc 1.96.0 (ac68faa20 2026-05-25)`, host `aarch64-pc-windows-msvc`, LLVM 22.1.2 |
-| Build target | `x86_64-pc-windows-msvc` (mandated by AGENTS.md — the ARM64 host cannot assemble `aws-lc-sys`) |
+| Build target | `x86_64-pc-windows-msvc` (the canonical target per AGENTS.md; it is what CI verifies and what the release gate is measured on. Note: the older note here said the ARM64 host "cannot assemble `aws-lc-sys`" — that reason is stale, `aws-lc-sys` is not in the dependency tree at all) |
 | Binary under test | `bench/target/x86_64-pc-windows-msvc/release/pq-bench.exe` |
 | Commit | `ae8061d50fa73c43467424c3fb3be988aa17527e` (`origin/main`) |
 | Profile | `release`, `opt-level = 3`, `debug = true`, `panic` **not** `abort` |
@@ -468,18 +468,85 @@ is almost certainly well under 100 ns. Reported as measured, and flagged.
 `p50 = 500 ns`, `min = 300 ns` — **identical across the entire sweep**, which is
 the signature of a measurement floor rather than a function cost.
 
-| rate (bps) | returned interval |
-|---:|---|
-| 1 000 | 10.24 s |
-| 64 000 | 160 ms |
-| 100 000 | 102.4 ms |
-| 1 000 000 | 10.24 ms |
-| **2 000 000** (default) | **5.12 ms** |
-| 10 000 000 | 1.024 ms |
-| 100 000 000 | 102.4 µs |
-| 1 000 000 000 | 10.24 µs |
-| 1 000 000 000 000 | 10 ns (clamped) |
-| ≥ 1 000 000 000 000 000 | 1 ns (clamped) |
+> **UPDATE — the returned values in the table below are no longer what the
+> function returns.** `interval_from_rate_bps` now clamps the interval into
+> `[MIN_COVER_INTERVAL_NANOS, ..]` with
+> `MIN_COVER_INTERVAL_NANOS = 21 762 ns` (21.762 µs), derived in §7.5 from the
+> measured cost of producing one cover packet. The old floor was
+> `nanos.max(1)` — a **1 ns** clamp — and rows that reached it are marked
+> below. The D19 default (2 Mbps → 5.12 ms) is **unaffected**: it is 235x the
+> floor.
+
+| rate (bps) | returned interval (as measured at `ae8061d`) | returned interval (**now**) |
+|---:|---|---|
+| 1 000 | 10.24 s | 10.24 s |
+| 64 000 | 160 ms | 160 ms |
+| 100 000 | 102.4 ms | 102.4 ms |
+| 1 000 000 | 10.24 ms | 10.24 ms |
+| **2 000 000** (default) | **5.12 ms** | **5.12 ms** |
+| 10 000 000 | 1.024 ms | 1.024 ms |
+| 100 000 000 | 102.4 µs | 102.4 µs |
+| 1 000 000 000 | 10.24 µs | **21.762 µs (clamped to the floor)** |
+| 1 000 000 000 000 | 10 ns (clamped) | **21.762 µs (clamped to the floor)** |
+| ≥ 1 000 000 000 000 000 | 1 ns (clamped) | **21.762 µs (clamped to the floor)** |
+| **470 544 986** (the maximum rate the floor admits) | — | **21.762 µs (exactly the floor)** |
+
+**The maximum sustainable cover rate** is
+
+```
+MAX_COVER_RATE_BPS = PACKET_SIZE * 8 * 1_000_000_000 / MIN_COVER_INTERVAL_NANOS
+                  = 10 240 * 1_000_000_000 / 21 762
+                  = 470 544 986 bit/s  ≈ 470 Mbps
+```
+
+(Integer division floors, so 470,544,986 bps is exactly the largest rate the
+floor admits: one bit/s more would ask for an interval one nanosecond shorter.)
+`pq-tunnel-bin` exposes this as `MAX_COVER_MBPS_PACING = 470` and **rejects**
+a `--cover-mbps` above it with a named error — an unschedulable rate is
+refused, not silently clamped.
+
+**Where the 21 762 ns floor came from, and what it does and does not
+guarantee.** It is the measured per-cover-packet CPU cost from §7.5: the
+emitting scheduler tick (11 109 ns p50) plus the full 1280-byte record
+encryption (10 653 ns p50) = **21 762 ns**, excluding syscalls. The
+derivation's host is the one described in §1: an **x86_64 build running under
+Windows x64-on-ARM64 emulation** on an aarch64 Windows host (`rustc` 1.96.0,
+host `aarch64-pc-windows-msvc`, build target `x86_64-pc-windows-msvc`).
+
+The floor is a **lower** bound on the true per-packet cost, and therefore an
+**upper** bound on the rate that may be requested. It has two independent
+conservative directions, which is why it can only ever reject a rate a faster
+host might have sustained:
+
+1. **The syscall cost is excluded.** The timer create/arm/close, the wake
+   path and the `sendto` are not in the 21 762 ns figure (§7.5 states this
+   explicitly). A real cover packet costs *more* than 21 762 ns, so the true
+   floor is higher than the derived one.
+2. **The measurement is emulated, and the emulation penalty is in the
+   conservative direction for this particular sum.** §1.1 shows the sub-µs
+   figures in this document are dominated by emulated clock reads. The
+   scheduler-tick row (11 109 ns) is exactly such a figure — and the
+   §7.1 control row proves it (an empty loop costing 3 717 ns, against a
+   `Instant::now()` round-trip of ~1 300 ns). The **encrypt** row (10 653 ns)
+   is compute-bound and is the representative one. So the derived floor
+   *over*-states the CPU cost on native hardware for the tick component.
+
+**What it does not guarantee.** The floor bounds the *requested* rate; it does
+not promise the requested rate is **achievable** on a given host. Because the
+syscall cost is excluded, the true achievable period is higher than the floor:
+adding the measured minimum Windows
+`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` wake latency of **15 200 ns** (§7.4)
+puts the reference host's achievable period at roughly 37 us — about
+**276 Mbps** — i.e. below the 470 Mbps ceiling the floor admits. The ceiling
+is therefore a bound on what may be *requested*, not a promise of throughput.
+The CLI rejects anything above it with a named error rather than silently
+clamping, so an operator learns the rate is out of range for this scheduler.
+
+A cross-check on the same host: the minimum Windows
+`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` wake latency measured in §7.4 is
+**15 200 ns**, so the floor is above the timer's own achievable re-arm
+period — the derived interval is not tighter than the platform's own timer
+resolution.
 
 The returned `Duration` values are exact and are the substantive output. The
 **call cost is at or below the 500 ns measurement floor on this host and is
@@ -562,6 +629,14 @@ requires a live client+server pair over loopback with a real socket, which was
 out of scope for this run; the timer arm/wake portion is bounded above by the
 §7.4 wake-latency p99 of 766 µs, but that is latency, not CPU, and must not be
 substituted here.
+
+> **This figure is now load-bearing.** The **21 762 ns** above is the source of
+> `MIN_COVER_INTERVAL_NANOS` in `pq-tunnel-core/src/scheduler.rs`, the
+> minimum cover interval the scheduler will return, and therefore of
+> `MAX_COVER_RATE_BPS` = 470,544,986 bit/s (≈ 470 Mbps). See §7.2 for the
+> derivation, the host it was measured on, and the two reasons it is
+> conservative (the syscall cost is excluded, and the tick component is
+> inflated by the emulation layer).
 
 ---
 

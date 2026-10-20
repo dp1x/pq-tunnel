@@ -41,6 +41,28 @@ Tunnel therefore treats both cryptographic security and metadata privacy as firs
 
 ---
 
+## 1.1 Product goal
+
+Tunnel's primary product is a **system-wide operating-system networking
+tool** — a VPN that carries the machine's IP traffic, via a TUN device and
+system routes.
+
+TUN/IP is a **primary goal**, not a later add-on. Split tunnelling and
+per-process masking are backlog items; neither is the product.
+
+This is a statement of **direction**, not of shipped capability. The current
+implementation is narrower: a local UDP relay client plus a server-side
+forwarding backend (D18). That relay is the current application-facing
+ingress, not the finished product; the system-wide TUN milestone is
+**proposed and not implemented**.
+
+The Charter's principles below apply to both. In particular, §14 (No Hidden
+Behaviour) means a stated product goal must never be read as a description of
+what the software currently does: where the implementation is behind the
+goal, the gap is stated, not smoothed over.
+
+---
+
 # 2. Core Security Goals
 
 ## 2.1 HNDL Resistance

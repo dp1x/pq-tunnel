@@ -2,10 +2,27 @@
 
 ## Status
 
-**Partially implemented.** Two low-risk fixes are in the tree (§5, §7); the
-remainder are proposals pending the decision gates in §10. Nothing here changes
-HNDL resistance, metadata resistance, the wire format, or any cryptographic or
-protocol semantic.
+**Partially implemented.** Several fixes are in the tree (§5, §7, and the
+amendment notes below); the remainder are proposals pending the decision gates
+in §10. Nothing here changes HNDL resistance, metadata resistance, the wire
+format, or any cryptographic or protocol semantic.
+
+> **Implementation status as of the current tree (fact-checked, 2026-10).**
+> The gates in §10 that were open when this document was written have since
+> been closed in code:
+>
+> | Gate | State now | Where |
+> |---|---|---|
+> | Gate 1 — handshake cap eviction | **IMPLEMENTED.** The `min_by_key` scan is gone; the cap victim is the oldest-*inserted* tracked source, taken from an insertion-order queue maintained in lockstep with the table, so the eviction is **O(1)**. | `pq-tunnel-core/src/handshake_v2.rs` — `rate_order`, `ServerHandshake::rate_ok` |
+> | Gate 2 — roster size | **IMPLEMENTED.** `MAX_ROSTER_SIZE` / `ServerConfig::max_roster_size`, enforced at load, at parse and in `set_roster` (fails closed). | `pq-tunnel-bin/src/identity.rs` |
+> | Gate 3 — `--cover-mbps` maximum | **IMPLEMENTED, with a derived ceiling.** The ceiling is not the 10,000 Mbps this document recommended but the *sustainable* rate: 470 Mbps (`MAX_COVER_MBPS_PACING`), derived from a measured 21,762 ns per cover packet. A rate above it is **rejected at the CLI** with a named error, not silently clamped. | `pq-tunnel-core/src/scheduler.rs` (`MIN_COVER_INTERVAL_NANOS`, `MAX_COVER_RATE_BPS`), `pq-tunnel-bin/src/lib.rs` |
+> | Item 3 — cheap roster select | **RESEARCH-ONLY**, unchanged. It would change the wire format. | — |
+> | Item 8 — pre-auth DoS inventory | **RESEARCH-ONLY**, unchanged. | — |
+>
+> §9's row 11 and §1's context paragraph contained two claims about the
+> **data-path** failure gate that were later measured to be false; they are
+> corrected in place below and do not change any of this document's
+> conclusions about the **handshake** path.
 
 > Scope note: this document is Track D of a multi-track review. It covers the
 > **resource** posture of the unauthenticated server surface only. It does not
@@ -21,8 +38,42 @@ failure gate ran an O(n) prune on every packet once its table exceeded 32
 entries, and the source key is a full `SocketAddr` — so one IP address yields up
 to 65,535 distinct keys and an attacker could *hold* a 4096-entry table fresh,
 paying two O(n) scans per packet indefinitely. D24's fix was **lookup-first**: a
-datagram naming an unowned sid is dropped before the gate, so the table is
-bounded by the active session population (at most `max_sessions`, default 64).
+datagram naming an unowned sid is dropped before the gate.
+
+> **CORRECTION — the sentence this paragraph originally ended with was
+> false, on two counts.**
+>
+> The original text read: *"D24's fix was **lookup-first**: a datagram naming
+> an unowned sid is dropped before the gate, so the table is bounded by the
+> active session population (at most `max_sessions`, default 64)."*
+>
+> 1. **The table was never bounded by the active session population.** The
+>    session id is cleartext in every packet header (it is AEAD associated
+>    data, not a secret), so a party that observes one datagram learns a live
+>    sid and can then present AEAD-failing traffic from a fresh source port
+>    per datagram. Measured on the pre-fix tree: **one** live session plus
+>    **200** distinct source ports produced **200** buckets. The table tracks
+>    *failing sources*, not sessions. The real bound is **`max_fail_buckets`**
+>    (default **4096**) — and by nothing else. D24 has since been amended and
+>    now states this correctly.
+> 2. **Lookup-first did not amortize the per-failing-packet scan.** It moved
+>    *bucket creation* behind the AEAD failure, but the prune and the cap
+>    eviction still ran on every failing datagram, so the O(n)-per-packet cost
+>    this document set out to measure was still reachable on that path.
+>    Measured on the pre-fix tree: 40,000 AEAD-failing datagrams against a
+>    200-entry table produced **12,600 prune passes and 2,520,000 bucket
+>    visits**.
+>
+> **Where the data path stands now (D24, as amended):** the packet path is
+> **O(1)** — no datagram, failing or succeeding, scans the fail-gate table;
+> the cap eviction is **O(1)** (oldest-inserted victim from an insertion-order
+> queue); and the expiry sweep runs **off the packet path**, in the manager's
+> 1 Hz tick, at most one pass per `fail_window`, so the table's reclamation
+> cost is bounded by `max_fail_buckets` bucket visits per `fail_window` rather
+> than by the attacker's packet rate.
+>
+> None of this changes this document's thesis: the **handshake** rate limiter
+> is a separate code path, and the table below is its own measurement.
 
 D24 explicitly scoped itself to the data path and stated that it "does not
 modify D13 (handshake construction and its DoS posture)". The **handshake**
@@ -49,6 +100,33 @@ crates and is not deployment-relevant).
 | M2 body / fragments | 5622 B / 5 |
 | Nonce exhaustion threshold | `u64::MAX - 2^32`, about 1.84e19 packets/direction |
 
+> **Provenance of the three `rate_ok` rows — read this before quoting them.**
+> The `rate_ok` per-packet figures (65.4 / 2.29 / 1.6 us/pkt) were measured
+> on the author's host for this document. **No committed artefact contains
+> them.** The benchmark harness in `bench/` measures the ML-DSA/ML-KEM
+> primitives, the roster-verify cost and the handshake CPU
+> (`bench/src/crypto_prims.rs`, `bench/src/roster_verify.rs`,
+> `bench/src/handshake.rs`); it contains **no rate-limiter benchmark**, and
+> `bench/src/handshake.rs` only *mentions* `rate_limit_burst` to explain why
+> each benchmark iteration uses a distinct source address. These three numbers
+> are therefore **unreproducible from the public tree**, in the same way the
+> §13 measurement campaign is (see `docs/audit/05-gaps.md` G-17).
+>
+> Two arithmetic corrections to how they were used here:
+>
+> - **65.4 / 1.6 = 40.9x, not "33x".** The "~33x amplification" figure quoted
+>   in §4b was wrong; the correct ratio is ≈ **40.9x**. (65.4 / 2.29 = 28.6x,
+>   so the "~28x" figure quoted for the before/after pair in §4d was right.)
+> - The two ratios are **not** independent evidence: 1.6 us/pkt is the small-table
+>   baseline that the 40.9x is computed against, and 2.29 us/pkt is the
+>   post-fix cost *at* the cap.
+>
+> The direction of the finding — that the per-packet cost at the 4096 cap was
+> far above the small-table cost, and therefore a single-source CPU primitive
+> — is a structural property of the code (an O(n) scan over a table the
+> attacker can hold fresh) and does not depend on the exact figures. The
+> *magnitude* should be re-measured before it is quoted as a number.
+
 The `verify` numbers are the empirical answer to "is ML-DSA verify
 input-independent?" — the three cases differ by less than the measurement noise
 floor. §3 explains why the source code says the same thing structurally.
@@ -59,13 +137,13 @@ floor. §3 explains why the source code says the same thing structurally.
 
 | # | Item | Current state (file:line) | Proposed change | Risk | Gate |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Handshake `rate_ok` per-packet O(n) prune | `handshake_v2.rs:1444-1473` | Amortize prune to at most 1 pass per `rate_limit_window` via `last_rate_prune` | **LOW-RISK** | **IMPLEMENTED** |
-| 2 | Handshake cap-eviction `min_by_key` O(n) at 4096 | `handshake_v2.rs:1461-1473` | Replace with O(1) (ring/LRU) or lower `MAX_RATE_BUCKETS` | **MEDIUM** | **NEEDS-DECISION** (gate 1) |
-| 3 | Roster scan: no early exit, uniform verify count | `handshake_v2.rs:1617-1630` | **No change.** A cheap select is impossible without a protocol change | — | **RESEARCH-ONLY** |
-| 4 | No upper bound on roster size | `identity.rs:378-390`, `handshake_v2.rs:1257` | Cap roster at construction **and** parse time | **LOW-RISK** (D7 parameter) | **NEEDS-DECISION** (gate 2) |
-| 5 | `--cover-mbps` unchecked `u64` multiply | `lib.rs:153` | `checked_mul`, fail closed with a named error | **LOW-RISK** | **IMPLEMENTED** |
-| 6 | `--cover-mbps` has no sane maximum (busy loop) | `lib.rs:153`, `scheduler.rs:74-78` | Reject rates above a documented ceiling | **LOW-RISK**, but changes accepted values | **NEEDS-DECISION** (gate 3) |
-| 7 | Cover / idle / lifetime interaction undocumented | `session_manager.rs:544`, `session_manager.rs:616-633` | Document the truth table (§8). No code change | — | **IMPLEMENTED** (doc) |
+| 1 | Handshake `rate_ok` per-packet O(n) prune | `handshake_v2.rs` — `rate_ok`, `last_rate_prune` | Amortize prune to at most 1 pass per `rate_limit_window` via `last_rate_prune` | **LOW-RISK** | **IMPLEMENTED** |
+| 2 | Handshake cap-eviction `min_by_key` O(n) at 4096 | `handshake_v2.rs` — `rate_order` + `rate_ok` | Replace with O(1) (ring/LRU) or lower `MAX_RATE_BUCKETS` | **MEDIUM** | **IMPLEMENTED** *(was: NEEDS-DECISION, gate 1 — the `min_by_key` scan is gone; the victim is the oldest-inserted source, popped from an insertion-order queue)* |
+| 3 | Roster scan: no early exit, uniform verify count | `handshake_v2.rs` — `complete_m1` | **No change.** A cheap select is impossible without a protocol change | — | **RESEARCH-ONLY** |
+| 4 | No upper bound on roster size | `pq-tunnel-bin/src/identity.rs` — `MAX_ROSTER_SIZE`, `ServerConfig::max_roster_size` | Cap roster at construction **and** parse time | **LOW-RISK** (D7 parameter) | **IMPLEMENTED** *(was: NEEDS-DECISION, gate 2 — enforced at load, at parse and in `set_roster`; over-long rosters fail closed)* |
+| 5 | `--cover-mbps` unchecked `u64` multiply | `pq-tunnel-bin/src/lib.rs` — `cover_policy_from_args` | `checked_mul`, fail closed with a named error | **LOW-RISK** | **IMPLEMENTED** |
+| 6 | `--cover-mbps` has no sane maximum (busy loop) | `pq-tunnel-core/src/scheduler.rs` — `MIN_COVER_INTERVAL_NANOS`, `MAX_COVER_RATE_BPS`; `pq-tunnel-bin/src/lib.rs` — `MAX_COVER_MBPS_PACING` | Reject rates above a documented ceiling | **LOW-RISK**, but changes accepted values | **IMPLEMENTED** *(was: NEEDS-DECISION, gate 3 — the ceiling is the derived **470 Mbps** sustainable rate, not the 10,000 Mbps this document recommended; an unschedulable rate is rejected at the CLI, not silently clamped)* |
+| 7 | Cover / idle / lifetime interaction undocumented | `pq-tunnel-core/src/session_manager.rs` — `cover_packet`, `on_data_packet`, `tick` | Document the truth table (§8). No code change | — | **IMPLEMENTED** (doc) — *with one factual correction, see §8* |
 | 8 | Pre-auth DoS surface inventory | §9 | None — every path is already bounded | — | **RESEARCH-ONLY** |
 
 ---
@@ -163,9 +241,15 @@ D24's argument was made against a table bounded by `max_sessions` = 64, where
 an O(64) scan per packet is noise. `MAX_RATE_BUCKETS` is 4096 — 64x larger —
 and the measured per-packet cost at that bound is:
 
-- **65.4 us/pkt** (pre-fix) versus **1.6 us/pkt** on a small table: a **~33x
+- **65.4 us/pkt** (pre-fix) versus **1.6 us/pkt** on a small table: a **~40.9x
   amplification**, on the unauthenticated path, from one attacker varying
   source ports.
+
+> **Two corrections.** (1) The original text said "~33x"; the ratio of the two
+> measured figures is 65.4 / 1.6 = **40.9x**. (2) All three `rate_ok` figures
+> have **no committed artefact** — see the provenance note in §1. The
+> *direction* of the argument is structural and survives; the exact multiplier
+> should be re-measured before it is quoted.
 
 At ~14,500 packets/s — trivially achievable over UDP — that is roughly a full
 core spent in `rate_ok` scans alone, with no packet ever reaching a session.
@@ -216,6 +300,13 @@ is untouched, so D24's pinned M1 = 2 / M1+M3 = 3 accounting still holds.
 
 ### 4e. What is NOT implemented (item 2) — NEEDS-DECISION
 
+> **STATUS UPDATE: item 2 is now IMPLEMENTED.** The `min_by_key` cap scan is
+> gone. The victim is the **oldest-*inserted*** tracked source, popped from an
+> insertion-order queue (`rate_order`) maintained in lockstep with the table —
+> the same shape the data-path failure gate uses after D24's amendment — so the
+> eviction is **O(1)** and visits exactly one entry. The text below is the
+> original analysis and recommendation, preserved as the decision record.
+
 Decomposing the pre-fix cost showed the `retain` prune was ~40 us and
 **dominant**; the `min_by_key` cap scan did not even fire during the
 measurement (after the prune the table fell just below the cap). With the
@@ -234,6 +325,10 @@ Options, none of which Track D will pick unilaterally:
 change a tunable. B is preferred over C because it is a one-line constant
 change with a defence-in-depth rationale, whereas C trades a measured ~1 us for
 a new invariant. **Gate 1 below.**
+
+*Outcome: neither B nor C exactly — the implementation follows C's *shape*
+(an O(1) insertion-order queue with one invariant) while leaving
+`MAX_RATE_BUCKETS` at 4096.*
 
 ---
 
@@ -279,7 +374,20 @@ test result: FAILED. 40 passed; 1 failed
 
 ---
 
-## 6. Item 6 — the `--cover-mbps` busy loop — NEEDS-DECISION
+## 6. Item 6 — the `--cover-mbps` busy loop — IMPLEMENTED
+
+> **STATUS UPDATE: implemented, with a derived ceiling rather than the
+> suggested one.** `interval_from_rate_bps` now clamps the interval to
+> `MIN_COVER_INTERVAL_NANOS` = **21,762 ns** (the measured cost of producing
+> one cover packet), so the highest admissible rate is
+> `MAX_COVER_RATE_BPS` = **470,544,986 bit/s** — 470 Mbps as an integer
+> megabit value (`MAX_COVER_MBPS_PACING`). `cover_policy_from_args` **rejects**
+> a `--cover-mbps` above that with a named error; it is not silently clamped.
+> The 10,000 Mbps ceiling suggested below was not adopted: a rate above what
+> the scheduler can be *asked* for is not merely fast, it is unschedulable.
+> The ceiling bounds the **requested** rate; it is not a promise of achievable
+> throughput on a given host (the measurement excludes the timer and `sendto`
+> syscalls — see `docs/performance/I-benchmark-methodology.md` §7.2).
 
 `interval_from_rate_bps` (`scheduler.rs:74-78`) ends in `nanos.max(1)`. That is
 a **lower** clamp on the *interval*, i.e. an upper clamp on the *rate* — and it
@@ -315,7 +423,12 @@ documents the clamp and should be extended, not replaced, if this is approved.
 
 ---
 
-## 7. Item 4 — roster size — NEEDS-DECISION
+## 7. Item 4 — roster size — IMPLEMENTED
+
+> **STATUS UPDATE: implemented.** The roster is bounded by
+> `MAX_ROSTER_SIZE` / `ServerConfig::max_roster_size`, enforced at load, at
+> parse and in `set_roster` — an over-long roster fails closed. The text below
+> is the original analysis, preserved as the decision record.
 
 ### The exposure
 
@@ -381,19 +494,32 @@ gets a nod rather than being slipped in.
 ## 8. Item 7 — cover / idle / lifetime: the actual guarantees
 
 Read from `session_manager.rs`. `last_activity` is refreshed on **any
-successfully authenticated receive** (`on_data_packet`,
-`session_manager.rs:468`) *and* on every locally-generated cover packet
-(`cover_packet`, `session_manager.rs:544`). `tick`
-(`session_manager.rs:616`) evicts when `now - last_activity >= idle_timeout`
-**or** `now - established_at >= lifetime_cap`, lifetime taking precedence.
+successfully authenticated receive** (`on_data_packet`) *and* on every
+locally-generated cover packet (`cover_packet`) *and* on every other
+locally-generated packet (`send_encrypted`). `tick` evicts when
+`now - last_activity >= idle_timeout` **or**
+`now - established_at >= lifetime_cap`, lifetime taking precedence.
+
+> **CORRECTION.** The row below originally said: *"Each side's own cover
+> emission does not refresh its own `last_activity`, but the *peer's* cover
+> packets are authenticated receives that do."* **That is false.** The local
+> side's own cover emission **does** refresh its own `last_activity`:
+> `SessionManager::cover_packet` sets `entry.last_activity = Instant::now()`
+> on a successful cover encrypt, and `send_encrypted` does the same for every
+> other outbound packet. The *peer's* cover also refreshes it, via the
+> authenticated-decrypt path in `on_data_packet`. The **conclusion** of the row
+> is unchanged — with cover enabled the idle timeout still cannot fire for an
+> established link — but it rests on **both** refresh paths, not on the
+> peer's alone. The same tightening is recorded in
+> `docs/audit/F-metadata-cover-guarantees.md` §5.2.
 
 | Configuration | Real exposure bound | Why |
 | --- | --- | --- |
-| cover **on** (default 2 Mbps), `idle_timeout` 5 min | **Idle timeout never fires for an established link.** Each side's own cover emission does not refresh its own `last_activity`, but the *peer's* cover packets are authenticated receives that do — and both ends emit | An established link is never idle by construction. |
+| cover **on** (default 2 Mbps), `idle_timeout` 5 min | **Idle timeout never fires for an established link.** Each side's own cover emission refreshes its own `last_activity` (`cover_packet`), *and* the peer's cover packets are authenticated receives that refresh it too (`on_data_packet`) — and both ends emit | An established link is never idle by construction. |
 | cover on, `lifetime_cap = None` (default) | **Nonce exhaustion only**: `u64::MAX - 2^32` packets/direction. At 195 pkt/s that is **~3,000,000 years** | Effectively unbounded. This is a *deliberate* D16 posture, not an oversight. |
 | `--no-cover` | `idle_timeout` becomes the real bound (5 min default) of **silence in either direction** | Without cover, an established-but-quiet session looks identical to a dead peer and is reaped at 5 min. |
-| cover on, `lifetime_cap` set | The **stricter** of lifetime and nonce exhaustion; lifetime wins | `tick` checks lifetime first (`session_manager.rs:626`) and reports `CloseReason::LifetimeCap`. |
-| cover on close/rotation | Cover is armed **only while a session is established** (`run_server_manager` starts it on `Established`, `session_manager.rs:1111`) and goes inert on `Closed` (`session_manager.rs:1188`) and when the session count hits 0 | No churn during handshake, and no cover for a dead session (D19). Rotation is close-and-re-establish (D16), so there is a brief window with no cover — an observable signal, recorded in D19. |
+| cover on, `lifetime_cap` set | The **stricter** of lifetime and nonce exhaustion; lifetime wins | `tick` checks lifetime first and reports `CloseReason::LifetimeCap`. |
+| cover on close/rotation | Cover is armed **only while a session is established** (the server driver starts it on `Established`) and goes inert on `Closed` and when the session count hits 0 | No churn during handshake, and no cover for a dead session (D19). Rotation is close-and-re-establish (D16), so there is a brief window with no cover — an observable signal, recorded in D19. |
 
 **Stated plainly:** with cover enabled and `lifetime_cap` unset (the shipped
 default), a session lives until its traffic keys' nonce space is exhausted —
@@ -439,36 +565,55 @@ the operator configures.
 | 8 | Roster verifies per M1 | `handshake_v2.rs:1617-1630` | N x 57 us, N unbounded | **Yes — unbounded in N.** Gate 2. |
 | 9 | ML-KEM keygen + encapsulate per completing M1 | `handshake_v2.rs:1639-1641` | once per token (at most 16/10 s per source) | **No.** Budgeted; amplifiable only across sources, which `THREAT_MODEL.md` §7.1 already scopes out. |
 | 10 | Session table | `session_manager.rs:415-419` | `max_sessions` = **64**, LRU eviction | **No.** Pre-auth traffic cannot create sessions. |
-| 11 | Data-path fail buckets | `session_manager.rs:439-442` | lookup-first (D24); bounded by session population | **No.** |
+| 11 | Data-path fail buckets | `pq-tunnel-core/src/session_manager.rs` — `FailGate` | lookup-first (D24); bounded by **`max_fail_buckets`** (default **4096**) and by nothing else — **not** by the session population; packet path O(1), expiry sweep off the packet path | **No.** *(Corrected: this row originally said "bounded by session population". That claim was false and has been withdrawn by D24's amendment — the sid is cleartext in every header, so one observed datagram plus 200 source ports produced 200 buckets.)* |
 | 12 | `WirePacket` / fragment parse | `handshake_v2.rs:314`, `udp.rs` | fixed 1280 B, wrong-size rejected | **No.** |
 | 13 | `MlDsaSignature::from_bytes` in `ClientHello::decode` | `signature.rs:134-145` | fixed 3309 B; may reject structurally | **No.** Cheap, input-bounded. |
-| 14 | Idle/lifetime `tick` sweep | `session_manager.rs:616-633` | 1 Hz, O(sessions), at most 64 | **No.** |
-| 15 | `--cover-mbps` busy loop | `lib.rs:153` | none (operator input) | **Yes — operator-triggered, not remote.** Gate 3. |
+| 14 | Idle/lifetime `tick` sweep | `pq-tunnel-core/src/session_manager.rs` — `tick` | 1 Hz, O(sessions), at most 64 | **No.** |
+| 15 | `--cover-mbps` busy loop | `pq-tunnel-bin/src/lib.rs` — `cover_policy_from_args`; `pq-tunnel-core/src/scheduler.rs` — `MIN_COVER_INTERVAL_NANOS` | **bounded** (operator input): the interval is floored at 21,762 ns and the CLI rejects a rate above the derived 470 Mbps sustainable ceiling | **No — resolved.** *(Was: "Yes — operator-triggered, not remote. Gate 3." Gate 3 is now implemented.)* |
 
 **Summary:** after item 1, the only *remote, unauthenticated* resource issue
 that survives is the unbounded roster (item 8 / gate 2). Everything else is
 either bounded by a small constant or is an operator-input robustness issue.
 
+> **Update — gate 2 is now closed.** The roster is bounded:
+> `MAX_ROSTER_SIZE` / `ServerConfig::max_roster_size`, enforced at load, at
+> parse and in `set_roster`, failing closed. Item 8 is therefore **CLOSED**
+> for the shipped code, and the surviving remote, unauthenticated resource
+> issues in this table are **none**.
+
 ---
 
 ## 10. Decision gates — what needs owner approval
+
+> **All three gates have since been decided and implemented in code.** The
+> text below preserves the original options and recommendations as the
+> decision record; the state of each gate is in the Status table at the top of
+> this document.
 
 **Gate 1 — handshake cap-eviction (NEEDS-DECISION).**
 Choose **A** (leave the `min_by_key`, status quo), **B** (lower
 `MAX_RATE_BUCKETS`, e.g. 4096 to 256), or **C** (O(1) ring/heap eviction).
 *Recommendation: B.* Only A and B are cheap; C adds a new invariant to the one
 code path whose failure mode is "attacker shapes our internal state".
+*Implemented as a variant of C — an insertion-order queue with one invariant
+(`rate_order.len() == rate_buckets.len()`), the same shape the data-path gate
+uses after D24's amendment.*
 
 **Gate 2 — roster-size bound (NEEDS-DECISION).**
 Approve a maximum, the value (**64** recommended), the enforcement points
 (`load_roster` + `ServerConfig::new` + **`set_roster`**, the last being the
 hot-swap bypass), and whether it is a `ServerConfig` field (operator-tunable,
 recommended) or a bare constant (hard product limit).
+*Implemented: the limit is a `ServerConfig` field (`max_roster_size`), and all
+three enforcement points are in place.*
 
 **Gate 3 — `--cover-mbps` maximum (NEEDS-DECISION).**
 Approve a documented ceiling (**10,000 Mbps** recommended) to stop the 1 ns
 busy loop. This narrows accepted operator input; it is not a protocol change
 and not attacker-reachable, but it is an interface change.
+*Implemented with a different (derived) ceiling: **470 Mbps**, the rate the
+cover path can actually sustain at the measured 21,762 ns per cover packet. A
+rate above it is rejected at the CLI with a named error rather than clamped.*
 
 **Explicitly NOT gated** (already implemented, no protocol semantics touched):
 the `rate_ok` prune amortization (item 1) and the `checked_mul` overflow fix
@@ -488,7 +633,9 @@ is to *not* do it.
 ## 11. Validation
 
 Gate commands, all with the mandatory `--target x86_64-pc-windows-msvc`
-(the ARM64 host cannot build `aws-lc-sys`):
+(the target CI runs and the release gate is measured on — note that the
+"ARM64 host cannot build `aws-lc-sys`" reason formerly quoted here is stale:
+`aws-lc-sys` is not in the dependency tree at all):
 
 ```sh
 cargo fmt --check
@@ -503,8 +650,8 @@ Observed results on this host:
 | --- | --- |
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --all-targets ... -- -D warnings` | exit 0 for `pq-tunnel-core` + `pq-tunnel-bin`; the workspace-wide run is blocked by a `clippy::type_complexity` lint in `pq-crypto/src/kdf.rs:589` test code belonging to a concurrent track, unrelated to this work |
-| `cargo test -p pq-tunnel-bin` | 53 lib + 6 adversarial + 3 smoke + 3 stress + 13 revocation — all pass |
-| `cargo test -p pq-tunnel-core` | 259 pass |
+| `cargo test -p pq-tunnel-bin` | 77 lib + 6 adversarial + 3 smoke + 3 stress + 13 revocation — all pass |
+| `cargo test -p pq-tunnel-core` | 280 pass |
 
 **New tests (6 total, all passing):**
 

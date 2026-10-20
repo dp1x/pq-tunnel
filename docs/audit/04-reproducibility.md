@@ -17,7 +17,7 @@ this package was written did **not** compile.
 | Question | Answer |
 |---|---|
 | Can a third party build the workspace? | **Yes**, if they install Rust ≥ 1.85 and ignore the target flag. |
-| Can a third party run the test suite? | **Yes.** 356 tests observed passing by this package (344 unit + 12 E2E). |
+| Can a third party run the test suite? | **Yes.** 356 tests observed passing by this package (344 unit + 12 E2E) **at `ae8061d` + the then-uncommitted working tree**; 422 at `86cf7bd`; **467 on the current tree**, all on `x86_64-pc-windows-msvc`. |
 | Can a third party verify the KATs? | **Yes**, for the 8 externally-anchored primitives. **No** for Tunnel's own construction. |
 | Can a third party reproduce the *exact* build? | **No** — no pinned toolchain, and the fuzz dependency set is unpinned. |
 | Can a third party reproduce the fuzz runs? | **Partially** — 1,000 runs/target yes (CI does it); the 1M-run campaigns have no published artefacts. |
@@ -80,6 +80,11 @@ toolchain". Two problems for an outside reproducer:
    removed the entire QUIC/TLS stack that pulled it in
    (`DESIGN_DECISIONS.md:1035-1039` — "the `aws-lc-sys` build constraint
    disappears"). The constraint no longer exists.
+   **[CORRECTED since]** — `AGENTS.md` no longer cites `aws-lc-sys`; it
+   records that the crate is absent from the dependency tree, that the
+   workspace has no `cc`/`nasm`-driven native build, and that the x86_64
+   target is canonical because it is what CI verifies and what the release
+   gate is measured on.
 2. **It is machine-shaped.** On Linux or macOS you must drop the flag
    (`README.md:131-133`). Nothing in the repository explains, in normative
    language, when the flag is required and when it is not.
@@ -96,8 +101,8 @@ cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 cargo test --workspace --locked --target x86_64-pc-windows-msvc
 ```
 
-**Expected result** (observed by this package on `x86_64-pc-windows-msvc`, all
-green):
+**Expected result** (observed by this package on `x86_64-pc-windows-msvc`, at
+`ae8061d` **plus the then-uncommitted working tree**, all green):
 
 ```
 pq-crypto       lib:  67 passed
@@ -109,6 +114,26 @@ e2e_stress             3 passed
                           ---
                           356 passed, 0 failed
 ```
+
+> **Later measurement — use this if you are reproducing today.** The current
+> tree measures **467 passed, 0 failed** on `x86_64-pc-windows-msvc`
+> (at commit `86cf7bd` it measured 422):
+>
+> ```
+> pq-crypto       lib:  85 passed
+> pq-tunnel-core  lib: 280 passed
+> pq-tunnel-bin   lib:  77 passed
+> e2e_adversarial        6 passed
+> e2e_smoke               3 passed
+> e2e_stress              3 passed
+> revocation_lifetime    13 passed
+>                           ---
+>                           467 passed, 0 failed
+> ```
+>
+> Exactly **3** of the 280 core tests are `#[cfg(windows)]`, so **277** core
+> tests run on a non-Windows host. The figures are measurements of
+> **different trees**, not a discrepancy.
 
 The E2E suites should be serialized (`-- --test-threads=1`), as CI does
 (`ci.yml:33`), because they bind UDP sockets.
@@ -351,6 +376,12 @@ Also note that the untracked code cites a decision **`D27`** that does not exist
 in `DESIGN_DECISIONS.md` (highest: D24) and a document
 `docs/decisions/D27-revocation-and-session-lifetime.md` that is not in the tree.
 
+> **HISTORICAL.** This section describes the tree at `ae8061d` plus an
+> uncommitted working tree. Since commit `86cf7bd` the `docs/` tree and
+> `pq-tunnel-bin/tests/revocation_lifetime.rs` are **tracked**, the workspace
+> **compiles**, and `docs/decisions/D27-revocation-and-session-lifetime.md`
+> exists. The `D27` entry is still absent from `DESIGN_DECISIONS.md`.
+
 ### 7.1 The tree kept moving
 
 After §7 was recorded, `pq-crypto/src/classical.rs` was additionally modified to
@@ -360,6 +391,9 @@ lines correspondingly, and a `bench/` directory appeared — all uncommitted.
 
 **The 356-test figure in §Step 3 was measured before that edit.** Re-measure.
 See gap G-23 in [`05-gaps.md`](05-gaps.md).
+
+> **HISTORICAL.** The contributory check and its tests are now committed
+> (`68273a8`), and `bench/` is now a tracked, separate workspace.
 
 ---
 
@@ -382,13 +416,13 @@ Ordered by how much they block an auditor.
 | R-11 | A test that forward secrecy holds (compromise an identity key, confirm history stays sealed) | Substantiating the headline claim | Medium |
 | R-12 | A test asserting the KEM-after-signature ordering | Substantiating a DoS-gate invariant | Small |
 | R-13 | RFC 2104 KAT for HMAC-SHA256 | Anchoring the Finished MAC's primitive | Trivial |
-| R-14 | Removal of the wrong-answer branch in the SHA-256 "abc" test | Removing an incorrect-output escape hatch | Trivial |
+| R-14 | ~~Removal of the wrong-answer branch in the SHA-256 "abc" test~~ **[DONE]** | Removing an incorrect-output escape hatch | Trivial — **done**: the test now asserts exactly one digest, the canonical `...f20015ad`. *(The finding as first written was inverted: the crate was always right and the test was wrong.)* |
 | R-15 | Test names for D24's "10 new focused tests" (`DESIGN_DECISIONS.md:1359`) | Letting an auditor find the evidence | Trivial |
 | R-16 | A decision index (TOC) for `DESIGN_DECISIONS.md` | Navigating 1,400 lines | Small |
 | R-17 | Correct D-record ordering, and a `supersedes` field per decision | Traceability | Small |
 | R-18 | Supersession of D18 by the TUN architecture | Accuracy of the product record | Small (the design already exists) |
-| R-19 | A published statement of the server's egress/SSRF posture | Deployment risk | Small |
-| R-20 | Publishing `docs/design/` (or promoting it to decisions) | Seeing the actual design trajectory | Trivial (un-gitignore) |
+| R-19 | A published statement of the server's egress/SSRF posture | Deployment risk | Small — *partly addressed: a minimal egress guard has shipped (see `docs/design/D28-server-egress-policy-1to1.md`); the full D28 policy and its CLI flags have not, and the posture is still not stated in `THREAT_MODEL.md` or the README.* |
+| R-20 | ~~Publishing `docs/design/`~~ **[DONE — tracked since `86cf7bd`]** | Seeing the actual design trajectory | Trivial — **done**; `git ls-files docs` → 17 files. *(Promoting the content into the decision record remains open.)* |
 
 **R-4, R-5, R-6, R-7, R-9, R-13, R-14, R-15 and R-20 together are perhaps a
 day of work** and would move the package from "partially reproducible" to

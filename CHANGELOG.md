@@ -12,6 +12,52 @@ stable 1.0 release.
 
 ## [Unreleased]
 
+### Security
+
+- The server's UDP forwarding backend now applies an **egress guard**: it
+  refuses destination port 0, IPv4/IPv6 loopback (including IPv4-embedded and
+  IPv4-mapped representations), unspecified addresses, multicast, limited
+  broadcast, and the exact cloud metadata endpoints `169.254.169.254`,
+  `100.100.100.200`, `fd00:ec2::254` and `fd20:ce::254`.  RFC1918, ULA,
+  CGNAT, link-local and port 53 remain reachable by design — blocking them
+  would break legitimate private-network and VPN routing.  Denials are silent
+  to the client and counted per rule (bounded, destination-free) for the
+  operator.  This protects the **current UDP relay path only**; a future
+  raw-IP/TUN forwarding path needs its own policy.
+- The data-path failure gate no longer performs a linear table scan on every
+  AEAD failure.  The table is bounded by `max_fail_buckets` and nothing else
+  (the session id is cleartext on the wire, so the table is *not* bounded by
+  the active session population); cap eviction is now O(1) and the expiry
+  sweep runs at most once per `fail_window` from the 1 Hz tick.  Per-source
+  token accounting is unchanged.
+- The handshake source rate limiter is O(1) on the hot path: a tracked source
+  no longer triggers a table scan or evicts another source's budget.  The
+  roster size is now bounded (default 64, `--max-roster-size`); an
+  over-limit roster is rejected, never truncated.
+- `--cover-mbps` is bounded to a schedulable rate (default ceiling 470 Mbps)
+  and now fails closed with a named error instead of wrapping silently in a
+  release build.  The D19 default (2 Mbps, 5.12 ms) is unchanged.
+
+### Changed
+
+- **Eviction victim policy for the two rate tables changed** from
+  least-recently-refilled to oldest-inserted.  The aggregate admission rate is
+  unchanged (both policies reset the victim's budget and neither bounds the
+  number of distinct sources), but *which* source is sacrificed differs.  This
+  is a deliberate change, not an optimisation.
+- The SHA-256 known-answer test now asserts exactly one digest (the canonical
+  FIPS 180-4 / RFC 6234 value).  The previous test accepted a second value
+  and described the canonical one as a platform bug; the implementation was
+  always correct, the *test* was wrong.
+
+### Fixed
+
+- The project documentation no longer claims a 192-bit ChaCha20-Poly1305
+  nonce (the construction uses the RFC 8439 96-bit nonce), no longer cites
+  an unreachable commit for the D16 driver E2E, and no longer mis-states the
+  1280-byte record as fitting a 1280-byte-MTU path (it is a UDP payload; the
+  outer packet is 1308/1328 bytes).
+
 ### Added (M10)
 
 - Establishment-window measurement campaign recorded in THREAT_MODEL

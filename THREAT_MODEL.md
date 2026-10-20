@@ -287,6 +287,28 @@ Tunnel aims to reduce metadata leakage through mechanisms such as:
 
 Metadata resistance is a primary design goal.
 
+The target is metadata-leakage **reduction**, not traffic-flow anonymity
+(`DESIGN_DECISIONS.md` D22). The following residuals are observable **by
+construction** and are accepted, not hidden:
+
+- application activity above the cover floor — bound λ·W ≥ 1, and raising
+  the cover rate does not change it (§13.4);
+- server-side session count, session liveness, and handshake / rekey / close
+  lifecycle events (§13.4);
+- the client's cover onset: no cover is emitted during establishment, so
+  cover onset is asymmetric between client and server (§13.5, §13.6);
+- the M3 retransmit budget, externally visible through establishment
+  duration — 6.86–8.86 s at the default budget, with disjoint populations
+  across budgets (§13.6);
+- the cover grid's cadence is bounded, not exact: 182.6 pkt/s against a
+  nominal 195.3 (93.5 %), p50 period 5.5 ms against a nominal 5.12 ms, and
+  the grid is a function of OS wakeups rather than of an absolute schedule
+  (§13.5).
+
+The absorbing (slot-capped) emission model that would close the
+application-activity channel is a different architecture, with its own
+costs, and is **rejected for v1** (D22).
+
 ---
 
 # 7. Active Attack Considerations
@@ -325,10 +347,21 @@ consume:
 - **Lookup-first, no allocation on a miss.** A data-path datagram naming an
   unknown or unowned session id is dropped before the failure gate and
   allocates no gate state (D24).
-- **Bounded gate state.** Failure-gate state is bounded by the active session
-  population (`max_sessions`, default 64), with `max_fail_buckets` as a hard
-  backstop; the session table is bounded by `max_sessions` with least-
-  recently-active eviction, and idle and lifetime caps bound each session.
+- **Bounded gate state — and a bounded amount of work.** Failure-gate state
+  is bounded by `max_fail_buckets` (default 4096) and by **nothing else**. It
+  is *not* bounded by the active session population: the session id is
+  cleartext in every packet header, so a party that observes one datagram can
+  learn a live session id and then present one failing source key per source
+  port. The per-packet cost is **O(1)**: no datagram — failing, succeeding,
+  or naming an unknown session — scans the fail-gate table; cap eviction
+  visits exactly one entry; and the expiry sweep runs off the packet path in
+  the manager's 1 Hz tick, at most one pass per `fail_window`, so the table's
+  reclamation cost is bounded by `max_fail_buckets` bucket visits per
+  `fail_window` rather than by the attacker's packet rate. The session table
+  is bounded by `max_sessions` (default 64) with least-recently-active
+  eviction, and an idle cap bounds a session's silence. The lifetime cap
+  exists as a mechanism but is **unset by default** (`lifetime_cap = None`),
+  so today it bounds nothing. (D24, as amended.)
 
 These are *bounded-resource* guarantees, not availability guarantees. Out of
 scope: the volume of traffic a legitimate key-holder sends, a server
@@ -478,11 +511,15 @@ campaign summary). This section is a dated assessment, not a promise.
    parked outside M7 (G6 in ledger).
 2. **Nonce-exhaustion E2E (D16)** (§2.1, HNDL/key life): rekey nonce
    hygiene is unit-proven at the envelope layer; the full-loop E2E test
-   is implemented and merged (commit `9db71df`, "test(transport): prove
+   is implemented and merged (commit `3f6d4f6`, "test(transport): prove
    D16 nonce-exhaustion full-loop re-establishment at the driver level") —
    the driver closes the session, auto-rearms a fresh handshake, reaches
    Ready on the new session, and continues carrying application data in
-   both directions. See CHANGELOG "Tested (release gate)".
+   both directions. The tests are
+   `client_driver_nonce_exhaustion_reestablishes` and
+   `server_driver_nonce_exhaustion_recovers`
+   (`pq-tunnel-core/src/session_manager.rs`). See CHANGELOG "Tested
+   (release gate)".
 3. **Sanitizer classes**: LSan sweeps green across the 9-target matrix
    (2026-08-08, W12); MSan/UBSan unavailable on the current toolchain
    (`rust-src` missing, `-Zsanitizer=undefined` invalid) — outstanding,
@@ -553,6 +590,22 @@ independent of the floor rate - 13.4 itself states raising the rate
 does not change the bound, so a constant ~7% shortfall cannot either.
 The grid remains deterministic, uniform and stationary: no new
 metadata channel opens because of the shortfall.
+
+**Scope of that last sentence — what the measurement does and does not
+establish.** "Stationary" here is a *summary statistic over a 30 s loopback
+run* (uniform per-second counts, one gap ≥ 15 ms). It is not a proof that the
+inter-arrival distribution has no conditional structure. The D19 relative
+re-arm (`scheduler.rs:187-189`, `self.next = Some(now + self.policy.interval)`)
+makes the grid a function of OS wakeups, so a stall of length *d* produces a
+gap of *d*; gap shapes conditioned on host state (suspend, throttle,
+scheduler preemption) are therefore a **host-state** channel, distinct from
+the tunnel-activity channel §13.4 bounds. That channel is **not measured**
+here: no capture in this campaign conditioned on host state, so the extent to
+which it is exploitable is unestablished. The *magnitude* of the cadence
+shortfall remains non-material as stated above; what is withdrawn is any
+reading of "stationary" as "no structure at all". See
+[`docs/audit/F-metadata-cover-guarantees.md`](docs/audit/F-metadata-cover-guarantees.md)
+§3.2 for the same derivation, recorded there as **NEW (unmeasured)**.
 
 **Establishment window (recorded for M10, pre-existing design).**  The
 client emits **no cover during connection establishment**: it reaches

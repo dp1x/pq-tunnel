@@ -1,11 +1,47 @@
 # D25 / D26 — System-Wide TUN Architecture: TUN Integration, Routing, Dual-Stack and Length Semantics
 
-**Status:** PROPOSED (design review required — not implemented, not a decision of record)
+**Status:** **SUPERSEDED (design content) — DO NOT IMPLEMENT FROM THIS DOCUMENT.**
+**Superseded by:** [`D30-corrected-system-wide-data-plane.md`](D30-corrected-system-wide-data-plane.md).
 **Author:** TRACK A design pass
 **Date:** 2026-10-05
 **Supersedes/scope:** Does **not** alter D19 (cover scheduling), D22 (metadata target is
 reduction, not anonymity), D24 (data-path failure budget), or the fixed 1280-byte
 `PACKET_SIZE` wire record.
+
+> ### SUPERSESSION NOTICE — READ THIS FIRST
+>
+> An independent verification pass found that this document contains **statements
+> that are factually wrong**, among them:
+>
+> - **RFC 8200 §4.5 is inverted.** This document states twice (in the IPv6
+>   fragmentation discussion) that IPv6 routers fragment and that source
+>   fragmentation is forbidden. RFC 8200 §4.5 says the opposite:
+>   *"fragmentation in IPv6 is performed only by source nodes, not by routers
+>   along a packet's delivery path."*
+> - **The proposed TUN MTU of 1241 is non-conformant for IPv6.** RFC 8200 §5
+>   requires a link MTU of at least 1280 octets. A 1241-byte IPv6 interface is
+>   rejected by the Linux kernel, so the value is not merely non-conformant but
+>   unimplementable there.
+> - **The reassembly key is not derivable** from the arriving fragments (each
+>   fragment carries its own nonce, and the cover scheduler can emit between two
+>   fragments of one datagram), so the stated reassembly scheme cannot be
+>   implemented as written.
+> - **The fragment count is treated as the authoritative packet length**, but the
+>   host TCP/IP stack honours the IP header's own length field; the two must be
+>   cross-checked, not substituted.
+> - **The reassembly deadline is derived from the cover interval**, which is a
+>   user-tunable knob (`--cover-mbps`) — a traffic-shaping parameter must not
+>   control a data-path correctness parameter.
+> - **The Linux policy-routing recipe creates the routing loop it claims to
+>   prevent**, and **the implementation graph has no server-side raw-IP path**,
+>   so the milestone as written cannot deliver a working system-wide tunnel.
+>
+> The corrected architecture is
+> [`D30-corrected-system-wide-data-plane.md`](D30-corrected-system-wide-data-plane.md).
+> **This document is retained only as a record of the design discussion and its
+> reasoning.** Its product framing (Tunnel is a system-wide OS/networking tool,
+> not an application proxy) remains correct and is confirmed by the owner; its
+> technical content does not.
 
 > This document is a *proposal* for review. The `D25 —` / `D26 —` entries below are
 > formatted to match `DESIGN_DECISIONS.md` (Status / Context / Decision /

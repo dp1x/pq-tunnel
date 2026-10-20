@@ -6,6 +6,33 @@ reference implementation. It is designed to keep traffic confidential against
 computers) while limiting the information leaked by traffic patterns
 (metadata resistance).
 
+> **Product goal — a system-wide OS networking tool, not an application
+> proxy.** Tunnel's primary product is a **system-wide OS networking / VPN**
+> product: the tunnel carries IP traffic for the whole machine, via a TUN
+> device and system routes. TUN/IP is a *primary goal*, not a later add-on.
+> Split tunnelling and per-process masking are backlog items.
+>
+> **Current implementation state is narrower than the goal.** What ships in
+> `v0.2.0-alpha` is a **local UDP relay client plus a server-side forwarding
+> backend** (D18). The relay is the current app-facing ingress — a diagnostic,
+> a conformance harness for the slot codec, and the fallback on platforms
+> without a usable TUN — **not the finished product**. The TUN milestone is
+> **proposed and not implemented**: there is no TUN device, no system-route
+> management, and no raw-IP egress path in the tree today. See
+> [`docs/design/D25-D26-TUN-SYSTEM-WIDE-ARCHITECTURE.md`](docs/design/D25-D26-TUN-SYSTEM-WIDE-ARCHITECTURE.md)
+> (status: PROPOSED) and `DESIGN_DECISIONS.md`.
+
+> **"Metadata-resistant" means reduced leakage, not anonymity.** The target
+> is metadata-leakage *reduction* compared with a conventional encrypted
+> tunnel (`DESIGN_DECISIONS.md` D22), not traffic-flow anonymity. Activity
+> above the cover floor, server-side session count, session liveness and
+> lifecycle events (handshake bursts, rekey, close) remain observable **by
+> construction**; the cover grid is measured at 182.6 pkt/s (93.5 % of the
+> nominal 195.3) with a p50 period of 5.5 ms against a nominal 5.12 ms; and
+> the establishment window is measured at 6.86–8.86 s, with the M3 retransmit
+> budget externally observable through it. See
+> [Known issues](#known-issues--limitations) and `THREAT_MODEL.md` §13.4–§13.6.
+
 This is a **pre-release** build. It ships the
 validated `pq-tunnel-core` data plane: a 1.5-RTT, mutual-authentication,
 hybrid (ML-KEM-768 + X25519) handshake, fixed 1280-byte wire datagrams,
@@ -58,6 +85,8 @@ Core principles (see [PROJECT_CHARTER.md](PROJECT_CHARTER.md)):
 ├── pq-tunnel-core/         # protocol core: session manager, handshake v2, envelope, codec
 ├── pq-proxy/               # SOCKS5 proxy (parked, out of the workspace — v2 rewrite pending)
 ├── pq-tunnel-bin/          # single pq-tunnel binary (keygen/server/client)
+├── docs/                   # design proposals, audit evidence package, benchmarks
+├── bench/                  # opt-in measurement harness (separate workspace, not a member)
 └── fuzz/                   # cargo-fuzz targets (never-panic contract)
 ```
 
@@ -70,16 +99,25 @@ Design and security documentation:
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — accepted/rejected design choices.
 - [IMPLEMENTATION_GUIDE.md](IMPLEMENTATION_GUIDE.md) — engineering guidance.
 
-**Validation (v0.2.0-alpha released):** 422 tests pass on
-`x86_64-pc-windows-msvc` (`cargo test --workspace`), including external
+**Validation (v0.2.0-alpha released):** **467 tests pass**, as measured on the
+`x86_64-pc-windows-msvc` target with
+`cargo test --workspace` — 85 in `pq-crypto`, 280 in `pq-tunnel-core`, and 77
+unit + 25 E2E in `pq-tunnel-bin`. The figure is anchored to that target; the
+previous figure of 422 was measured at commit `86cf7bd`, before the D24
+fail-gate, handshake-rate-limiter, roster-limit, cover-pacing and egress-guard
+work; re-measure rather than quoting it after a change. The suite
+includes external
 known-answer vectors (RFC 8439
 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, RFC 7748 X25519, Wycheproof ML-KEM-768
 and ML-DSA-65 — D21), adversarial end-to-end cases (garbage, forged
 handshake, version downgrade, AEAD tamper, replay, reordering) that assert a
 silent drop plus a healthy post-attack round trip, and the D16
 nonce-exhaustion full-loop driver E2E (close → auto re-establish → continue).
-Adversarial design-review campaigns (cryptography, protocol, security) were
-completed and their findings fixed, and the modern-harness cargo-fuzz targets
+Internal design-review campaigns (cryptography, protocol, security) were
+completed and their findings fixed — these were **in-tree** reviews by the
+project's own authors, not independent audits (see
+[Known issues](#known-issues--limitations)) — and the modern-harness
+cargo-fuzz targets
 compile (continuous fuzz execution requires an ASan-capable host; see Fuzzing
 below).
 Detailed validation logs are kept private (not part of the public release).
@@ -87,6 +125,10 @@ Detailed validation logs are kept private (not part of the public release).
 are not stable before 1.0.
 
 ## Usage
+
+> The commands below drive the **current implementation** (the D18 UDP relay
+> client + forwarding backend). They are the shipped interface today, not the
+> final product — see [Product goal](#tunnel) above.
 
 Identity provisioning is the first step; keys are generated on a trusted
 machine and distributed out of band (the secret seed never leaves it). The
@@ -121,7 +163,14 @@ pq-tunnel client --remote 192.0.2.1:4433 \        # v2 UDP (default)
 
 The v2 client exposes a local UDP relay on `127.0.0.1:51821` (loopback-only)
 that forwards application datagrams into the tunnel; the server is a
-forwarding backend by default (D18).
+forwarding backend by default (D18). This relay is the current app-facing
+ingress — a diagnostic, a conformance harness for the slot codec, and the
+fallback on platforms without a usable TUN. It is **not** the end state of
+the product: the product goal is a system-wide TUN device with system routes
+carrying the machine's IP traffic, and that milestone is **proposed and not
+implemented** (no TUN device, no route management and no raw-IP egress path
+exist in the tree today). Until it lands, applications reach the tunnel
+through the local UDP relay shown above.
 
 ## Build
 
@@ -166,16 +215,23 @@ never-panic contract.
 
 ## Tests
 
+Counts below are the figures measured on the `x86_64-pc-windows-msvc` target
+with `cargo test --workspace` (see **Validation** above). They are anchored to
+that target, not to absolute truth; re-measure after a change.
+
 - `pq-crypto`: 85 unit tests (incl. external known-answer vectors, D21)
-- `pq-tunnel-core`: 259 unit tests (incl. session-manager & handshake-v2 tests
+- `pq-tunnel-core`: 280 unit tests (incl. session-manager & handshake-v2 tests
   and the D16 nonce-exhaustion full-loop driver E2E)
-- `pq-tunnel-bin`: 53 unit tests + 25 E2E integration tests (identity
-  provisioning, keygen, CIDR parsing, packet length, revocation/lifetime) —
-  single `pq-tunnel` binary with `keygen`/`server`/`client` subcommands; the
-  E2E suite covers the smoke gate (3), the adversarial tunnel cases (6), the
-  stress suite (3), and the revocation/lifetime suite (13)
+- `pq-tunnel-bin`: 77 unit tests + 25 E2E integration tests (identity
+  provisioning, keygen, CIDR parsing, packet length, revocation/lifetime,
+  server egress policy) — single `pq-tunnel` binary with
+  `keygen`/`server`/`client` subcommands; the E2E suite covers the smoke gate
+  (3), the adversarial tunnel cases (6), the stress suite (3), and the
+  revocation/lifetime suite (13)
 - `pq-proxy`: parked (v1 SOCKS5-over-QUIC, excluded from the workspace; v2
   rewrite planned — see D20); `pq-tun`: removed in M4
+- `bench/`: a separate workspace and **not** a member of the main workspace,
+  so `cargo test --workspace` never builds or runs it
 - 10 `cargo-fuzz` targets are defined; all use the modern `fuzz_target!`
   harness and compile under the fuzz harness (execution requires an
   ASan-capable host — see Fuzzing above).
@@ -186,9 +242,9 @@ cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 cargo test --workspace --target x86_64-pc-windows-msvc
 ```
 
-(On Linux CI, 3 `pq-tunnel-core` tests are skipped: one measures
+(On Linux CI 3 of the 280 `pq-tunnel-core` tests are skipped: one measures
 Windows-specific working-set memory, two cover the Windows high-resolution
-cover clock. The remaining 220 core tests run.)
+cover clock. The remaining **277** core tests run.)
 
 ## Security
 
@@ -214,6 +270,19 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
   adversarial E2E suite; **interoperability
   with other implementations is not yet verified** (no independent
   implementation exists yet).
+- **Metadata resistance is reduction, not anonymity.** Application activity
+  above the cover floor is separable (bound λ·W ≥ 1) and raising the cover
+  rate does not change that; server session count, session liveness and
+  lifecycle events are observable by construction; the cover grid measures
+  182.6 pkt/s (93.5 % of the nominal 195.3) with a p50 period of 5.5 ms
+  against a nominal 5.12 ms; the client emits no cover during establishment
+  and the measured establishment window is 6.86–8.86 s; and the M3 retransmit
+  budget is externally observable through that window. See
+  [THREAT_MODEL.md](THREAT_MODEL.md) §13.4–§13.6 and D22.
+- **The system-wide TUN product is not implemented.** `v0.2.0-alpha` ships
+  the D18 local UDP relay client plus a server-side forwarding backend. The
+  TUN-device milestone is proposed, not built; there is no TUN device, no
+  system-route management and no raw-IP egress path in the tree.
 - Cover traffic defaults to a fixed 2 Mbps pure-periodic schedule; an
   operator-chosen adaptive shaper is future work (see
   [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) D19).
@@ -224,6 +293,8 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the full threat model and
 
 ## Future work
 
+- System-wide TUN/IP client with system routes — the product goal; the
+  milestone is proposed, not implemented.
 - Adaptive cover-traffic shaper (user-selected policy; never a default).
 - Interoperability testing against a second implementation.
 - crates.io publishing of library crates (`pq-crypto`, `pq-tunnel-core`).

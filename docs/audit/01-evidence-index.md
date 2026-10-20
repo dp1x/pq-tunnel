@@ -98,7 +98,7 @@
 | K-06 | ML-DSA-65 verify | Wycheproof `mldsa_65_verify_test.json` grp0 tcId1 | `kat_vectors.rs:19-21,244` | **PRESENT** |
 | K-07 | ML-DSA-65 **sign** | Wycheproof `mldsa_65_sign_seed_test.json` grp0 tcId1, `.sig` | `kat_vectors.rs:22-25,247-317` | **PRESENT** |
 | K-08 | ML-DSA-65 keygen from seed | same file, grp0 | `kat_vectors.rs:22-24,319-361` | **PRESENT** |
-| K-09 | SHA-256 | FIPS 180-4 vectors, inline in tests | `pq-crypto/src/transcript.rs:119-143,145-157` | **PARTIAL** — the "abc" vector test **accepts two answers**, one of which is wrong (`transcript.rs:131-139` accepts `...f20015ad`, and the comment at `:122-126` calls the other "a platform bug"). This is a live accepted-wrong-answer escape hatch. |
+| K-09 | SHA-256 | FIPS 180-4 / RFC 6234 §8.5 vectors, inline in tests | `pq-crypto/src/transcript.rs` — `sha256_known_vector`, `sha256_empty_string_known_vector` | **PRESENT — [RESOLVED] since this package was written.** *The finding as first recorded was inverted: it said the test "accepts two answers, one of which is wrong", and it named the **canonical** digest as the wrong one. It was not: the canonical `SHA-256("abc")` is `ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad` — it ends **`...f20015ad`** (RFC 6234 §8.5, TEST1 = `"abc"`). The crate's implementation was always correct; the *test* was wrong. The test is now **strict**: exactly one expected digest, the canonical one, with no escape hatch and no "platform bug" comment. (The original wording of this row is preserved in the committed version of this file.)* |
 | K-10 | HMAC-SHA256 | RFC 2104 | **NONE** — no `RFC2104_*` constant exists in `kat_vectors.rs`; the only check is a hand-rolled HMAC inside `kdf.rs:497-537` | **MISSING** |
 | K-11 | Hybrid master secret (`derive_master_secret_v2`) | **NONE** | — | **MISSING** |
 | K-12 | Canonical transcript hashes TH1/TH2/TH3 | **NONE** | — | **MISSING** |
@@ -138,7 +138,7 @@
 | D-02 | D1–D24 all present | 24 headers found | `DESIGN_DECISIONS.md` (§D1 at `:41` … §D24 at `:1232`) | **PARTIAL** | **Numbering order is wrong:** D22, D23 appear at `:1054`/`:1104`, *before* D21 at `:1184`, and D24 at `:1232` after. Chronological ≠ numerical. |
 | D-03 | **A decision index / table of contents** | None | — | **MISSING** | 1,400 lines with no index. An auditor must read the whole file or grep. |
 | D-04 | Superseded decisions marked | D20 records that it supersedes the v1 deprecation schedule | `DESIGN_DECISIONS.md:1018-1022` | **PARTIAL** | Only one supersession is recorded. No "supersedes"/"superseded by" fields per decision. |
-| D-05 | **D18 reflects the current product** | D18 says "local **UDP relay** client (no TUN, no admin)" | `DESIGN_DECISIONS.md:860-864` | **PARTIAL — STALE** | The product direction is a system-wide TUN + routes tool. `docs/design/D25-D26-TUN-SYSTEM-WIDE-ARCHITECTURE.md:18-27` says so explicitly and calls D18 "**not** the product model", but that file is (a) `Status: PROPOSED` (`:3`), (b) **untracked by git**. **D18 must be superseded.** See `05-gaps.md` G-02. |
+| D-05 | **D18 reflects the current product** | D18 says "local **UDP relay** client (no TUN, no admin)" | `DESIGN_DECISIONS.md:860-864` | **PARTIAL — STALE** | The product direction is a system-wide TUN + routes tool. `docs/design/D25-D26-TUN-SYSTEM-WIDE-ARCHITECTURE.md:18-27` says so explicitly and calls D18 "**not** the product model", but that file is (a) `Status: PROPOSED` (`:3`), (b) **not in the decision record**. **D18 must be superseded.** See `05-gaps.md` G-02. *HISTORICAL: this row also said the proposal is "untracked by git". Since `86cf7bd` the `docs/` tree is tracked (`git ls-files docs` → 17 files), so the "an outside reader cannot see it" part is no longer true; the "it is not a decision of record" part still is.* |
 | D-06 | D21 (KAT policy) placed correctly | Appears after D23 in file order | `DESIGN_DECISIONS.md:1184` vs `:1104` | **PARTIAL** | Ordering inconsistency; harmless to content, harmful to auditability. |
 | D-07 | D22 correctly framed as a limitation, not a claim | Decision text: "metadata-leakage **reduction**, not traffic-flow anonymity" | `DESIGN_DECISIONS.md:1076-1080` | **PRESENT** | This is exemplary. |
 | D-08 | D23's "vanished peer lingers until idle eviction" recorded | Tradeoff bullet | `DESIGN_DECISIONS.md:1157-1159` | **PRESENT** | — |
@@ -199,7 +199,7 @@
 |---|---|---|---|---|
 | X-01 | Document hierarchy is respected (charter / threat / spec / decisions do not overlap) | Each file has a "Purpose" + "This document does not define" section | **PARTIAL** | The boundaries are *declared* (`PROTOCOL_SPEC.md:20-30`, `CRYPTO_PROFILE.md:24-31`, `DESIGN_DECISIONS.md:13-24`, `IMPLEMENTATION_GUIDE.md:23-30`) and mostly honoured — but `CRYPTO_PROFILE.md:281-284` says nonce construction belongs in `PROTOCOL_SPEC.md`, which does not define it. Three documents point at each other for the nonce and nobody writes it down normatively. |
 | X-02 | Every document has a Status line | Yes | **PRESENT** | All say "Draft" — including `PROTOCOL_SPEC.md` and `CRYPTO_PROFILE.md` at `v0.2.0-alpha` release. |
-| X-03 | Test counts reconcile across documents | No | **MISSING** | `README.md:74` says 352; `README.md:173-176` sums to 67+236+37+12; measured today: 67+41+236 = 344 unit. Three different numbers. |
+| X-03 | Test counts reconcile across documents | No | **PARTIAL — [CORRECTED since this package was written]** | As first recorded: `README.md:74` said 352; `README.md:173-176` summed to 67+236+37+12; measured at package time: 67+41+236 = 344 unit — three different numbers. **Now:** the README states its count anchored to a target ("467 tests pass … measured on the `x86_64-pc-windows-msvc` target"), and states the per-crate breakdown for the same target (85 + 280 + 77 unit + 25 E2E); the figure at `86cf7bd` was 422. The *underlying* problem is only partly fixed: the numbers are still hand-written, and they will drift again unless CI emits them. |
 | X-04 | Code references in docs resolve | Spot-checked | **PARTIAL** | D-record and codec citations resolve. `CRYPTO_PROFILE.md` cites §8 for nonce uniqueness (`codec.rs:112-118` agrees). But `docs/design/D25-D26-...md` cites `pq-tunnel-bin/src/identity.rs` line numbers that shift with the working tree. |
 | X-05 | README does not overclaim | Yes | **PRESENT** | `README.md:204-211` is unusually candid. This is a genuine strength and this package does not discount it. |
 | X-06 | The decision record covers the key-establishment code | **No** — see row D-12 | — | **MISSING** |
@@ -219,3 +219,19 @@
 
 The 14 MISSING rows are the remediation list; they are enumerated and
 prioritised in [`05-gaps.md`](05-gaps.md).
+
+> **Two notes on this tally.**
+>
+> 1. The tally above is **as recorded at package time**. Two rows have changed
+>    status since: **K-09** moved PARTIAL → PRESENT (the SHA-256 test is now
+>    strict — see the row and the correction log in [`README.md`](README.md)
+>    §0 X-1), and **X-03** moved MISSING → PARTIAL (the README now anchors its
+>    test count to a named commit and target, though the numbers are still
+>    hand-written — see §0 X-5). The counts are left at their original values
+>    rather than recomputed here, because the counting convention this table
+>    used is not the one a mechanical recount produces.
+> 2. **Pre-existing inconsistency, not introduced here:** the table says
+>    "MISSING | 15" while the sentence below it says "The 14 MISSING rows".
+>    Those two numbers do not agree with each other. The finding itself
+>    stands; only the arithmetic needs reconciling, and that is left to
+>    whoever re-tallies the table.

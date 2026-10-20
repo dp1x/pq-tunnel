@@ -422,15 +422,28 @@ However, replacement should not require redesigning Tunnel's security model.
 
 > **v0.2.0-alpha pinned suite (current implementation).** The placeholders below
 > were resolved for v0.2.0-alpha and are pinned in code; they remain
-> *replaceable* (§13) without redesigning the security model. Selection is
-> anchored to external known-answer vectors per D21 (RFC 8439, RFC 5869,
-> RFC 7748, Wycheproof ML-KEM-768/ML-DSA-65) and to D13–D15/D19. Future
-> algorithm replacement may require a protocol version change (D13).
+> *replaceable* (§13) without redesigning the security model. The
+> **primitives** below are selected against external known-answer vectors per
+> D21 (RFC 8439, RFC 5869, RFC 7748, Wycheproof ML-KEM-768/ML-DSA-65) and to
+> D13–D15/D19. Future algorithm replacement may require a protocol version
+> change (D13).
+>
+> **Scope of that external anchoring — read before citing the sentence above.**
+> D21 anchoring applies to the **primitive set only**. The externally anchored
+> vectors cover ChaCha20-Poly1305, HKDF-SHA256, X25519, ML-KEM-768 and
+> ML-DSA-65. The anchoring does **not** extend to Tunnel's *own* construction
+> — the v2 master-secret derivation, the per-direction traffic keys, the
+> nonce prefixes, and the canonical transcript hashes TH1/TH2/TH3 — for which
+> **no external vector exists at any version**. Those elements are pinned only
+> by self-authored tests; their normative description is the (still skeletal)
+> `docs/audit/spec/crypto-construction.md`, which is pre-filled from
+> `pq-crypto/src/kdf.rs` and `pq-tunnel-core/src/handshake_v2.rs`. The
+> selection sentence must not be read as one claim about the whole suite.
 
 ```text
 Key Establishment: ML-KEM-768 + X25519 hybrid (HKDF-SHA256 shared-secret merge)
 Authentication:     ML-DSA-65, roster-pinned mutual authentication (no anon mode)
-AEAD:               ChaCha20-Poly1305 (192-bit nonce = 4-byte KDF prefix ‖ 8-byte u64 counter)
+AEAD:               ChaCha20-Poly1305 (96-bit nonce = 4-byte KDF prefix ‖ 8-byte u64 counter)
 KDF:                HKDF-SHA256 with per-purpose domain-separation labels (-v1/-v2)
 ```
 
@@ -439,6 +452,36 @@ The final selection must satisfy:
 - Tunnel threat model requirements
 - protocol security requirements
 - cryptographic design principles
+
+---
+
+## 14.1 Dependency posture of the pinned suite
+
+The versions below are the ones resolved in `Cargo.lock` at `v0.2.0-alpha`.
+This subsection **records** the upstream review posture of those exact
+versions. It proposes **no** dependency change: a substitution is an
+architectural decision under §7 and §13, not a documentation edit.
+
+| Crate | Version | Upstream review posture (quoted from the crate's own README) |
+|---|---|---|
+| `ml-kem` | 0.3.2 | "The implementation contained in this crate has never been independently audited! USE AT YOUR OWN RISK!" |
+| `ml-dsa` | 0.1.1 | "The implementation contained in this crate has never been independently audited! USE AT YOUR OWN RISK!" |
+| `x25519-dalek` | `=3.0.0-rc.1` | Pre-release (release-candidate) version, pinned exactly. Its README makes no independent-audit claim. |
+| `curve25519-dalek` | `=5.0.0-rc.1` | Pre-release (release-candidate) version, pinned exactly. Its README makes no independent-audit claim. |
+| `chacha20poly1305` | 0.10.1 | "This crate has received one security audit by NCC Group, with no significant findings." |
+| `sha2` | 0.10.9 (`force-soft-compact`) | No upstream audit claim recorded in the crate README. |
+| `hkdf` / `hmac` | 0.12.4 / 0.12.1 | No upstream audit claim recorded in the crate READMEs. |
+| `zeroize` | 1.9.0 | No upstream audit claim recorded in the crate README. |
+
+Two of the crates that carry the post-quantum half of the key establishment
+and the whole of the long-term authentication state ship with an explicit
+upstream "never been independently audited" warning, and two more are pinned
+to pre-release versions. The known-answer vectors pinned under D21 prove
+*conformance to the published vectors*; they cannot prove the absence of an
+implementation defect in the pinned version. This is a supply-chain risk
+acceptance, and it is recorded here so that it is visible rather than
+implied. It does not alter §14's selection, and it does not weaken any
+guarantee stated in this document.
 
 ---
 

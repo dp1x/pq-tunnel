@@ -332,12 +332,33 @@ All native compilation must target `x86_64-pc-windows-msvc`:
 cargo test -p <crate> --target x86_64-pc-windows-msvc
 cargo check -p <crate> --target x86_64-pc-windows-msvc
 ```
-The default host (`aarch64-pc-windows-msvc`) cannot compile `aws-lc-sys` — native builds on ARM64 fail at the C assembler level. Use explicit `--target` for all Rust invocations.
+Use explicit `--target` for all Rust invocations. The reason is that this is
+the target CI runs and the target the release gate is measured on.
+
+The justification previously recorded here — that the default host
+(`aarch64-pc-windows-msvc`) "cannot compile `aws-lc-sys`" because native
+builds on ARM64 fail at the C assembler level — is **stale and has been
+removed**. D20 removed the pre-v2 QUIC/TLS stack; `aws-lc-sys` (and
+`ring`/`openssl`) are **not in the dependency tree at all**, and the workspace
+contains no `cc`/`nasm`-driven native build. Native aarch64 builds have
+failed on this host for *host* reasons (the toolchain's `libcore` cannot be
+memory-mapped), not for a C-assembler reason. The x86_64 target is canonical
+because it is what CI verifies, not because the dependency set demands it.
 
 ## Workspace tests
 ```sh
 cargo test --workspace --target x86_64-pc-windows-msvc
 ```
+
+## Benchmark harness
+`bench/` is a **separate workspace** and is deliberately **not** a member of
+the main workspace, so `cargo test --workspace` never builds or runs it. It
+is invoked explicitly:
+```sh
+cargo run --release --manifest-path bench/Cargo.toml \
+    --target x86_64-pc-windows-msvc -- --bench all
+```
+See `docs/performance/I-benchmark-methodology.md`.
 
 ## Fuzz targets (x86_64-msvc only; requires `cargo-fuzz`)
 The fuzz crate lives in `fuzz/` (own workspace). `fuzz/Cargo.toml` has
@@ -346,7 +367,7 @@ All 10 targets use the modern `fuzz_target!` harness (no legacy
 `rust_fuzzer_test_input` exports remain). Run from the repo root with the
 cross-target flag:
 ```sh
-cargo +nightly fuzz run <target_name> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
+cargo +nightly-2026-10-18 fuzz run <target_name> --fuzz-dir fuzz --target x86_64-pc-windows-msvc
 # Targets: wire_packet_from_bytes, inner_plaintext_decode, envelope_decrypt,
 #          replay_window, handshake_message_decode, handshake_driver_receive,
 #          session_manager_receive, cover_scheduler, relay_overlay, manager_churn
@@ -361,7 +382,15 @@ Notes (verified 2026-08 on this machine):
   reliably possible on a compatible host (e.g. Linux); the targets are
   still the contract for what must never panic.
 - The fuzz crate cannot be `cargo check`ed standalone (no `main` until the
-  harness is injected). Verify compile via `cargo +nightly fuzz build`.
+  harness is injected). Verify compile via
+  `cargo +nightly-2026-10-18 fuzz build`.
+- The nightly is **pinned** in `fuzz/rust-toolchain.toml`; the rolling
+  `nightly` channel is not used, because the fuzz graph depends on a
+  specific std metadata version. The main workspace pins `1.99.0` in the
+  root `rust-toolchain.toml`.
+- `fuzz/Cargo.lock` is **tracked**. The fuzz workspace resolves its own
+  dependency graph, so it is pinned to the shipped versions explicitly; CI
+  fails if it drifts from the main `Cargo.lock`.
 
 ## Linting
 ```sh

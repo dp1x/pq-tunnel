@@ -32,19 +32,19 @@ codebase: S ≈ under a day, M ≈ a few days, L ≈ a week or more.
 | **G-08** | The construction has no external known-answer vectors | `blocks-audit` | **M** |
 | **G-09** | Verification-order invariant is untested | `nice-to-have` | **S** |
 | **G-10** | `PROTOCOL_SPEC.md` is stale and self-referential | `blocks-audit` | **M** |
-| **G-11** | `CRYPTO_PROFILE.md` §14 overstates external anchoring | `nice-to-have` | **S** |
-| **G-12** | Test counts do not reconcile | `nice-to-have` | **S** |
-| **G-13** | SHA-256 test accepts an incorrect digest | `nice-to-have` | **S** |
+| **G-11** | `CRYPTO_PROFILE.md` §14 overstates external anchoring | `nice-to-have` | **S — DONE** |
+| **G-12** | Test counts do not reconcile | `nice-to-have` | **S — PARTLY DONE** |
+| **G-13** | SHA-256 test accepts an incorrect digest | `nice-to-have` | **S — RESOLVED** |
 | **G-14** | Toolchain not pinned; fuzz deps not locked | `nice-to-have` | **S** |
 | **G-15** | `build.ps1` is Windows-only and defaults to one crate | `nice-to-have` | **S** |
 | **G-16** | `ip_packet_len` has no production caller or dedicated target | `nice-to-have` | **S** |
 | **G-17** | The measurement harness for §13 is not published | `blocks-audit` (for the metadata claim) | **M** |
 | **G-18** | No supply-chain artefact | `nice-to-have` | **S** |
-| **G-19** | The server egress / SSRF posture is unstated | `blocks-audit` (deployment) | **M** |
-| **G-20** | Design documents under `docs/design/` are untracked | `nice-to-have` | **S** |
+| **G-19** | The server egress / SSRF posture is unstated | `blocks-audit` (deployment) | **M — PARTLY ADDRESSED** |
+| **G-20** | Design documents under `docs/design/` are untracked | `nice-to-have` | **S — RESOLVED (tracked since `86cf7bd`)** |
 | **G-21** | HMAC-SHA256 has no RFC 2104 vector | `nice-to-have` | **S** |
 | **G-22** | Evidence cited by test *name* is given by name nowhere | `nice-to-have` | **S** |
-| **G-23** | Key-establishment changes are landing in the working tree with no decision record | `blocks-audit` | **S** |
+| **G-23** | Key-establishment changes are landing in the working tree with no decision record | `blocks-audit` | **S — PARTLY RESOLVED** |
 
 ---
 
@@ -110,8 +110,11 @@ project's own design proposal states this in its own words
    `DESIGN_DECISIONS.md` concludes Tunnel is a loopback-only UDP relay proxy with
    no privileges — which misdescribes both the shipped product and its direction.
 2. **The correcting document is not a decision.** It is `Status: PROPOSED`
-   (`:3`), it is "not yet in `DESIGN_DECISIONS.md`" (`:14`), and it is
-   **untracked by git** (`git ls-files docs` → empty).
+   (`:3`), it is "not yet in `DESIGN_DECISIONS.md`" (`:14`), and it was
+   **untracked by git** at package time (`git ls-files docs` → empty).
+   *(HISTORICAL: since commit `86cf7bd` the `docs/` tree **is** tracked —
+   `git ls-files docs` → 17 files — so an outside reader can now see it.
+   The "not a decision of record" half of the problem is unchanged.)*
 3. **"Relay code is implementation infrastructure" is a claim an auditor cannot
    verify** — it is a design intent, and the code still has the relay as the
    *only* `data_tx` producer (`docs/design/D25-D26-...md:36`).
@@ -310,8 +313,37 @@ egress. The project's own research says this plainly
 > the request."
 
 `docs/design/D28-server-egress-policy-1to1.md` proposes a deny-by-default CIDR
-policy with an explicit `--allow-cidr` override and a port-0 rejection — but it
-is **untracked and unimplemented**, and its own status is a proposal.
+policy with an explicit `--allow-cidr` override and a port-0 rejection. At
+package time it was **untracked and unimplemented**, and its own status was a
+proposal. *(HISTORICAL on both counts: `docs/` has been tracked since `86cf7bd`,
+and a **minimal** egress guard has since shipped — see below.)*
+
+> **PARTLY ADDRESSED — what actually shipped.** A minimal egress guard is now
+> in `pq-tunnel-bin/src/forward.rs` (module `egress`), evaluated **before any
+> socket is created**, so a denied destination produces no outbound datagram
+> and no client-visible signal. It denies:
+>
+> - destination port 0;
+> - IPv4 loopback `127.0.0.0/8` and IPv6 loopback `::1` (including the
+>   IPv4-mapped forms — `::ffff:127.0.0.1` is normalised to IPv4 *before* the
+>   IPv4 rules run);
+> - the IPv4 unspecified range `0.0.0.0/8` and the IPv6 unspecified address
+>   `::/128`;
+> - IPv4 multicast `224.0.0.0/4` and IPv6 multicast `ff00::/8`;
+> - IPv4 limited broadcast `255.255.255.255/32`;
+> - the four **exact** cloud-metadata hosts `169.254.169.254`,
+>   `100.100.100.200`, `fd00:ec2::254`, `fd20:ce::254` — evaluated **before**
+>   any range rule, so the exact hosts are denied even though their enclosing
+>   ranges are not.
+>
+> **What is still NOT implemented:** the full D28 table (24 rows), the
+> `--allow-cidr` / `--allow-all-egress` flags, and the D28 defaults "deny
+> `100.64.0.0/10`" and "deny the operator's LAN DNS". RFC1918, ULA, CGNAT
+> (`100.64.0.0/10`), link-local generally, and port 53 all remain reachable
+> **by design** — two of the D28 defaults would be product-breaking for a
+> VPN, which is why they were not taken. The raw-IP/TUN egress policy is
+> deferred to the TUN milestone. See the Status note in
+> `docs/design/D28-server-egress-policy-1to1.md`.
 
 The D-record, the README and the THREAT_MODEL are all **silent** on this. An
 operator deploying a v0.2 server exposes it.
@@ -321,7 +353,8 @@ adversary obtaining a client credential can pivot the server — that is
 `§4.5`, which currently understates it), and state in the README whether D28 is
 in scope for the release.
 
-**Effort:** M.
+**Effort:** M — the shipped guard is recorded above; the documentation half is
+still outstanding.
 
 ---
 
@@ -361,63 +394,115 @@ verification (not a KEM error path), or a structural assertion on the call order
 
 ### G-11 — `CRYPTO_PROFILE.md` §14 overstates external anchoring
 
-`CRYPTO_PROFILE.md:429` reads: "Selection is anchored to external known-answer
+> **STATUS: [DONE].**
+
+`CRYPTO_PROFILE.md` §14 used to read: "Selection is anchored to external known-answer
 vectors per D21 (RFC 8439, RFC 5869, RFC 7748, Wycheproof ML-KEM-768/ML-DSA-65)
 and to D13–D15/D19."
 
-Read plainly, this says the selection is anchored. What is anchored is the
+Read plainly, this said the selection is anchored. What is anchored is the
 *primitive set*. The construction (master, transcript, Finished MAC) is not, and
-§14 never mentions the construction at all — `CRYPTO_PROFILE.md:24-31` still
+§14 never mentioned the construction at all — `CRYPTO_PROFILE.md:24-31` still
 declines to define "final handshake construction" and "packet formats".
 
-**Required:** narrow the sentence and add a "Construction is specified in
-`docs/audit/spec/crypto-construction.md` (TO BE AUTHORED)" pointer once G-03
-lands.
+**What was done.** §14 now says the **primitives** are selected against the
+external known-answer vectors, and adds an explicit scope paragraph: the D21
+anchoring covers the *primitive set only*; the v2 master-secret derivation, the
+per-direction traffic keys, the nonce prefixes and the canonical transcript
+hashes TH1/TH2/TH3 have **no external vector at any version** and are pinned
+only by self-authored tests; and the normative (still skeletal) description is
+`docs/audit/spec/crypto-construction.md`, pre-filled from
+`pq-crypto/src/kdf.rs` and `pq-tunnel-core/src/handshake_v2.rs`.
 
-**Effort:** S.
+**What is still open.** The underlying gap is unchanged and is **G-08**: the
+construction still has no external vectors. This gap was about the *wording*,
+and the wording is fixed.
+
+**Effort:** S — **done**.
 
 ### G-12 — Test counts do not reconcile
 
-Three published numbers, none matching measurement:
+> **STATUS: [PARTLY DONE].**
+
+Three published numbers, none matching measurement **at package time**:
 
 | Source | Number |
 |---|---|
 | `README.md:74` | 352 |
 | `README.md:173-176` | 67 + 236 + 37 + 12 = 352 |
 | `checkpoints/VALIDATION_LINUX_E2E_FUZZ.md:76` | core = 223 |
-| **Measured by this package** (`x86_64-pc-windows-msvc`) | **67 + 41 + 236 + 12 = 356** |
+| **Measured by this package** (`x86_64-pc-windows-msvc`, at `ae8061d` + working tree) | **67 + 41 + 236 + 12 = 356** |
+| **Measured later** (`x86_64-pc-windows-msvc`, at `86cf7bd`) | **85 + 259 + 53 + 25 = 422** |
+| **Measured on the current tree** (`x86_64-pc-windows-msvc`) | **85 + 280 + 77 + 25 = 467** |
 
 These are the only numbers an outside reader can verify independently, and they
-are wrong.
+are wrong — but note that they are also measurements of **different trees on
+different targets**, which is part of the confusion. The internal Linux
+ledger's 327 (native ARM64) is a third tree again.
 
-**Required:** have CI emit the count into a file the README links, or state the
-count as of a named commit and date.
+**What was done.** The README now states the count **anchored to a target** —
+"467 tests pass … measured on the `x86_64-pc-windows-msvc` target" — gives the
+per-crate breakdown for the same target (85 + 280 + 77 unit + 25 E2E), and
+states the Linux core-test figure as **277** (280 − 3 `#[cfg(windows)]`).
+
+**What is still open.** The numbers are still hand-written. They will drift
+again on the next release unless CI emits the count into a file the README
+links, or the README keeps naming the commit it measured.
+
+**Effort:** S — the wording fix is done; the CI-emitted count is not.
 
 **Effort:** S.
 
 ### G-13 — SHA-256 test accepts an incorrect digest
 
-`pq-crypto/src/transcript.rs:131-139`:
+> **STATUS: [RESOLVED] — and the finding as written was INVERTED.**
+>
+> The original text of this gap read:
+>
+> ```rust
+> assert!(
+>     result == fips_vector || result == platform_vector,
+>     "SHA-256 of 'abc' must match a known test vector; got: {:02x?}", result
+> );
+> ```
+>
+> and then said the canonical digest was the "platform" variant and named a
+> different digest as "the FIPS 180-4 value" (the two differ only in their
+> last four bytes), and that the comment at `:122-126` calls the
+> x86-64-emulation difference "a platform bug, not a code bug".
+>
+> **That was backwards, and the platform story was false.**
+>
+> - The canonical value of `SHA-256("abc")` is
+>   `ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad` —
+>   it ends **`...f20015ad`**. That is the FIPS 180-4 / RFC 6234 §8.5 value
+>   (RFC 6234 §8.5, TEST1 = `"abc"` → `…f20015ad`). The value this gap
+>   recorded as "the FIPS 180-4 value" differs from it in the last four
+>   bytes and is **not** the FIPS value.
+> - The crate's implementation was **always correct**. `sha2` is built with
+>   `force-soft-compact` (`pq-crypto/Cargo.toml:14`) — scalar, no NEON/SHA-NI —
+>   and it produced the canonical digest on every platform, including this
+>   Windows/ARM64 host. There was never a "Windows-on-ARM64 SHA-256
+>   discrepancy"; that story was false.
+> - The sibling test at `sha256_empty_string_known_vector` asserted only the
+>   FIPS value for `SHA-256("")` and passed throughout, which is what made
+>   the inconsistency visible.
+> - **The defect was in the test, not the implementation.** The old test
+>   accepted either digest and the comment labelled the *correct* one "a
+>   platform bug". A test that accepts a wrong answer is worse than no test.
+>
+> **The correct order of operations — and the one that was actually
+> followed.** Fix the constant first (to the canonical `...f20015ad`), then
+> delete the escape hatch so the test accepts exactly one value; only then is
+> the anchor strict. Doing it the other way round — deleting the branch
+> first — would have turned the test **red** everywhere, because the constant
+> it asserted was the wrong one. The strict test is now in the tree:
+> `pq-crypto/src/transcript.rs::sha256_known_vector` asserts exactly one
+> digest, with no escape hatch and no platform comment.
+>
+> **The gap is closed. No further action.**
 
-```rust
-assert!(
-    result == fips_vector || result == platform_vector,
-    "SHA-256 of 'abc' must match a known test vector; got: {:02x?}", result
-);
-```
-
-`platform_vector` ends `...f20015ad`; the FIPS 180-4 value ends `...f200186d`.
-The comment at `:122-126` says the x86-64-emulation difference is "a platform
-bug, not a code bug". But `sha2` is built with `force-soft-compact`
-(`pq-crypto/Cargo.toml:14`) — scalar, no NEON/SHA-NI — and the sibling test at
-`:145-157` correctly asserts only the FIPS value for `SHA-256("")`, passing
-today.
-
-A test that accepts an incorrect cryptographic output is worse than no test: it
-can hide a real regression. If the platform issue is genuinely fixed, delete the
-escape hatch.
-
-**Effort:** S.
+**Effort:** S — **done**.
 
 ### G-14 — Toolchain not pinned; fuzz dependencies not locked
 
@@ -471,15 +556,25 @@ review — but that file is INTERNAL-ONLY.
 
 ### G-20 — Design documents under `docs/design/` are untracked
 
-Three substantial documents exist on disk and are in git's ignore path's blind
-spot (`docs/` is not itself ignored, but the files were never added —
-`git ls-files docs` → empty). An auditor cloning the repo sees none of them.
+> **STATUS: [RESOLVED] — HISTORICAL. They are tracked now.**
 
-This matters more than it sounds: `D25-D26-*.md` is the **only** place in the
-project that says D18 is no longer the product model (G-02), and
-`D28-*.md` is the **only** place the SSRF posture is analysed (G-19).
+Three substantial documents existed on disk and were in git's ignore path's
+blind spot (`docs/` is not itself ignored, but the files had never been added —
+at package time `git ls-files docs` → empty), so an auditor cloning the repo
+saw none of them.
 
-**Effort:** S (add them, or promote the content into the decision record).
+**That is no longer true:** since commit `86cf7bd` the whole `docs/` tree is
+tracked (`git ls-files docs` → 17 files, including `docs/design/*.md` and this
+package). An auditor cloning the repo now sees them.
+
+The **substantive** half of this gap survives and is unchanged: `D25-D26-*.md`
+is still the only place in the project that says D18 is no longer the product
+model (G-02), and `D28-*.md` is still the only place the SSRF posture is
+analysed (G-19) — and neither is a *decision of record*. Tracking the files
+made them visible; it did not make them binding.
+
+**Effort:** S — the tracking is done; promoting the content into the decision
+record remains open (G-02).
 
 ### G-21 — HMAC-SHA256 has no RFC 2104 vector
 
@@ -522,11 +617,28 @@ in the same window to handle the `None` case.
 problem is that it is **entirely unrecorded**:
 
 - no `DESIGN_DECISIONS.md` entry (highest is D24; D27 is referenced by other
-  uncommitted code but also absent);
+  code but also absent);
 - no `THREAT_MODEL.md` note, despite it changing what a malicious peer can do;
 - no `CRYPTO_PROFILE.md` statement of the DH-leg validity rule;
 - no test named anywhere;
 - nothing committed — `git status` shows `M pq-crypto/src/classical.rs`.
+
+> **STATUS: [PARTLY RESOLVED] — the code half is done, the record half is not.**
+>
+> The change is now **committed** as `68273a8` ("fix(crypto): add X25519
+> contributory check and KAT boundary tests"), and it is **covered by named
+> tests** — `low_order_peer_keys_are_rejected`,
+> `low_order_rejection_is_symmetric`,
+> `contributory_exchange_is_never_rejected`,
+> `server_rejects_non_contributory_client_x25519_key`,
+> `client_rejects_non_contributory_server_x25519_key`. So the "moving target
+> in the working tree" and "no test named anywhere" complaints are closed.
+>
+> The **record** half is unchanged at `86cf7bd`: there is still no
+> `DESIGN_DECISIONS.md` entry for the contributory rule, still no
+> `THREAT_MODEL.md` note, and still no `CRYPTO_PROFILE.md` statement of the
+> DH-leg validity rule. The `docs/decisions/D27-*.md` document is now tracked
+> but still absent from the D-record.
 
 **Why it blocks an audit.** An auditor must be able to enumerate every change to
 the key-establishment path and find its rationale and its tests. At the moment
@@ -547,9 +659,12 @@ missing.
 If the project wants to move from "evidence package" toward
 "auditable specification", this order minimises wasted work:
 
-1. **G-14, G-15, G-20, G-12** — trivial, unblocks reproduction. (½ day)
-2. **G-13, G-21, G-22, G-09, G-11** — small, closes specific wrong/incomplete
+1. **G-14, G-15, G-12** — trivial, unblocks reproduction. (½ day)
+   *(G-20 is now done — the `docs/` tree is tracked since `86cf7bd`.)*
+2. **G-21, G-22, G-09** — small, closes specific wrong/incomplete
    claims. (1–2 days)
+   *(G-13 is resolved — the SHA-256 test is strict; G-11 is done — `CRYPTO_PROFILE.md` §14
+   is narrowed.)*
 3. **G-04, G-02, G-23** — decision-record hygiene; **G-02 is *required* for the
    record to be truthful**, and **G-23 stops the record from falling further
    behind the code**. (1 day)

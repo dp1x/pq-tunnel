@@ -1,5 +1,14 @@
 # Track F — Metadata / Cover-Traffic Guarantees Audit
 
+> **This is an internal self-assessment, not an audit.** Everything below was
+> produced and checked by the Tunnel project's own authors, in-tree. **No
+> independent third party has reviewed, verified, endorsed or approved any of
+> it**, and nothing in this document constitutes assurance or a third-party
+> statement of correctness. The project's own disclaimer stands: *"No
+> independent third-party security audit has been performed."* The "audit" in
+> the title names the *method* (a static-source gap-finding pass), not an
+> external reviewer.
+
 **Track:** F (re-run) · **Scope:** cover-traffic guarantees, aggregate cost, idle/lifetime coupling
 **Date:** 2026-10-05 · **Status:** analysis only, documentation only, no source modified, nothing committed.
 **Method:** static source reading only. **New measurements: NOT MEASURED.** D23/M9A empirical

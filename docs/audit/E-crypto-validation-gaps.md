@@ -1,5 +1,14 @@
 # Track E — Crypto Validation Gaps Audit
 
+> **This is an internal self-assessment, not an audit.** Every finding and
+> every test below was produced and checked by the Tunnel project's own
+> authors, in-tree. **No independent third party has reviewed, verified,
+> endorsed or approved any of it**, and nothing in this document constitutes
+> assurance, certification or a third-party statement of correctness. The
+> project's own disclaimer stands: *"No independent third-party security
+> audit has been performed."* The "audit" in the title names the *method*
+> (a gap-finding pass over the crypto surface), not an external reviewer.
+
 **Scope:** `pq-crypto` (X25519, HKDF/key schedule, transcript, KEM, signature, AEAD,
 KAT vectors), `pq-tunnel-core` (codec, v2 handshake), `pq-tunnel-bin` (relay framing,
 packet length recovery).
@@ -8,6 +17,12 @@ packet length recovery).
 
 **Status:** audit + tests landed. **NOT committed** — per task instruction. Two findings
 require a human decision before the corresponding behaviour is pinned as permanent (§6).
+
+> **HISTORICAL:** the "NOT committed" status above describes the tree at
+> package time. The changes this track produced **were** committed — as
+> `68273a8` ("fix(crypto): add X25519 contributory check and KAT boundary
+> tests") — and the tests listed below are present in the current tree. The
+> two open human gates (§6 G-1, G-2) are unaffected and remain open.
 
 Per D21, this report keeps two classes of test strictly separated and never blurs them:
 
@@ -344,7 +359,7 @@ No attacker-reachable panic was found. The `fuzz/` targets cover the same surfac
 | ChaCha20-Poly1305 | **RFC 8439 §2.8.2** | Informational (2018) | `RFC8439_*` (key/nonce/AAD/114-byte plaintext/130-byte ct‖tag) | **YES** |
 | HKDF-SHA256 | **RFC 5869 §A.1 TC1** | Informational (2010) | `RFC5869_{IKM,SALT,INFO,OKM}` | **YES** |
 | X25519 | **RFC 7748 §6.1** | Informational (2016) | `RFC7748_{ALICE_*,BOB_*,SHARED}` | **YES** |
-| SHA-256 | **FIPS 180-4** | — | `transcript.rs:119` `"abc"`, `:144` `""` | **YES** |
+| SHA-256 | **FIPS 180-4** / RFC 6234 §8.5 | — | `transcript.rs` — `sha256_known_vector` (`"abc"`), `sha256_empty_string_known_vector` (`""`) | **YES** |
 | Hybrid key schedule | — (none) | — | **NONE** | **NO — gap, §3.3** |
 | Transcript digest TH1/2/3 | — (Tunnel-specific) | — | **NONE** | **NO — gap** |
 
@@ -389,18 +404,49 @@ security guarantees. The KATs prove *conformance to the published vectors*; they
 absence of implementation defects. `CRYPTO_PROFILE.md` and `DESIGN_DECISIONS.md` do not
 mention this. Recorded as **G-1**.
 
-Note also `pq-crypto/src/transcript.rs:119-127`, which already documents a Windows-on-ARM64
-SHA-256 discrepancy and permits **either** the FIPS vector or a `platform_vector` ending in
-`15ad`. The workspace build target is `x86_64-pc-windows-msvc`, where the strict vector applies,
-but this permissive branch is a latent way for a KAT to stop being a real anchor. Worth a
-follow-up decision (**G-6**).
+> **Update — the posture is now recorded.** `CRYPTO_PROFILE.md` §14.1 ("Dependency
+> posture of the pinned suite") now states these exact versions and their
+> upstream review posture, and names the `chacha20poly1305` 0.10.1 NCC Group
+> audit that was missing here. The finding itself is **unchanged**: the
+> versions are still release candidates and still carry the upstream
+> "never been independently audited" warning, and `DESIGN_DECISIONS.md` still
+> does not record the acceptance.
+
+**[CORRECTED — the SHA-256 note that followed this paragraph was inverted.]**
+The text as first written described `pq-crypto/src/transcript.rs` as
+"documenting a Windows-on-ARM64 SHA-256 discrepancy" and permitting "either
+the FIPS vector or a `platform_vector` ending in `15ad`". **That was
+backwards, and the "platform discrepancy" story was false.**
+
+- The canonical value of `SHA-256("abc")` is
+  `ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad` — it
+  ends **`...f20015ad`**. That is the FIPS 180-4 / RFC 6234 §8.5 value
+  (RFC 6234 §8.5, TEST1 = `"abc"`), and it is the value the crate's
+  implementation produced. The *other* value — the one this track recorded as
+  "the FIPS vector" — differs from it in its last four bytes and is **not** the
+  FIPS value.
+- The crate's SHA-256 was always correct: it is pure-software SHA-256 via
+  `sha2` with `force-soft-compact` (`pq-crypto/Cargo.toml:14`) — scalar, no
+  NEON/SHA-NI — and it produced the canonical digest on every platform
+  including this Windows/ARM64 host. There was never a "Windows-on-ARM64
+  discrepancy". The empty-string test asserted only the FIPS value and
+  passed throughout, which is what made the inconsistency visible.
+- **The defect was in the test, not the implementation.** The old
+  `sha256_known_vector` accepted either digest and the comment labelled the
+  *correct* one "a platform bug". A test that accepts a wrong answer is
+  worse than no test.
+
+**Current state (resolved):** `pq-crypto/src/transcript.rs` now asserts
+**exactly one** expected digest — the canonical `...f20015ad` — with no
+escape hatch. Gate **G-6** is therefore **CLOSED**, and no follow-up decision
+is needed.
 
 ### 5.3 Documentation claims vs. reality
 
 | Claim | Reality | Verdict |
 |---|---|---|
 | `DESIGN_DECISIONS.md:1202` — "Google Wycheproof JSON vectors (FIPS 203 ML-KEM-768, FIPS 204 ML-DSA-65)" | Vectors are real and byte-exact (§5.1). Attribution says "Google"; the corpus now lives at `C2SP/wycheproof` (Google-authored, transferred). | **Accurate**, attribution slightly stale |
-| `CRYPTO_PROFILE.md:426` — "anchored to external known-answer vectors per D21 (RFC 8439, RFC 5869, RFC 7748, Wycheproof ML-KEM-768/ML-DSA-65)" | True for the **primitives**. Silent on the hybrid key schedule having no anchor. | **Accurate but incomplete** |
+| `CRYPTO_PROFILE.md` §14 — "anchored to external known-answer vectors per D21 (RFC 8439, RFC 5869, RFC 7748, Wycheproof ML-KEM-768/ML-DSA-65)" | True for the **primitives**. Silent on the hybrid key schedule having no anchor. | **Accurate but incomplete — since narrowed.** §14 now states explicitly that the D21 anchoring covers the *primitive set only*, and that the master-secret derivation, traffic keys, nonce prefixes and TH1/TH2/TH3 have **no external vector** and are pinned only by self-authored tests. |
 | "FIPS 203" / "FIPS 204" as final | Both final (13 Aug 2024), both with **open errata** pending a revision. | **Accurate; add errata note** |
 | Nothing claims FIPS validation / certification | Nothing does. | **Correct** |
 
@@ -423,7 +469,7 @@ the file.
 | **G-3** | Fix `ip_packet_len`'s IPv6 branch to require `len >= 40`? | Changes behaviour for 20..=39-byte buffers (currently returns a length derived from non-IPv6 bytes). Must confirm the caller cannot over-read. | Fix it. Split the minimum-length guard per version. Verify the caller first. |
 | **G-4** | Record the FIPS 203 / FIPS 204 errata ("potential updates" dated 11/17/2025 and 07/31/2026) in `CRYPTO_PROFILE.md`? | Documentation accuracy; the current text implies the standards are settled. | Yes — one line each, with the NIST planning-note dates. |
 | **G-5** | Ratify the non-contributory X25519 rejection as a `DESIGN_DECISIONS` entry, and ratify `diffie_hellman` returning `Option`? | It changes a documented crypto behaviour from accept to reject. Argued fail-secure and not a wire change (§2.4), but the decision belongs to the maintainer. | Ratify. Add a D-number next to the `Option` doc comment. |
-| **G-6** | Remove the permissive `platform_vector` branch in `transcript.rs::sha256_known_vector` now that the build target is `x86_64-pc-windows-msvc`? | A KAT that accepts two values is a weaker anchor. Removing it restores a strict external anchor; keeping it preserves ARM64 tolerance. | Remove it, or gate it behind `#[cfg(target_arch = "aarch64")]` so the strict vector is mandatory on the CI target. |
+| **G-6** | ~~Remove the permissive `platform_vector` branch in `transcript.rs::sha256_known_vector`?~~ **CLOSED — done.** The branch is gone; the test asserts exactly one digest, the canonical `SHA-256("abc")` = `…f20015ad`. | A KAT that accepts two values is a weaker anchor. Removing it restores a strict external anchor. | **Done.** No `#[cfg(target_arch = "aarch64")]` carve-out is needed or wanted: the "ARM64 tolerance" the old gate proposed to preserve was protecting a value that was never the FIPS one. |
 
 ---
 
@@ -444,7 +490,7 @@ the file.
 | `signature::tests::ml_dsa_65_wycheproof_verify_kat` | `mldsa_65_verify_test.json` g0 tcId 1 |
 | `signature::tests::ml_dsa_65_wycheproof_keygen_kat` | `mldsa_65_sign_seed_test.json` g0 |
 | `signature::tests::ml_dsa_65_wycheproof_sign_kat` | `mldsa_65_sign_seed_test.json` g0 tcId 1 |
-| `transcript::tests::sha256_known_vector` | FIPS 180-4 — **see G-6**, accepts a platform variant |
+| `transcript::tests::sha256_known_vector` | FIPS 180-4 / RFC 6234 §8.5 — **strict, single expected digest** (`…f20015ad`); the permissive branch is gone (gate G-6, **CLOSED**) |
 | `transcript::tests::sha256_empty_string_known_vector` | FIPS 180-4 |
 
 **Added by this audit — none.** No new test in this audit carries an external expected value.
