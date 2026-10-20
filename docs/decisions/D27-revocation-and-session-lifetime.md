@@ -518,5 +518,301 @@ tightening, already verified):**
   `ServerSessionManager::set_roster` / `roster_len` — additive API.
 - `RosterHandle` with parse-then-swap and fail-closed reload — the atomicity
   invariant and its tests.
-- The `pq-tunnel-bin/tests/revocation_lifetime.rs` suite.
 - Renaming D17's "revocation remains manual" limitation once a trigger exists.
+
+---
+
+# Amendment A — Track B (runtime revocation), 2026-10-21
+
+**Prior status of this record (unchanged above, restated for the record):**
+*Proposed (implementable; the owner gates in "Human decision gate" below are not
+yet approved).*
+
+**Status after this amendment:** *Proposed (amended — the runtime-revocation
+mechanism described in §2, §3 and the Human decision gate below is now
+specified in `docs/design/D32-runtime-revocation.md`; the reload trigger, the
+data-sharing model and the file-read protocol are settled there and the
+corresponding gates below are marked RESOLVED. The `lifetime_cap` default and
+gates 1, 2, 3 and 5 remain open.)*
+
+This amendment **appends** to D27. It does not rewrite, delete or re-interpret
+the text above; where the two disagree, this section states the correction
+explicitly. The implementation-ready detail is
+[`docs/design/D32-runtime-revocation.md`](../design/D32-runtime-revocation.md)
+("D32"); all `file:line` citations below are against the baseline commit
+`c6c0f12`.
+
+## A.1 The M3 re-check is load-bearing and must not be weakened
+
+**CONFIRMED, and confirmed to be load-bearing.** D27 §4's re-check is present
+at `pq-tunnel-core/src/handshake_v2.rs:1949-1952`, positioned **after** the
+Finished-MAC comparison (`:1932-1937`) and **before** `ServerEvent::Complete`
+(`:1954-1960`). It reads the roster that is in force at M3 time
+(`roster_contains` reads `self.cfg.roster`, `:1577`; `set_roster` replaces it
+wholesale, `:1563`).
+
+`pq-tunnel-bin/tests/revocation_lifetime.rs:365`
+(`midflight_revocation_blocks_m3_completion`) fails if the block is removed,
+because the pending entry would then complete and `ManagerEvent::Established`
+would be emitted.
+
+**Amendment:** the re-check is a **permanent, load-bearing** control. It must
+not be weakened, reordered before the MAC check, made conditional, or replaced
+by a membership pre-filter in front of the D12 uniform verification loop
+(`handshake_v2.rs:1813-1819`). A pre-filter would make the number of ML-DSA
+verifications attacker-observable and would permit the early exit D12 rejects.
+
+## A.2 Runtime reload was never wired into the shipped server
+
+**CONFIRMED.** `set_roster` has **zero production call sites**. Its only
+occurrences are the definition (`handshake_v2.rs:1550`), the delegation on
+`ServerSessionManager` (`session_manager.rs:551-552`), and three `#[cfg(test)]`
+call sites in `handshake_v2.rs` (`:3573`, `:3596`, `:3599`).
+
+`RosterHandle` appears only in its own definition
+(`pq-tunnel-bin/src/identity.rs:540`) and in the test suite
+(`pq-tunnel-bin/tests/revocation_lifetime.rs:28`, `:561`, `:626`, `:694`).
+
+The shipped server loads the roster once (`pq-tunnel-bin/src/v2_server.rs:52`),
+builds the config (`:54`) and constructs the manager (`:56`).
+
+**Amendment:** D27 §2's decision ("a file-watch/periodic-reload on the roster
+path") and its Consequences bullet ("A watcher or signal handler is not wired
+in this change — `RosterHandle::reload()` is the primitive") remain accurate as
+a statement about the tree. D27's "Not covered / UNVERIFIED" bullet "The
+reload **trigger** ... is not implemented" is likewise confirmed. **The
+revocation feature does not exist in the shipped server**: revoking a client
+key still requires a restart, which kills every live session.
+
+## A.3 The `RosterHandle` clone defect
+
+**CONFIRMED.** `RosterHandle` is `#[derive(Clone)]` with an
+`Arc<Vec<MlDsaPublicKey>>` field (`identity.rs:539-542`) and publishes a new
+generation by **replacing** that `Arc` (`identity.rs:609`).
+
+`Clone` for `Arc<T>` increments the strong count and copies the pointer, so a
+clone shares the same allocation. A `reload` on the original installs a
+*different* allocation in the original only. **A clone therefore stays pinned to
+the generation that was current at clone time and never observes a subsequent
+reload.** The divergence is permanent, not a transient race.
+
+In the shipped tree this is a latent trap rather than an active defect: the
+roster is read only by the handshake machine, which owns its own `Vec`. But
+`RosterHandle` is a **public** type of `pq_tunnel_lib`, so any future change
+that wants a second reader of the roster (a health endpoint, an admin
+interface) steps directly on it and gets a silently stale view of the trust
+anchor.
+
+**Amendment:** D27 §3's description of the implementation (`RosterHandle`,
+"Exactly one publication point: `self.current = Arc::new(parsed);`. Readers
+take `Arc::clone(&self.current)`") is **withdrawn**. The replacement design has
+**no shared roster cell**; see A.5.
+
+## A.4 The shipped atomicity test is vacuous with respect to the swap
+
+**CONFIRMED, and the claim in the review brief is correct.**
+`pq-tunnel-bin/tests/revocation_lifetime.rs:616-683`
+(`roster_replacement_is_atomic_under_concurrent_readers`).
+
+The reader threads hold a **clone** of the handle (`:631`). Because of A.3,
+that clone's `Arc` is the *same allocation* the original used, and `reload`
+replaces the original's pointer without ever mutating that allocation. Every
+sample therefore yields exactly the generation `[A]`:
+
+- `is_a == true` always (`:644`),
+- the assertion `is_a || is_ab` (`:646-650`) **can never fail**,
+- the assertion `!snap.is_empty()` (`:639`) **can never fail**,
+- `total_samples > 0` (`:678-680`) proves only that the threads ran.
+
+**The readers never observe generation 2 at all.** The property D27 §3 claims
+the test pins -- "A reader that samples after the swap sees the entire new
+roster" (D27 §3, lines 215-221) -- is **not exercised**.
+
+**What the test *does* still pin, precisely.** Because the readers are pinned
+to the same allocation, an implementation that mutated the `Vec` **in place**
+(leaving `self.current` unchanged while clearing and refilling it) *would* be
+caught. The test therefore pins exactly one thing:
+
+> **The published `Vec` is never mutated in place; it is replaced wholesale.**
+
+It pins nothing about the swap, about generation ordering, or about a reader
+ever observing the new generation.
+
+**Amendment:** D27 §3's claim that the atomicity property is "pinned by
+`roster_replacement_is_atomic_under_concurrent_readers` (3 threads x 200 swaps)
+and `held_snapshot_survives_a_swap_unchanged`" is **corrected**: the first of
+those two tests must be **deleted and replaced** by one that observes both
+generations and can actually fail. D32 §12.3 specifies the replacement
+(`roster_read_is_whole_under_concurrent_replacement`, which asserts
+`saw_a && saw_ab`, and `roster_read_never_publishes_a_torn_prefix`, which pins
+the stability check). `held_snapshot_survives_a_swap_unchanged` is retained but
+re-purposed.
+
+## A.5 The adopted reload model
+
+D27 §2's option table is unchanged: (b) an admin RPC/socket stays **rejected**,
+(d) restart-only stays **rejected**, and the file-watch/poll path is **adopted**.
+
+What is now settled (D32 §§3 to 5):
+
+- **Trigger.** `--roster-watch <secs>`, default 5, `0` disables. Plus an
+  opt-in Unix `SIGHUP` (`--roster-reload-on-hup`), off by default because
+  installing a handler changes SIGHUP's conventional meaning. A poll was
+  chosen over a signal because SIGHUP does not exist on Windows and
+  `tokio::signal::ctrl_break` needs a console and a process group, so a poll is
+  the only trigger that behaves identically on the CI target and the primary
+  deployment platform. **No new network surface.**
+- **Data-sharing model.** **Single owner, message passing.** The roster stays a
+  plain `Vec<MlDsaPublicKey>` owned by `ServerHandshake.cfg.roster` inside the
+  one task that owns the driver. A reload is delivered to that owner as an
+  `mpsc` message and adopted through `ServerSessionManager::set_roster`. There
+  is no `Arc<RwLock<...>>`, no `arc-swap` dependency, and no shareable roster
+  handle that could be cloned. **"A reader observes exactly one whole
+  generation" is therefore true by construction**, because every read and the
+  single write take `&mut self` and execute in one task.
+- **File-read protocol.** One handle; metadata captured from the handle before
+  and after a single `read_to_end`; the read is refused if the file changed
+  underneath it; then the strict `PQTI` / `version: 1` / `type: roster`
+  grammar, then validation (at most `max_roster_size` payload lines **checked
+  before any key is decoded**, at least one key, every key exactly 1952 bytes,
+  every key a decodable ML-DSA-65 public key). A candidate is published only
+  if every check passes.
+- **Fail-closed gate.** The gate is the **parse/validation** gate (malformed,
+  empty, oversize, unstable) -- never a size- or membership-based rule. D27 §3's
+  "parse-then-swap, never mutate-in-place" invariant is retained and is now
+  enforced by the single-`Vec`-move publication point.
+
+**The valid-subset policy (new, and it settles the ambiguity in D27 §3 and
+§5).** A roster file that parses, is non-empty and is within the bound is
+**published even if it is a strict subset of the roster in force**. A narrowing
+IS revocation. Refusing a narrowing would be a *silent failure to revoke* (a
+security failure); publishing one that was not intended is an *availability*
+failure, which is loud -- the reload is logged at `warn!` with the roster size,
+the roster fingerprint and the per-key fingerprints of the added and removed
+keys. **An availability failure is the safe direction; a security failure is
+not.** D10 ("Tunnel fails securely") is about not continuing *insecurely*; it
+does not require refusing to *act*.
+
+The defence against an unintended narrowing is therefore **operational and
+observable**, not a validation rule: the operator replaces the roster
+**atomically**; the server detects an in-flight in-place rewrite and refuses
+it; every adoption is logged; and the roster fingerprint is a stable,
+order-independent identifier of the *set*, so the operator can confirm that
+what is in force is what they intended. The server **cannot** distinguish
+"revoked" from "rotated" from "clobbered by an old backup": there is no signed
+manifest, no generation counter in the file and no per-key revocation record,
+and adding any of them is out of scope for this wave.
+
+**Failure behaviour.** A **runtime** reload failure is **never fatal**: the
+roster in force stays in force, the server keeps serving, the failure is
+logged and retried on the next poll. A **startup** failure remains **fatal**
+(the server does not start with an untrusted roster). The asymmetry is
+deliberate: at startup there is no previous roster to fall back to. **Fail-secure
+is not fail-stop**: the secure state is "the last known-good roster", not "no
+server".
+
+**Latency, stated plainly.** The effective time of a revocation is **the moment
+the driver applies the swap**, not the moment the operator edited the file. The
+bound is the poll interval plus the 1 s quiescence window -- about 6 s with the
+defaults. A second, sub-millisecond window remains in the same `select!`
+iteration and is closed by draining the reload channel at the top of the
+transport branch.
+
+## A.6 Policy for already-established sessions (unchanged, with the reasoning re-verified)
+
+D27 §5's decision stands: **revocation gates future establishment; it does not
+tear down an already-established session.** The re-verification added three
+points of reasoning that were not in the original text:
+
+1. **Revoking the identity key does not expose the established session.** The
+   traffic keys are session-scoped and derived from ephemeral handshake
+   secrets (D14), and the identity key never enters the key schedule
+   (`DESIGN_DECISIONS.md:509-510`). An attacker who steals the client's
+   *identity* seed can forge new handshakes; it gives them nothing about an
+   already-established session's traffic keys. Killing the session protects
+   against essentially nothing.
+2. **The signal is ambiguous.** Without a signed manifest or a per-key
+   revocation record, the server cannot distinguish "the operator revoked A"
+   from "the operator rotated A to B" from "the operator restored an old
+   backup". A "kill sessions whose key left the roster" policy would kill the
+   legitimate session during a routine rotation -- a self-inflicted denial of
+   service with no security benefit.
+3. **D16 rotation already re-runs the roster check**, so a revoked client
+   cannot rotate back in: M1 does not authenticate, no M2 is produced, the
+   client burns its `m1_max_attempts` budget and reports
+   `Closed{HandshakeTimeout}`. Verified by
+   `revoked_key_cannot_re_establish` (`revocation_lifetime.rs:330`) and
+   `revoked_client_retry_loop_never_establishes` (`:417`).
+
+## A.7 The 24 h `lifetime_cap` is the exposure bound
+
+D27 §5 already bounds the exposure window of a revoked-but-alive session by
+`lifetime_cap`. This amendment names the bound explicitly and records the
+dependency it creates:
+
+> **The 24 h cap is the bound on exposure; revocation is not.** With the cap
+> enabled, a session established by a revoked key lives at most until
+> `established_at + 24 h`, after which `Closed{LifetimeCap}` fires
+> (`CloseReason::LifetimeCap`, `pq-tunnel-core/src/session_manager.rs:170`) and
+> the client re-establishes -- which fails at M1 against the revoked roster.
+
+`SessionLimits::lifetime_cap` is currently `None` by default
+(`session_manager.rs:150`) and is **not** enabled by any shipped binary. The
+consequence must be recorded rather than left implicit:
+
+> **Without the cap, a revoked-but-alive session is unbounded.** Revocation
+> bounds only *future* establishment. The runtime-revocation feature must not
+> be read as fixing the D27 §1.3 exposure hole; the cap is what closes it.
+
+This dependency is why D27 §1.6's default decision (`Some(24h)`, with a visible
+CLI override) matters beyond its own section: it is the bound that makes
+"revocation does not kill live sessions" an acceptable trade.
+
+## A.8 Citation drift in this record
+
+The `file:line` citations in the text above were written against an earlier
+tree and no longer resolve. **They are left unchanged** (this amendment does
+not rewrite the record), but the verified locations are:
+
+| D27's citation | Verified location at baseline `c6c0f12` |
+|---|---|
+| `session_manager.rs:141` (`lifetime_cap` default `None`) | `session_manager.rs:150` |
+| `session_manager.rs:141` (`idle_timeout` default) | `session_manager.rs:149` |
+| `session_manager.rs:141` (`max_sessions` default) | `session_manager.rs:148` |
+| `session_manager.rs:468` / `:585` / `:544` (the `last_activity` refresh sites) | `session_manager.rs:659` / `:776` / `:735` |
+| `session_manager.rs:621` (`last_activity` read) | `session_manager.rs:812` |
+| `codec.rs:121` (`MAX_PACKET_NONCE`) | `codec.rs:129` |
+| `codec.rs:104` (`PACKET_SIZE`) | `codec.rs:112` |
+| `handshake_v2.rs:1595-1626` (`complete_m1`) | `handshake_v2.rs:1793-1830` |
+| `handshake_v2.rs:1661` (the matched key is stored) | `handshake_v2.rs:1868` |
+| `handshake_v2.rs:1669` (`on_m3_fragment`) | `handshake_v2.rs:1879` |
+| `handshake_v2.rs:1276` (`pending_ttl`) | `handshake_v2.rs:1353` |
+| `handshake_v2.rs:1372-1377` (`ServerHandshake::new` clones the roster) | `handshake_v2.rs:1511-1515` |
+| `identity.rs:92-93` (`EmptyRoster`) | `identity.rs:105-106` |
+| `identity.rs:279` (`write_atomic`) | `identity.rs:325-352` |
+
+D32 Appendix A records the further drift between the baseline and the working
+tree as of this amendment.
+
+## A.9 Human decision gate -- gate-by-gate status
+
+The gate list in the text above is unchanged. This amendment records which
+gates it closes and which it leaves open.
+
+| Gate | Status after this amendment |
+|---|---|
+| 1. The 1-day value itself | **OPEN.** Unchanged. |
+| 2. Whether the cap may ever be unbounded in production | **OPEN.** Unchanged. |
+| 3. Whether revocation should ever kill live sessions | **OPEN**, but **the recommendation is unchanged and now carries three arguments** (A.6). A kill mode would need a per-key revocation marker in the file, which is out of scope for this wave. |
+| 4. Reload trigger | **RESOLVED.** Poll on the roster path, default 5 s, plus an opt-in Unix SIGHUP. No admin socket. A failed reload is not fatal and is retried. See A.5 and D32 §4. |
+| 5. Whether `lifetime_cap` should be split per role | **OPEN.** Unchanged. Not a dependency of the runtime-revocation design. |
+
+New gates raised by the runtime-revocation design, carried in D32 §13: the
+poll interval and whether polling is on by default (H1), whether an unintended
+narrowing should be published or confirmed (H2), whether SIGHUP is worth
+having at all (H3), whether duplicate roster keys should be rejected (H5),
+whether the over-limit-roster startup error should be legible (H6), whether
+the STATS line should carry the roster generation (H7), whether aggregate
+rejected-handshake counters are added (H8), whether the quiescence window
+should be configurable (H10, recommended: no), and whether `RosterHandle` is
+deleted or deprecated (H11, recommended: deleted).
