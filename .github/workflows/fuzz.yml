@@ -10,6 +10,14 @@ name: fuzz
 # `rustflags` injects extra RUSTFLAGS for experiments (e.g. UBSan via
 # `-Zsanitizer=undefined` with `sanitizer=none`).  Defaults:
 # 1_000_000 runs per target with a hard 1-hour wall-clock guard.
+#
+# The toolchain is pinned (nightly-2026-10-18, matching
+# fuzz/rust-toolchain.toml): the rolling `nightly` channel moves daily, so
+# a campaign started today and resumed next month could otherwise be built
+# by two different compilers.
+#
+# cargo-fuzz cannot forward `--locked` to the cargo it spawns, so the
+# "fuzz lock is fresh" step below enforces the same guarantee explicitly.
 
 on:
   workflow_dispatch:
@@ -67,18 +75,23 @@ jobs:
       matrix:
         target: ${{ fromJson(github.event.inputs.target == 'ALL' && '["wire_packet_from_bytes","inner_plaintext_decode","envelope_decrypt","replay_window","handshake_message_decode","handshake_driver_receive","session_manager_receive","cover_scheduler","relay_overlay","manager_churn"]' || format('["{0}"]', github.event.inputs.target)) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.4.0
 
-      - name: Install Rust (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust (nightly-2026-10-18)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-10-18
+
+      - name: Verify the fuzz lock is fresh
+        run: cargo metadata --locked --manifest-path fuzz/Cargo.toml --format-version 1 > /dev/null
 
       - name: Install cargo-fuzz runner
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly-2026-10-18 install cargo-fuzz --locked
 
       - name: Build fuzz target
         env:
           RUSTFLAGS: ${{ github.event.inputs.rustflags }}
-        run: cargo +nightly fuzz build --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} ${{ matrix.target }}
+        run: cargo +nightly-2026-10-18 fuzz build --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} ${{ matrix.target }}
         timeout-minutes: 30
 
       - name: Run fuzz target
@@ -88,7 +101,7 @@ jobs:
           RUNS="${{ github.event.inputs.runs }}"
           MAX_T="${{ github.event.inputs.max_total_time }}"
           [ "$MAX_T" = "0" ] && MAX_T=3600
-          cargo +nightly fuzz run --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} \
+          cargo +nightly-2026-10-18 fuzz run --fuzz-dir fuzz --sanitizer ${{ github.event.inputs.sanitizer }} \
             ${{ matrix.target }} -- -runs="$RUNS" -max_total_time="$MAX_T"
         # The fuzz budget is governed by the `max_total_time` input (up to 4 h
         # for the B1 soak), not by this step timeout, which only guards against
@@ -97,7 +110,7 @@ jobs:
 
       - name: Upload interesting cases
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: |

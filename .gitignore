@@ -6,11 +6,12 @@
 target/
 **/target/
 
-# Fuzz runtime outputs / lock (volatile deps; not pinned for release)
+# Fuzz runtime outputs (volatile).  `fuzz/Cargo.lock` is deliberately NOT
+# ignored: it is the provenance record that pins the fuzzed dependency
+# graph to the one the shipped workspace uses (see fuzz/Cargo.toml).
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
-fuzz/Cargo.lock
 
 # Bench harness lock (its own workspace; volatile deps; not pinned for release)
 bench/target/

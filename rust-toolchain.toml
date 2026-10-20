@@ -1,0 +1,25 @@
+# Pinned toolchain for the Tunnel workspace.
+#
+# Rationale (see AGENTS.md "Build & Test Commands" and DECISIONS.md):
+# an unpinned `stable` channel means two CI runs a month apart can use two
+# different compilers, and a compiler change can silently change the
+# behaviour of the code under test -- or of a dependency -- without any
+# change in this repository.  For a project whose threat model centres on
+# HNDL resistance and metadata resistance, "it worked last month" is not a
+# sufficient guarantee.  Pinning the compiler makes every CI run
+# reproducible against a known toolchain.
+#
+# This file is the single source of truth for the toolchain:
+#   * local builds use it automatically (rustup),
+#   * CI installs exactly this version (see .github/workflows/ci.yml),
+#   * the MSRV job overrides it with RUSTUP_TOOLCHAIN=1.85.0 so that the
+#     1.85 floor is still exercised (RUSTUP_TOOLCHAIN takes precedence
+#     over this file).
+#
+# The `fuzz/` workspace has its own file (fuzz/rust-toolchain.toml) that
+# pins the nightly used for sanitizer builds.
+#
+# Bumping this channel is a deliberate, reviewable act.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

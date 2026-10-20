@@ -7,7 +7,9 @@
 //! Also exercises `interval_from_rate_bps` directly.
 //!
 //! Hard invariants (see `pq-tunnel-core/src/scheduler.rs`):
-//! * `interval_from_rate_bps(r)` is never zero for ANY u64 rate (1 ns floor);
+//! * `interval_from_rate_bps(r)` is never zero for ANY u64 rate (it is
+//!   clamped to the derived minimum cover interval, see
+//!   `MIN_COVER_INTERVAL_NANOS` in `pq-tunnel-core/src/scheduler.rs`);
 //! * a higher rate never yields a longer interval;
 //! * `on_deadline(t)` returns true EXACTLY when a deadline `d <= t` is armed
 //!   (a full behavioural oracle against a local deadline copy);
@@ -52,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
     });
     // Fuzz-controlled timeline (bounded so every arithmetic is safe).
     let mut off = 0u64;
-    let mut now = |off: u64| epoch + Duration::from_nanos(off & ((1 << 61) - 1));
+    let now = |off: u64| epoch + Duration::from_nanos(off & ((1 << 61) - 1));
 
     // Local oracle state.
     let mut started = false;

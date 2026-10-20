@@ -11,7 +11,66 @@ cargo-fuzz = true
 pq-tunnel-core = { path = "../pq-tunnel-core" }
 pq-crypto = { path = "../pq-crypto" }
 pq-tunnel-bin = { path = "../pq-tunnel-bin" }
-libfuzzer-sys = "0.4"
+libfuzzer-sys = "=0.4.13"
+
+# ---- provenance pins -------------------------------------------------
+#
+# `fuzz/` is its own cargo workspace, so it resolves its own dependency
+# graph independently of the shipped workspace.  The workspace crates are
+# consumed by path, but their third-party requirements are caret ranges
+# (`ml-kem = "0.3.2"` means ">=0.3.2, <0.4.0"), so cargo is free to pick a
+# *newer* patch/minor release here than the one pinned in the top-level
+# `Cargo.lock`.  That is how `ml-kem 0.3.2` (shipped) and `ml-kem 0.3.3`
+# (fuzzed) ended up in the same repository: CI was fuzzing different code
+# than the code that ships.
+#
+# Every entry below is an optional, never-enabled dependency.  It adds
+# nothing to the build, but it constrains the resolver so this workspace
+# can only ever select the exact versions recorded in the top-level
+# `Cargo.lock`.  Keep the two in sync; the "Fuzz lock is fresh and in
+# sync with the shipped lock" step in .github/workflows/ci.yml fails if
+# they diverge.
+#
+# These versions mirror the root `Cargo.lock` at the time of writing.
+#
+# Note: `der 0.8.0` is yanked upstream.  A plain `cargo update` therefore
+# refuses to re-resolve this workspace at all (which is fail-closed and
+# prevents accidental drift); use `cargo update --precise <version> -p
+# <crate>` to move a pinned crate, or bump `der` in the shipped workspace
+# first.
+aho-corasick = { version = "=1.1.4", optional = true }
+bitflags = { version = "=2.13.0", optional = true }
+block-buffer = { version = "=0.12.1", optional = true }
+bytes = { version = "=1.12.0", optional = true }
+cfg-if = { version = "=1.0.4", optional = true }
+clap = { version = "=4.6.1", optional = true }
+clap_builder = { version = "=4.6.0", optional = true }
+clap_derive = { version = "=4.6.1", optional = true }
+clap_lex = { version = "=1.1.0", optional = true }
+cpufeatures = { version = "=0.3.0", optional = true }
+ctutils = { version = "=0.4.2", optional = true }
+der = { version = "=0.8.0", optional = true }
+hybrid-array = { version = "=0.4.12", optional = true }
+keccak = { version = "=0.2.0", optional = true }
+lazy_static = { version = "=1.5.0", optional = true }
+libc = { version = "=0.2.186", optional = true }
+log = { version = "=0.4.33", optional = true }
+memchr = { version = "=2.8.2", optional = true }
+mio = { version = "=1.2.1", optional = true }
+ml-kem = { version = "=0.3.2", optional = true }
+proc-macro2 = { version = "=1.0.106", optional = true }
+quote = { version = "=1.0.46", optional = true }
+regex-automata = { version = "=0.4.14", optional = true }
+sha3 = { version = "=0.11.0", optional = true }
+smallvec = { version = "=1.15.2", optional = true }
+socket2 = { version = "=0.6.4", optional = true }
+spki = { version = "=0.8.0", optional = true }
+syn = { version = "=2.0.118", optional = true }
+thread_local = { version = "=1.1.9", optional = true }
+tokio = { version = "=1.52.3", optional = true }
+tokio-macros = { version = "=2.7.0", optional = true }
+unicode-ident = { version = "=1.0.24", optional = true }
+zeroize = { version = "=1.9.0", optional = true }
 
 [[bin]]
 name = "wire_packet_from_bytes"

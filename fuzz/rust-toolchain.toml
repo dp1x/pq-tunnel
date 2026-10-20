@@ -1,0 +1,20 @@
+# Toolchain used to build and run the fuzz targets.
+#
+# cargo-fuzz needs a nightly compiler: it relies on unstable flags
+# (`-Zsanitizer=address`, `-Cpasses=sancov-module`) and on libFuzzer
+# instrumentation that is not available on stable.  The rolling `nightly`
+# channel moves every day, so a campaign started today and resumed next
+# month could be built by two different compilers, and a nightly regression
+# would silently change the behaviour of the fuzz targets.
+#
+# This file pins the nightly that CI (see .github/workflows/ci.yml and
+# .github/workflows/fuzz.yml) and local runs both use.
+#
+#   nightly-2026-10-18 == rustc 1.101.0-nightly (8006091eb 2026-10-17)
+#
+# rustup resolves the nearest rust-toolchain.toml when it walks up from the
+# current directory, so anything run inside `fuzz/` picks this file up.
+# Note that `cargo +nightly-<date>` and RUSTUP_TOOLCHAIN still take
+# precedence over it, which is how CI selects the toolchain explicitly.
+[toolchain]
+channel = "nightly-2026-10-18"
