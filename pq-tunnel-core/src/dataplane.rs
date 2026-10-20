@@ -220,11 +220,13 @@ fn declared_ip_len(ip: &[u8]) -> Result<usize, OverlayError> {
             if ihl < 20 || ihl > total {
                 return Err(OverlayError::InvalidIpHeader);
             }
-            if total != ip.len() {
-                // Caller may pass a slice shorter than declared; for the
-                // sender we require equality. For reassembly validation of
-                // fragment 0 we compare against expected_len instead.
+            if total > MAX_IP_PACKET_LEN {
+                return Err(OverlayError::InvalidIpHeader);
             }
+            // Equality with the actual buffer is enforced by
+            // `validate_ip_packet` (sender) / `validate_ip_header_at`
+            // (reassembler); a slice may legitimately be shorter than the
+            // declared total (e.g. an IP header carried in a fragment).
             Ok(total)
         }
         6 => {
@@ -234,6 +236,9 @@ fn declared_ip_len(ip: &[u8]) -> Result<usize, OverlayError> {
             let payload = u16::from_be_bytes([ip[4], ip[5]]) as usize;
             let total = 40usize.saturating_add(payload);
             if total < 40 {
+                return Err(OverlayError::InvalidIpHeader);
+            }
+            if total > MAX_IP_PACKET_LEN {
                 return Err(OverlayError::InvalidIpHeader);
             }
             Ok(total)
@@ -253,6 +258,9 @@ pub fn validate_ip_packet(ip: &[u8]) -> Result<usize, OverlayError> {
 }
 
 fn validate_ip_header_at(buf: &[u8], expected_len: usize) -> Result<(), OverlayError> {
+    if expected_len > MAX_IP_PACKET_LEN {
+        return Err(OverlayError::InvalidIpHeader);
+    }
     if buf.len() < expected_len {
         return Err(OverlayError::InvalidIpHeader);
     }
@@ -490,7 +498,7 @@ impl Reassembler {
                 return FeedOutcome::DroppedCap;
             }
             let ipt = hdr.ip_total_len as usize;
-            if self.current_bytes + ipt > self.max_bytes {
+            if self.current_bytes.saturating_add(ipt) > self.max_bytes {
                 return FeedOutcome::DroppedCap;
             }
             let fc = hdr.frag_count as usize;
@@ -857,6 +865,34 @@ mod tests {
             fill(&mut slot).unwrap();
             let _ = r.feed(&slot, now);
         }
+    }
+
+    #[test]
+    fn invariants_random_sequences() {
+        use getrandom::fill;
+        let max_entries = 8usize;
+        let max_bytes = 64 * 1024usize;
+        let mut r = Reassembler::with_caps(DEFAULT_REASSEMBLY_DEADLINE, max_entries, max_bytes);
+        let base = Instant::now();
+        for i in 0..500u64 {
+            // occasional expire/clear to exercise stateful paths
+            if i % 50 == 0 {
+                r.expire(base + Duration::from_millis(i));
+            }
+            if i % 100 == 0 {
+                r.clear();
+            }
+            let mut slot = [0u8; PAYLOAD_LEN];
+            fill(&mut slot).unwrap();
+            let now = base + Duration::from_millis(i % 5);
+            let _ = r.feed(&slot, now);
+            // Invariants: bounds never exceeded.
+            assert!(r.entry_count() <= max_entries, "entry_count exceeded cap");
+            assert!(r.current_bytes() <= max_bytes, "current_bytes exceeded cap");
+        }
+        r.clear();
+        assert_eq!(r.entry_count(), 0);
+        assert_eq!(r.current_bytes(), 0);
     }
 
     #[test]
