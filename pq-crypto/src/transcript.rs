@@ -115,28 +115,29 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
+    /// Strict known-answer test for SHA-256 over the one-block message `"abc"`.
+    ///
+    /// External anchor: RFC 6234 §8.5 ("The Test Driver") publishes the
+    /// expected digest for `TEST1 = "abc"` as
+    /// `BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD`.
+    /// FIPS 180-4 (Update 1) §5.1.1 uses `"abc"` as its canonical 24-bit
+    /// example message for the SHA-1/SHA-224/SHA-256 padding rule.
+    ///
+    /// This asserts exactly one expected digest. A known-answer test that
+    /// accepts a second value is not a known-answer test: it can no longer
+    /// detect a wrong implementation, and it hides the fact that the expected
+    /// value and the accepted alternative disagreed.
     #[test]
     fn sha256_known_vector() {
-        // SHA-256("abc") per FIPS 180-4: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f200186d
-        // NOTE: On Windows-on-ARM64 with x86_64 emulation, integer arithmetic
-        // in the SHA-256 compression function produces different last-two bytes
-        // (15ad instead of 186d). This is a platform bug, not a code bug.
-        // The sha2 crate with `force-soft` is verified correct on standard x86_64.
         let result = sha256(b"abc");
-        let fips_vector = [
-            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
-            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
-            0xf2, 0x00, 0x18, 0x6d,
-        ];
-        let platform_vector = [
-            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
-            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
-            0xf2, 0x00, 0x15, 0xad,
-        ];
-        assert!(
-            result == fips_vector || result == platform_vector,
-            "SHA-256 of 'abc' must match a known test vector; got: {:02x?}",
-            result
+        assert_eq!(
+            result,
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ],
+            "SHA-256 of 'abc' must match the RFC 6234 §8.5 known test vector"
         );
     }
 
