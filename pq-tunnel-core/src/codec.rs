@@ -91,11 +91,19 @@ pub const VERSION_LEN: usize = 1;
 /// Fixed size of every on-wire `WirePacket` in bytes.
 ///
 /// PROTOCOL_SPEC §12 (traffic-shaping requirements) requires uniform packet
-/// sizes to resist size-based traffic analysis.  PROTOCOL_SPEC §7.5 requires
-/// avoiding dependence on a specific MTU; therefore this default fits a standard
-/// IPv4/IPv6 MTU (1500 / 1280) without requiring jumbo frames, while still
-/// carrying a useful payload.  This is an implementation parameter (D7) and is
-/// intentionally centralized so it can be tuned per deployment.
+/// sizes to resist size-based traffic analysis.  This is an implementation
+/// parameter (D7) and is intentionally centralized so it can be tuned per
+/// deployment.
+///
+/// **This is the Tunnel record size, not an outer IP packet size.** The record
+/// is the UDP payload, so the complete outer packet is 1280 + 8 (UDP) + 20
+/// (IPv4) = **1308 bytes**, or 1280 + 8 + 40 (IPv6) = **1328 bytes**.
+/// Consequently the record fits a 1500-byte-MTU path (1472 bytes of usable
+/// IPv4 UDP payload, 1452 for IPv6) but **not** a 1280-byte-MTU path: on
+/// IPv6 the outer packet is 48 bytes over, and IPv6 routers do not fragment
+/// (RFC 8200 §4.5 — fragmentation is performed only by source nodes).  A
+/// deployment therefore requires a path MTU of at least 1328 bytes, which is
+/// a stated deployment assumption rather than a guarantee.
 ///
 /// This is the canonical Tunnel on-wire packet size, re-exported as
 /// `pq_tunnel_core::PACKET_SIZE`.  (The pre-v2 QUIC transport used an 8192-byte

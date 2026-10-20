@@ -175,7 +175,11 @@ pub fn full_handshake(warmup: usize, iters: usize) -> HandshakeTables {
         let client_kp = roster_keys[n - 1].clone(); // signer is last
         let roster: Vec<_> = roster_keys.into_iter().map(|k| k.public_key()).collect();
 
-        let sc = ServerConfig::new(server_kp.clone(), roster);
+        // The roster sizes measured here deliberately exceed the shipped
+        // default limit (`ServerConfig::DEFAULT_MAX_ROSTER_SIZE`), so the
+        // benchmark raises the limit explicitly instead of measuring a
+        // configuration the server would refuse to start with.
+        let sc = ServerConfig::with_roster_limit(server_kp.clone(), roster, roster.len());
         let mut server = ServerHandshake::new(&sc);
         let cc = ClientConfig::new(addr(4433), client_kp, server_kp.public_key());
 
@@ -256,7 +260,9 @@ pub fn handshake_totals(
         }
         let client_kp = roster_keys[n - 1].clone();
         let roster: Vec<_> = roster_keys.into_iter().map(|k| k.public_key()).collect();
-        let sc = ServerConfig::new(server_kp.clone(), roster);
+        // See the note above: the benchmark raises the roster limit so it can
+        // measure the D12 verification loop above the shipped default bound.
+        let sc = ServerConfig::with_roster_limit(server_kp.clone(), roster, roster.len());
         let mut server = ServerHandshake::new(&sc);
         let cc = ClientConfig::new(addr(4433), client_kp, server_kp.public_key());
 

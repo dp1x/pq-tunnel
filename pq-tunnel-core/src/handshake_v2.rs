@@ -85,7 +85,7 @@
 //! MAC verifies (1.5 RTT).  A multi-session manager (Phase 6) drives one
 //! `ServerHandshake` per source.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -1263,8 +1263,19 @@ pub struct ServerConfig {
     pub identity: MlDsaKeypair,
     /// Pinned client identity public keys, provisioned out of band.  The
     /// client signature is verified against the entire roster with no early
-    /// exit (D12); an empty roster fails closed.
+    /// exit (D12); an empty roster fails closed, and the roster size is
+    /// bounded by [`ServerConfig::max_roster_size`].
     pub roster: Vec<MlDsaPublicKey>,
+    /// Maximum number of client keys the roster may hold.
+    ///
+    /// A D7 *resource* bound, not a security guarantee: the server verifies
+    /// the client signature against **every** roster entry (D12, uniform
+    /// verification count, no early exit), so a completing M1 costs
+    /// `roster.len()` ML-DSA-65 verifications.  The bound turns an
+    /// unbounded pre-authentication work amplifier into a finite one; it is
+    /// operator-overridable, so a deployment that genuinely needs more keys
+    /// can raise it (at the cost of proportionally more CPU per handshake).
+    pub max_roster_size: usize,
     /// Upper bound on concurrently pending handshakes (D13 DoS posture).
     pub max_pending: usize,
     /// Pending-entry lifetime before silent eviction (D13).
@@ -1276,17 +1287,104 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// Default maximum roster size.
+    ///
+    /// # Why 64
+    ///
+    /// The bound exists because the D12 verification loop is uniform and has
+    /// no early exit, so a completing M1 costs `roster.len()` ML-DSA-65
+    /// verifications.  Measured on the reference host
+    /// (`docs/performance/I-benchmark-methodology.md` §4.1, §6.3):
+    ///
+    /// | roster | D12 loop p50 | server-side handshake p50 |
+    /// |---:|---:|---:|
+    /// | 1 | 56.7 us | 0.84 ms |
+    /// | 64 | 3.41 ms | 4.38 ms |
+    /// | 256 | 13.7 ms | 15.1 ms |
+    /// | 1024 | 56.3 ms | 57.3 ms |
+    ///
+    /// 64 keeps the worst-case completing M1 at **3.41 ms** of measured
+    /// verification work — the same order as D16's "~2.5 ms CPU per side"
+    /// claim (1.36x for the verification loop, 1.75x for the whole server
+    /// handshake at 4.38 ms) — instead of the unbounded figure.  It is also the
+    /// value already used by the two other capacity constants of the DoS
+    /// posture (`max_sessions` = 64, `max_pending` = 64), and it is 64x the
+    /// production roster of the 1:1 deployment model (D28: one client per
+    /// server, so the deployed roster is 1).
+    ///
+    /// The number is a *policy* default, not a derived requirement: the
+    /// security-relevant property is that a finite, enforced, operator-
+    /// overridable bound exists on every entry point.  Deployments that
+    /// genuinely need more keys raise it with
+    /// [`ServerConfig::with_roster_limit`].
+    pub const DEFAULT_MAX_ROSTER_SIZE: usize = 64;
+
     /// Construct with protocol defaults (DoS parameters are tunable — D7).
+    ///
+    /// **Fail closed on an over-limit roster.**  A roster larger than
+    /// [`ServerConfig::DEFAULT_MAX_ROSTER_SIZE`] is *not* adopted: the
+    /// returned configuration carries an empty roster, which every consumer
+    /// rejects (`ServerSessionManager::new`, `server_handshake_v2`).  The
+    /// roster is never silently truncated — it is either adopted whole or
+    /// not at all, because a partial roster would silently revoke clients.
+    ///
+    /// Use [`ServerConfig::with_roster_limit`] to raise the limit for a
+    /// deployment that needs more keys.
     pub fn new(identity: MlDsaKeypair, roster: Vec<MlDsaPublicKey>) -> Self {
-        Self {
+        Self::with_roster_limit(identity, roster, Self::DEFAULT_MAX_ROSTER_SIZE)
+    }
+
+    /// Construct with an explicit roster-size limit (operator-overridable).
+    ///
+    /// The same fail-closed rule as [`ServerConfig::new`]: a roster larger
+    /// than `max_roster_size` is not adopted, and the configuration is left
+    /// with an empty roster.
+    pub fn with_roster_limit(
+        identity: MlDsaKeypair,
+        roster: Vec<MlDsaPublicKey>,
+        max_roster_size: usize,
+    ) -> Self {
+        let mut cfg = Self {
             version: PROTOCOL_VERSION,
             identity,
-            roster,
+            roster: Vec::new(),
+            max_roster_size,
             max_pending: 64,
             pending_ttl: Duration::from_secs(30),
             rate_limit_burst: 16,
             rate_limit_window: Duration::from_secs(10),
+        };
+        if roster.len() <= max_roster_size {
+            cfg.roster = roster;
         }
+        cfg
+    }
+
+    /// Validate this configuration (fail closed).
+    ///
+    /// Checks the protocol version, that the roster is non-empty (D12: an
+    /// empty roster would silently revoke every client) and that it is not
+    /// larger than [`ServerConfig::max_roster_size`].
+    pub fn validate(&self) -> Result<(), HandshakeV2Error> {
+        if self.version != PROTOCOL_VERSION {
+            return Err(HandshakeV2Error::InvalidConfig(format!(
+                "version {} unsupported (expected {PROTOCOL_VERSION})",
+                self.version
+            )));
+        }
+        if self.roster.is_empty() {
+            return Err(HandshakeV2Error::InvalidConfig(
+                "roster must not be empty (fail closed)".into(),
+            ));
+        }
+        if self.roster.len() > self.max_roster_size {
+            return Err(HandshakeV2Error::InvalidConfig(format!(
+                "roster of {} keys exceeds the configured maximum of {}",
+                self.roster.len(),
+                self.max_roster_size
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1361,7 +1459,9 @@ struct RateBucket {
 
 /// Absolute cap on per-source rate buckets: a spoofed-source flood must not
 /// grow the table unboundedly (the window-based prune alone is evadable by
-/// keeping buckets fresh).  At the cap, the stalest bucket is evicted.
+/// keeping buckets fresh).  At the cap, the oldest-inserted bucket is evicted
+/// (O(1), from the insertion-order queue) and the table never exceeds the
+/// cap.
 const MAX_RATE_BUCKETS: usize = 4096;
 
 /// Server-side handshake state machine (one per source in v1).
@@ -1373,21 +1473,54 @@ pub struct ServerHandshake {
     cfg: ServerConfig,
     pending: HashMap<[u8; SESSION_ID_LEN], PendingSession>,
     rate_buckets: HashMap<SocketAddr, RateBucket>,
+    /// Insertion order of `rate_buckets`' keys.
+    ///
+    /// Invariant: `rate_order` holds exactly the keys of `rate_buckets`,
+    /// each once, so `rate_order.len() == rate_buckets.len()`.  The
+    /// cap-eviction victim is the front of this queue, so eviction is O(1)
+    /// instead of a scan for the least-recently-refilled bucket.  The
+    /// window prune removes the same keys from both.
+    ///
+    /// This is the same shape as the data-path failure gate
+    /// (`session_manager::FailGate`): one insertion-order queue, one
+    /// invariant, no second ordering to keep consistent.
+    rate_order: VecDeque<SocketAddr>,
     /// When the window prune last ran (D29: amortized to at most one pass per
     /// `rate_limit_window`, so a spoofed-source flood cannot buy a per-packet
     /// O(n) scan by holding buckets fresh).
     last_rate_prune: Instant,
+    /// Test instrumentation: the number of rate-bucket table entries visited
+    /// by an operation that is not a plain hash lookup (cap evictions and
+    /// prune passes).  The packet path must never move this counter for a
+    /// source that is already tracked.
+    #[cfg(test)]
+    rate_table_visits: u64,
 }
 
 impl ServerHandshake {
     /// Create a server handshake state machine.  Configuration is validated
     /// by `server_handshake_v2` (empty roster / bad version fail closed).
+    ///
+    /// **Fail closed on an over-limit roster.**  If the configuration's
+    /// roster is larger than `max_roster_size` (only reachable through a
+    /// struct-literal construction that bypasses [`ServerConfig::new`]), the
+    /// machine adopts an *empty* roster: the D12 uniform-verification loop
+    /// must verify against the whole roster or against none of it, and a
+    /// truncated roster would silently revoke clients.  An empty roster
+    /// rejects every client, which is the safe direction.
     pub fn new(cfg: &ServerConfig) -> Self {
+        let mut cfg = cfg.clone();
+        if cfg.roster.len() > cfg.max_roster_size {
+            cfg.roster = Vec::new();
+        }
         Self {
-            cfg: cfg.clone(),
+            cfg,
             pending: HashMap::new(),
             rate_buckets: HashMap::new(),
+            rate_order: VecDeque::new(),
             last_rate_prune: Instant::now(),
+            #[cfg(test)]
+            rate_table_visits: 0,
         }
     }
 
@@ -1404,6 +1537,12 @@ impl ServerHandshake {
     /// empty roster would silently revoke every client), matching
     /// [`ServerConfig::new`]'s fail-closed contract.
     ///
+    /// A roster larger than [`ServerConfig::max_roster_size`] is rejected for
+    /// the same reason and with the same effect: the hot-swap path is a
+    /// roster entry point like any other, and it must not be a way around
+    /// the bound. The roster is never truncated — the previous roster stays
+    /// in force.
+    ///
     /// Membership is re-verified at M3 (`on_m3_fragment`), so a handshake that
     /// authenticated against a since-revoked key cannot complete after the
     /// swap. Established sessions are untouched: revocation stops *future*
@@ -1413,6 +1552,13 @@ impl ServerHandshake {
             return Err(HandshakeV2Error::InvalidConfig(
                 "roster must not be empty (fail closed)".into(),
             ));
+        }
+        if roster.len() > self.cfg.max_roster_size {
+            return Err(HandshakeV2Error::InvalidConfig(format!(
+                "roster of {} keys exceeds the configured maximum of {}",
+                roster.len(),
+                self.cfg.max_roster_size
+            )));
         }
         self.cfg.roster = roster;
         Ok(())
@@ -1468,32 +1614,71 @@ impl ServerHandshake {
             self.last_rate_prune = now;
             self.rate_buckets
                 .retain(|_, b| now.duration_since(b.last_refill) < self.cfg.rate_limit_window);
-        }
-        if self.rate_buckets.len() >= MAX_RATE_BUCKETS {
-            // Hard cap: evict the stalest bucket so spoofed sources cannot
-            // grow the table without bound, regardless of freshness.
-            if let Some(stale) = self
-                .rate_buckets
-                .iter()
-                .min_by_key(|(_, b)| b.last_refill)
-                .map(|(k, _)| *k)
+            // Keep `rate_order` in lockstep with `rate_buckets`: the swept
+            // keys are gone from the table, so they are gone from the queue.
             {
-                self.rate_buckets.remove(&stale);
+                let buckets = &self.rate_buckets;
+                self.rate_order.retain(|k| buckets.contains_key(k));
+            }
+            #[cfg(test)]
+            {
+                self.rate_table_visits += (self.rate_buckets.len() + self.rate_order.len()) as u64;
             }
         }
-        let bucket = self.rate_buckets.entry(from).or_insert_with(|| RateBucket {
+        // An already-tracked source: charge its own budget.  This is the hot
+        // path and it is O(1) — one hash lookup, no eviction, no insert and
+        // no scan of the table.  (Before the fix, the cap eviction ran on
+        // *every* call once the table was at the cap, so a repeat source's
+        // packet evicted a *different* source's bucket — resetting that
+        // source's token budget — and paid an O(n) `min_by_key` scan for it.)
+        if let Some(bucket) = self.rate_buckets.get_mut(&from) {
+            if now.duration_since(bucket.last_refill) >= self.cfg.rate_limit_window {
+                bucket.tokens = self.cfg.rate_limit_burst;
+                bucket.last_refill = now;
+            }
+            if bucket.tokens == 0 {
+                return false;
+            }
+            bucket.tokens -= 1;
+            return true;
+        }
+        // A new source: make room first.  The victim is the oldest-*inserted*
+        // tracked source (the front of `rate_order`), so the eviction is
+        // O(1) — one queue pop and one map removal, no scan.  The victim is
+        // never the source being inserted (that one is not tracked yet).
+        //
+        // The victim policy is the same one the data-path failure gate uses
+        // (D24): under table pressure *any* eviction policy allows a budget
+        // reset, and the least-recently-refilled bucket is precisely the one
+        // a table-filling attacker would keep fresh — so oldest-inserted is
+        // no weaker and costs one pop instead of a scan.
+        while self.rate_buckets.len() >= MAX_RATE_BUCKETS {
+            match self.rate_order.pop_front() {
+                Some(victim) => {
+                    self.rate_buckets.remove(&victim);
+                    #[cfg(test)]
+                    {
+                        self.rate_table_visits += 1;
+                    }
+                }
+                // Unreachable while the `rate_order`/`rate_buckets` invariant
+                // holds.
+                None => break,
+            }
+        }
+        let mut bucket = RateBucket {
             tokens: self.cfg.rate_limit_burst,
             last_refill: now,
-        });
-        if now.duration_since(bucket.last_refill) >= self.cfg.rate_limit_window {
-            bucket.tokens = self.cfg.rate_limit_burst;
-            bucket.last_refill = now;
+        };
+        // The admit/refuse decision is taken on the *pre-decrement* budget,
+        // exactly as the pre-refactor path did.
+        let allowed = bucket.tokens > 0;
+        if bucket.tokens > 0 {
+            bucket.tokens -= 1;
         }
-        if bucket.tokens == 0 {
-            return false;
-        }
-        bucket.tokens -= 1;
-        true
+        self.rate_buckets.insert(from, bucket);
+        self.rate_order.push_back(from);
+        allowed
     }
 
     fn on_m1_fragment(
@@ -1785,12 +1970,7 @@ pub async fn server_handshake_v2<T: HandshakeTransport>(
     transport: &mut T,
     cfg: &ServerConfig,
 ) -> Result<HandshakeOutcome, HandshakeV2Error> {
-    validate_version(cfg.version)?;
-    if cfg.roster.is_empty() {
-        return Err(HandshakeV2Error::InvalidConfig(
-            "roster must not be empty (fail closed)".into(),
-        ));
-    }
+    cfg.validate()?;
     let mut srv = ServerHandshake::new(cfg);
     loop {
         let (pkt, from) = match transport.recv().await {
@@ -3123,6 +3303,373 @@ pub(crate) mod tests {
             1,
             "one prune after the window must reclaim every stale bucket"
         );
+        assert_eq!(
+            server.rate_order.len(),
+            server.rate_buckets.len(),
+            "the insertion-order queue must stay in lockstep with the table"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate-bucket cap eviction: O(1), and never on behalf of a tracked source
+    // -----------------------------------------------------------------------
+
+    /// Fill the rate-bucket table to its cap with `n` distinct sources and
+    /// return the source addresses in insertion order.
+    fn fill_rate_table(server: &mut ServerHandshake, n: usize) -> Vec<SocketAddr> {
+        let mut addrs = Vec::with_capacity(n);
+        for i in 0..n {
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, i as u8, 7)),
+                40000 + (i % 1000) as u16,
+            );
+            let mut sid = [0u8; SESSION_ID_LEN];
+            sid.copy_from_slice(&(i as u64).to_be_bytes());
+            server
+                .handle_datagram(&m1_frag0_datagram(sid), addr)
+                .expect("srv");
+            addrs.push(addr);
+        }
+        addrs
+    }
+
+    /// The hot path must be O(1): a packet from a source that is *already*
+    /// tracked must not visit a single table entry.
+    ///
+    /// Before the fix, the cap eviction ran on every call once the table was
+    /// at the cap: it scanned the whole table for the least-recently-refilled
+    /// bucket (`min_by_key`) and removed one — even when the arriving source
+    /// was already in the table, i.e. a repeat source's packet evicted a
+    /// *different* source's bucket and reset that source's token budget.
+    ///
+    /// The invariant is asserted structurally (a visit counter), never by
+    /// timing.
+    #[test]
+    fn rate_ok_hot_path_visits_no_table_entry() {
+        let (_, sc) = test_configs();
+        let mut server = ServerHandshake::new(&sc);
+        let addrs = fill_rate_table(&mut server, MAX_RATE_BUCKETS);
+        assert_eq!(server.rate_buckets.len(), MAX_RATE_BUCKETS);
+        let visits_before = server.rate_table_visits;
+
+        // 200 further packets, all from one already-tracked source.
+        for i in 0..200u64 {
+            let mut sid = [0u8; SESSION_ID_LEN];
+            sid.copy_from_slice(&(100_000u64 + i).to_be_bytes());
+            server
+                .handle_datagram(&m1_frag0_datagram(sid), addrs[0])
+                .expect("srv");
+        }
+
+        assert_eq!(
+            server.rate_table_visits, visits_before,
+            "a packet from a tracked source must not visit the table at all"
+        );
+        assert_eq!(
+            server.rate_buckets.len(),
+            MAX_RATE_BUCKETS,
+            "a tracked source's packet must not evict anybody"
+        );
+        assert_eq!(
+            server.rate_order.len(),
+            server.rate_buckets.len(),
+            "the insertion-order queue must stay in lockstep with the table"
+        );
+    }
+
+    /// A repeat source must be charged its own budget and must not evict —
+    /// let alone reset the budget of — any *other* source.
+    ///
+    /// The pre-fix code evicted the *stalest* bucket on every call at the
+    /// cap, so a tracked source's packet could hand a different source a
+    /// fresh token budget.  This test is set up so that the oldest-inserted
+    /// source is also the stalest: under the pre-fix policy that source
+    /// would have been evicted by a packet from a *different* tracked source,
+    /// so the assertion is not vacuous.
+    #[test]
+    fn rate_ok_tracked_source_does_not_reset_another_sources_budget() {
+        let (_, mut sc) = test_configs();
+        sc.rate_limit_burst = 4;
+        sc.rate_limit_window = Duration::from_secs(600);
+        let mut server = ServerHandshake::new(&sc);
+        let addrs = fill_rate_table(&mut server, MAX_RATE_BUCKETS);
+
+        // Spend the whole budget of the *oldest* inserted source.
+        let oldest = addrs[0];
+        for i in 0..4u64 {
+            let mut sid = [0u8; SESSION_ID_LEN];
+            sid.copy_from_slice(&(200_000u64 + i).to_be_bytes());
+            server
+                .handle_datagram(&m1_frag0_datagram(sid), oldest)
+                .expect("srv");
+        }
+        assert_eq!(server.rate_buckets[&oldest].tokens, 0);
+
+        // A packet from a *different*, already-tracked source must neither
+        // evict the exhausted source nor hand it a fresh budget.
+        server
+            .handle_datagram(&m1_frag0_datagram([9u8; SESSION_ID_LEN]), addrs[5])
+            .expect("srv");
+        assert!(
+            server.rate_buckets.contains_key(&oldest),
+            "a tracked source's packet must not evict another source"
+        );
+        assert_eq!(
+            server.rate_buckets[&oldest].tokens, 0,
+            "another source's packet must not reset an exhausted source's budget"
+        );
+    }
+
+    /// The cap eviction is O(1) and takes the *oldest-inserted* source.
+    ///
+    /// The victim policy matches the data-path failure gate (D24): under
+    /// table pressure any eviction policy allows a budget reset, and the
+    /// least-recently-refilled bucket is the one a table-filling attacker
+    /// keeps fresh, so oldest-inserted is no weaker — and it costs one pop
+    /// instead of a scan.
+    #[test]
+    fn rate_ok_cap_eviction_is_o1_and_takes_the_oldest_inserted_source() {
+        let (_, sc) = test_configs();
+        let mut server = ServerHandshake::new(&sc);
+        let addrs = fill_rate_table(&mut server, MAX_RATE_BUCKETS);
+        let visits_before = server.rate_table_visits;
+
+        // One more distinct source pushes the table past the cap.
+        let newcomer = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 99).into(), 45000);
+        let mut sid = [0u8; SESSION_ID_LEN];
+        sid.copy_from_slice(&300_000u64.to_be_bytes());
+        server
+            .handle_datagram(&m1_frag0_datagram(sid), newcomer)
+            .expect("srv");
+
+        assert_eq!(
+            server.rate_buckets.len(),
+            MAX_RATE_BUCKETS,
+            "the table must never exceed the cap"
+        );
+        assert_eq!(
+            server.rate_table_visits - visits_before,
+            1,
+            "the eviction must visit exactly one table entry"
+        );
+        assert!(
+            !server.rate_buckets.contains_key(&addrs[0]),
+            "the oldest-inserted source is the victim"
+        );
+        for a in &addrs[1..] {
+            assert!(
+                server.rate_buckets.contains_key(a),
+                "no other source may be evicted"
+            );
+        }
+        assert_eq!(
+            server.rate_order.len(),
+            server.rate_buckets.len(),
+            "the insertion-order queue must stay in lockstep with the table"
+        );
+    }
+
+    /// The window prune is a *memory cleanup*, not a correctness requirement:
+    /// a bucket the prune removes and a bucket it keeps behave identically
+    /// on the source's next touch (both refill to a full burst), so skipping
+    /// or performing the prune can never change an accept/reject decision.
+    ///
+    /// The two cases are compared directly: the same source, with the same
+    /// aged-out bucket, is charged once on a server where the prune ran and
+    /// once on a server where it did not.  The resulting budget must be
+    /// identical.
+    #[test]
+    fn rate_ok_prune_is_decision_preserving() {
+        const BURST: u32 = 8;
+
+        /// One server: `prune` decides whether the window prune runs.
+        fn budget_after_one_stale_touch(prune: bool) -> u32 {
+            let (_, mut sc) = test_configs();
+            sc.rate_limit_burst = BURST;
+            sc.rate_limit_window = Duration::from_millis(50);
+            let mut server = ServerHandshake::new(&sc);
+
+            // 40 tracked sources, so the prune is reachable (it only runs
+            // above 32 entries).
+            let addrs = fill_rate_table(&mut server, 40);
+            let subject = addrs[0];
+
+            // Age every bucket past the window.
+            let aged = Instant::now() - sc.rate_limit_window - Duration::from_secs(1);
+            for b in server.rate_buckets.values_mut() {
+                b.last_refill = aged;
+            }
+            if prune {
+                // Rewind the prune clock so the next packet runs one pass.
+                server.last_rate_prune = aged;
+                server
+                    .handle_datagram(&m1_frag0_datagram([77u8; SESSION_ID_LEN]), addrs[39])
+                    .expect("srv");
+                assert!(
+                    !server.rate_buckets.contains_key(&subject),
+                    "the prune must have reclaimed the stale bucket"
+                );
+            } else {
+                assert!(
+                    server.rate_buckets.contains_key(&subject),
+                    "without a prune the stale bucket must survive"
+                );
+            }
+
+            // The subject's next touch: same decision, same budget.
+            server
+                .handle_datagram(&m1_frag0_datagram([78u8; SESSION_ID_LEN]), subject)
+                .expect("srv");
+            server.rate_buckets[&subject].tokens
+        }
+
+        let pruned = budget_after_one_stale_touch(true);
+        let kept = budget_after_one_stale_touch(false);
+        assert_eq!(
+            pruned, kept,
+            "the prune must not change the budget a source is left with"
+        );
+        assert_eq!(
+            pruned,
+            BURST - 1,
+            "a stale source is refilled to a full burst and then charged once"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Roster-size bound (D12 uniform verification => the bound is a work bound)
+    // -----------------------------------------------------------------------
+    /// `n` distinct ML-DSA-65 public keys.
+    fn roster_of(n: usize) -> Vec<MlDsaPublicKey> {
+        (0..n)
+            .map(|_| MlDsaKeypair::generate().expect("keygen").public_key())
+            .collect()
+    }
+
+    /// The default roster limit is **64** — written out, not derived from the
+    /// constant, so a change to the constant fails this test.
+    #[test]
+    fn roster_limit_default_is_64() {
+        assert_eq!(ServerConfig::DEFAULT_MAX_ROSTER_SIZE, 64);
+    }
+
+    /// A roster of exactly the limit is accepted, and the hot-swap path
+    /// accepts it too.
+    #[test]
+    fn roster_at_the_limit_is_accepted() {
+        let (client_id, server_id) = test_ids();
+        let roster = roster_of(64);
+        let sc = ServerConfig::new(server_id, roster.clone());
+        assert_eq!(
+            sc.roster.len(),
+            64,
+            "a roster of exactly the limit must be adopted whole"
+        );
+        assert!(sc.validate().is_ok());
+
+        let mut server = ServerHandshake::new(&sc);
+        assert_eq!(server.roster_len(), 64);
+        server
+            .set_roster(roster)
+            .expect("a roster of exactly the limit must be accepted by the hot-swap path");
+        assert_eq!(server.roster_len(), 64);
+        let _ = client_id;
+    }
+
+    /// One key over the limit fails closed, and the hot-swap path leaves the
+    /// previous roster in force (no truncation, no partial adoption).
+    #[test]
+    fn roster_one_over_the_limit_fails_closed() {
+        let (_, server_id) = test_ids();
+        let roster = roster_of(65);
+        let sc = ServerConfig::new(server_id, roster.clone());
+        assert!(
+            sc.roster.is_empty(),
+            "an over-limit roster must not be adopted"
+        );
+        assert!(sc.validate().is_err(), "validation must fail closed");
+
+        // The hot-swap path rejects it and keeps the old roster in force.
+        let mut server = ServerHandshake::new(&sc);
+        let good = roster_of(1);
+        server
+            .set_roster(good.clone())
+            .expect("a roster within the limit is accepted");
+        assert!(
+            server.set_roster(roster).is_err(),
+            "an over-limit roster must be rejected by the hot-swap path"
+        );
+        assert_eq!(
+            server.roster_len(),
+            1,
+            "a rejected swap must leave the previous roster in force"
+        );
+    }
+
+    /// The limit is a `ServerConfig` field, so an operator can raise it (and
+    /// lower it).  A raised limit adopts the whole roster; a lowered limit
+    /// fails closed.
+    #[test]
+    fn roster_limit_is_operator_overridable() {
+        let (_, server_id) = test_ids();
+        let roster = roster_of(65);
+
+        let raised = ServerConfig::with_roster_limit(server_id.clone(), roster.clone(), 128);
+        assert_eq!(
+            raised.roster.len(),
+            65,
+            "a raised limit must adopt the whole roster"
+        );
+        assert!(raised.validate().is_ok());
+
+        let lowered = ServerConfig::with_roster_limit(server_id, roster, 1);
+        assert!(
+            lowered.roster.is_empty(),
+            "a lowered limit must fail closed, not truncate"
+        );
+        assert!(lowered.validate().is_err());
+    }
+
+    /// A handshake machine built from an over-limit configuration must never
+    /// verify against more than the limit allows.  The D12 uniform loop
+    /// verifies against the *whole* roster or against none of it, so the
+    /// fail-closed direction is an empty roster (every client is rejected),
+    /// never a truncated one.
+    #[test]
+    fn handshake_machine_fails_closed_on_an_over_limit_roster() {
+        let (_, server_id) = test_ids();
+        let mut sc = ServerConfig::new(server_id, roster_of(65));
+        // Bypass the constructor's fail-closed rule to model a struct-literal
+        // configuration that skipped it.
+        sc.roster = roster_of(65);
+        let server = ServerHandshake::new(&sc);
+        assert_eq!(
+            server.roster_len(),
+            0,
+            "an over-limit configuration must yield a machine that trusts nobody"
+        );
+    }
+
+    /// The standalone server driver rejects an over-limit roster before it
+    /// touches the network.
+    #[tokio::test]
+    async fn server_rejects_an_over_limit_roster() {
+        let (_, server_id) = test_ids();
+        // Build a configuration whose roster exceeds its own limit, bypassing
+        // the constructor's fail-closed adoption rule.
+        let mut sc = ServerConfig::with_roster_limit(server_id, roster_of(1), 64);
+        sc.roster = roster_of(65);
+        let (client_t, mut server_t, _guard) = wired_transports();
+        let srv = tokio::spawn(async move { server_handshake_v2(&mut server_t, &sc).await });
+        let cli = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client_t
+        });
+        let (srv_res, _) = tokio::join!(srv, cli);
+        assert!(matches!(
+            srv_res.expect("join"),
+            Err(HandshakeV2Error::InvalidConfig(_))
+        ));
     }
 
     #[test]

@@ -30,6 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use pq_crypto::{ML_DSA_65_PUBLIC_KEY_BYTES, MlDsaKeypair, MlDsaPublicKey};
+use pq_tunnel_core::HandshakeV2ServerConfig;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroize;
@@ -37,6 +38,18 @@ use zeroize::Zeroize;
 /// Size of the ML-DSA-65 secret seed on disk (the `ml-dsa` crate's canonical
 /// compact secret serialization — *not* the FIPS-204 expanded encoding).
 const SEED_BYTES: usize = 32;
+
+/// Maximum number of client keys a roster file may hold.
+///
+/// The value is the core's default roster bound, so the parser and the
+/// handshake machine can never disagree about what a legal roster is (the
+/// server verifies the client signature against the **entire** roster, with
+/// no early exit — D12 — so the roster size is a bound on the server's
+/// per-handshake work, not a cosmetic limit).  The core's bound is
+/// operator-overridable per deployment; the provisioning parser uses the
+/// default, which is the right place for a file-format limit: a roster file
+/// larger than this is not loadable by a default deployment.
+pub const MAX_ROSTER_SIZE: usize = HandshakeV2ServerConfig::DEFAULT_MAX_ROSTER_SIZE;
 
 /// First line of every provisioning file (magic string).
 const MAGIC: &str = "PQTI";
@@ -91,6 +104,15 @@ pub enum IdentityError {
     BadPublicKey { path: PathBuf, reason: String },
     #[error("{}: empty roster (fails closed)", path.display())]
     EmptyRoster { path: PathBuf },
+    #[error(
+        "{}: roster of {got} keys exceeds the maximum of {max} (fails closed)",
+        path.display()
+    )]
+    RosterTooLarge {
+        path: PathBuf,
+        got: usize,
+        max: usize,
+    },
     #[error("{}: could not create (it already exists)", path.display())]
     Exists { path: PathBuf },
     #[error("{}: missing or invalid header ({reason})", path.display())]
@@ -210,14 +232,42 @@ fn read_payload_lines(path: &Path, expected: KeyType) -> Result<Vec<String>, Ide
 /// Decode payload lines into hex blobs with per-type structural validation.
 ///
 /// `identity`/`public-key` must have exactly one payload line; `roster` must
-/// have at least one (empty rosters fail closed). When `blob_len` is non-zero
-/// every decoded blob must be exactly that many bytes.
+/// have at least one (empty rosters fail closed) and at most
+/// [`MAX_ROSTER_SIZE`] (an over-long roster fails closed, and is rejected
+/// *before* any key is materialised, so a hostile or corrupt file cannot
+/// force an unbounded number of ML-DSA-65 key decodes).  When `blob_len` is
+/// non-zero every decoded blob must be exactly that many bytes.
+///
+/// `max_payloads` is the maximum number of payload lines the file may
+/// contain; `None` means "no early limit" (the identity/public-key types
+/// enforce their own exact-count rule after decoding, so that their error
+/// behaviour is unchanged).
 fn parse_blobs(
     path: &Path,
     expected: KeyType,
     blob_len: usize,
+    max_payloads: Option<usize>,
 ) -> Result<Vec<Vec<u8>>, IdentityError> {
     let mut lines = read_payload_lines(path, expected)?;
+
+    // Count the payload lines BEFORE decoding any of them: the roster bound
+    // must stop a hostile file from forcing an unbounded number of key
+    // decodes, and a decoded key is far more expensive than a line count.
+    //
+    // MSRV 1.85: nested `if` (let chains stabilize in 1.88). Cannot be
+    // collapsed into a `&& let` chain without breaking the MSRV gate.
+    #[allow(clippy::collapsible_if)]
+    if let Some(max) = max_payloads {
+        if lines.len() > max {
+            let got = lines.len();
+            lines.zeroize();
+            return Err(IdentityError::RosterTooLarge {
+                path: path.to_path_buf(),
+                got,
+                max,
+            });
+        }
+    }
 
     // The payload lines are hex text of (possibly secret) key material; scrub
     // them as they are decoded so no copy reaches the allocator alive.
@@ -326,7 +376,7 @@ pub fn ensure_missing(path: &Path) -> Result<(), IdentityError> {
 
 /// Load an identity (secret) from a `type: identity` file.
 pub fn load_identity(path: &Path) -> Result<MlDsaKeypair, IdentityError> {
-    let mut blobs = parse_blobs(path, KeyType::Identity, SEED_BYTES)?;
+    let mut blobs = parse_blobs(path, KeyType::Identity, SEED_BYTES, None)?;
     let mut seed = blobs.remove(0);
     let mut fixed: [u8; SEED_BYTES] = [0; SEED_BYTES];
     fixed.copy_from_slice(&seed);
@@ -353,7 +403,7 @@ pub fn save_identity(path: &Path, keypair: &MlDsaKeypair) -> Result<(), Identity
 
 /// Load a pinned peer public key from a `type: public-key` file.
 pub fn load_public_key(path: &Path) -> Result<MlDsaPublicKey, IdentityError> {
-    let mut blobs = parse_blobs(path, KeyType::PublicKey, ML_DSA_65_PUBLIC_KEY_BYTES)?;
+    let mut blobs = parse_blobs(path, KeyType::PublicKey, ML_DSA_65_PUBLIC_KEY_BYTES, None)?;
     let blob = blobs.remove(0);
     MlDsaPublicKey::from_bytes(&blob).map_err(|e| IdentityError::BadPublicKey {
         path: path.to_path_buf(),
@@ -374,9 +424,32 @@ pub fn save_public_key(path: &Path, key: &MlDsaPublicKey) -> Result<(), Identity
 /// Load a roster (list of trusted client public keys) from a `type: roster` file.
 ///
 /// One encoded public key per payload line; blank lines and `#` comment lines
-/// are ignored. An empty parsed result is an error (fails closed — D12).
+/// are ignored. An empty parsed result is an error (fails closed — D12), and
+/// so is a roster with more than [`MAX_ROSTER_SIZE`] keys (fails closed: the
+/// server verifies the client signature against the *entire* roster with no
+/// early exit — D12 — so an unbounded roster is an unbounded pre-authentication
+/// work amplifier).  The size check runs before any key is decoded.
 pub fn load_roster(path: &Path) -> Result<Vec<MlDsaPublicKey>, IdentityError> {
-    let blobs = parse_blobs(path, KeyType::Roster, ML_DSA_65_PUBLIC_KEY_BYTES)?;
+    load_roster_with_limit(path, MAX_ROSTER_SIZE)
+}
+
+/// Load a roster with an explicit size limit.
+///
+/// Same rules as [`load_roster`], with the limit supplied by the caller.  A
+/// deployment that raises the server's roster bound
+/// (`ServerConfig::max_roster_size`) must load its roster with the same
+/// bound, or the provisioning file and the server would disagree about what
+/// a legal roster is.
+pub fn load_roster_with_limit(
+    path: &Path,
+    max_roster_size: usize,
+) -> Result<Vec<MlDsaPublicKey>, IdentityError> {
+    let blobs = parse_blobs(
+        path,
+        KeyType::Roster,
+        ML_DSA_65_PUBLIC_KEY_BYTES,
+        Some(max_roster_size),
+    )?;
 
     let mut roster = Vec::with_capacity(blobs.len());
     for blob in blobs {
@@ -391,11 +464,20 @@ pub fn load_roster(path: &Path) -> Result<Vec<MlDsaPublicKey>, IdentityError> {
 
 /// Write a roster (list of trusted client public keys) as a `type: roster` file.
 ///
-/// An empty roster is rejected (fails closed — D12).
+/// An empty roster is rejected (fails closed — D12), and so is a roster with
+/// more than [`MAX_ROSTER_SIZE`] keys: a file the loader would refuse to
+/// read is not a file the writer should produce.
 pub fn save_roster(path: &Path, keys: &[MlDsaPublicKey]) -> Result<(), IdentityError> {
     if keys.is_empty() {
         return Err(IdentityError::EmptyRoster {
             path: path.to_path_buf(),
+        });
+    }
+    if keys.len() > MAX_ROSTER_SIZE {
+        return Err(IdentityError::RosterTooLarge {
+            path: path.to_path_buf(),
+            got: keys.len(),
+            max: MAX_ROSTER_SIZE,
         });
     }
 
@@ -413,7 +495,8 @@ pub fn save_roster(path: &Path, keys: &[MlDsaPublicKey]) -> Result<(), IdentityE
 ///
 /// Appending an already-present key is a no-op (idempotent). A missing file is
 /// created with the roster header. Any existing file must parse as a valid
-/// roster (fails closed).
+/// roster (fails closed).  A roster that is already at [`MAX_ROSTER_SIZE`]
+/// keys is not grown: the append is refused and the file is left untouched.
 pub fn append_roster(path: &Path, key: &MlDsaPublicKey) -> Result<(), IdentityError> {
     let mut keys = if path.exists() {
         load_roster(path)?
@@ -422,6 +505,13 @@ pub fn append_roster(path: &Path, key: &MlDsaPublicKey) -> Result<(), IdentityEr
     };
 
     if !keys.iter().any(|k| k.encode() == key.encode()) {
+        if keys.len() >= MAX_ROSTER_SIZE {
+            return Err(IdentityError::RosterTooLarge {
+                path: path.to_path_buf(),
+                got: keys.len() + 1,
+                max: MAX_ROSTER_SIZE,
+            });
+        }
         // Rebuild the key from its encoding. `from_bytes` here cannot fail: the
         // encoding was just produced by a valid key; a failure still fails
         // closed rather than panicking.
@@ -450,16 +540,27 @@ pub fn append_roster(path: &Path, key: &MlDsaPublicKey) -> Result<(), IdentityEr
 pub struct RosterHandle {
     path: PathBuf,
     current: std::sync::Arc<Vec<MlDsaPublicKey>>,
+    /// Maximum number of keys this handle will publish.  The handle refuses
+    /// to load or publish a larger roster, so the hot-swap path cannot widen
+    /// the roster past the bound the server was configured with.
+    max_roster_size: usize,
 }
 
 impl RosterHandle {
     /// Load `path` and hold it. Fails closed at startup on a missing or
     /// malformed roster — the server never starts with no trusted clients.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
-        let roster = load_roster(path)?;
+        Self::load_with_limit(path, MAX_ROSTER_SIZE)
+    }
+
+    /// Load `path` with an explicit size limit (a deployment that raised the
+    /// server's roster bound uses the same bound here).
+    pub fn load_with_limit(path: &Path, max_roster_size: usize) -> Result<Self, IdentityError> {
+        let roster = load_roster_with_limit(path, max_roster_size)?;
         Ok(Self {
             path: path.to_path_buf(),
             current: std::sync::Arc::new(roster),
+            max_roster_size,
         })
     }
 
@@ -496,7 +597,7 @@ impl RosterHandle {
     /// snapshot stays in force and the error is returned to the caller: a
     /// half-written or corrupt roster can never narrow the trusted set.
     pub fn reload(&mut self) -> Result<usize, IdentityError> {
-        let parsed = load_roster(&self.path)?;
+        let parsed = load_roster_with_limit(&self.path, self.max_roster_size)?;
         if parsed.is_empty() {
             return Err(IdentityError::EmptyRoster {
                 path: self.path.clone(),
@@ -765,5 +866,160 @@ mod tests {
             "fingerprint must be stable"
         );
         assert!(fp.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Roster-size bound
+    // -----------------------------------------------------------------------
+
+    /// The provisioning limit is the core's default roster bound — the
+    /// server verifies the client signature against the *entire* roster with
+    /// no early exit (D12), so the roster size bounds the server's
+    /// per-handshake work.  The value is written out, not derived from the
+    /// constant, so a change to the constant fails this test.
+    #[test]
+    fn roster_limit_is_64_and_matches_the_core_default() {
+        assert_eq!(MAX_ROSTER_SIZE, 64);
+        assert_eq!(
+            MAX_ROSTER_SIZE,
+            HandshakeV2ServerConfig::DEFAULT_MAX_ROSTER_SIZE
+        );
+    }
+
+    /// `n` distinct ML-DSA-65 public keys.
+    fn roster_keys(n: usize) -> Vec<MlDsaPublicKey> {
+        (0..n)
+            .map(|_| MlDsaKeypair::generate().expect("keygen").public_key())
+            .collect()
+    }
+
+    /// Write a roster file with `n` payload lines of the given text (used to
+    /// write files the writer itself would refuse to produce).
+    fn write_roster_lines(path: &Path, lines: &[String]) {
+        let mut content = String::from("PQTI\nversion: 1\ntype: roster\n");
+        for l in lines {
+            content.push_str(l);
+            content.push('\n');
+        }
+        fs::write(path, content).expect("write");
+    }
+
+    /// A roster of exactly the limit loads.
+    #[test]
+    fn roster_at_the_limit_loads() {
+        let path = temp_path("roster-at-limit");
+        let keys = roster_keys(MAX_ROSTER_SIZE);
+        save_roster(&path, &keys).expect("save roster at the limit");
+
+        let loaded = load_roster(&path).expect("load roster at the limit");
+        assert_eq!(loaded.len(), MAX_ROSTER_SIZE);
+        assert_eq!(loaded[0].encode(), keys[0].encode());
+        cleanup(&path);
+    }
+
+    /// One key over the limit is rejected — the load fails closed.
+    #[test]
+    fn roster_one_over_the_limit_is_rejected() {
+        let path = temp_path("roster-over-limit");
+        let keys = roster_keys(MAX_ROSTER_SIZE + 1);
+        let lines: Vec<String> = keys.iter().map(|k| encode_hex(&k.encode())).collect();
+        write_roster_lines(&path, &lines);
+
+        let err = load_roster(&path).expect_err("an over-limit roster must be rejected");
+        match err {
+            IdentityError::RosterTooLarge { got, max, .. } => {
+                assert_eq!(got, MAX_ROSTER_SIZE + 1);
+                assert_eq!(max, MAX_ROSTER_SIZE);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        cleanup(&path);
+    }
+
+    /// The size check runs *before* any key is decoded: a file with too many
+    /// (malformed) lines must report the size, not a hex/parse error.  A
+    /// hostile or corrupt file therefore cannot force an unbounded number of
+    /// ML-DSA-65 key decodes.
+    #[test]
+    fn roster_over_the_limit_is_rejected_before_any_key_is_decoded() {
+        let path = temp_path("roster-over-limit-malformed");
+        let lines: Vec<String> = (0..=MAX_ROSTER_SIZE)
+            .map(|_| "not-hex".to_string())
+            .collect();
+        write_roster_lines(&path, &lines);
+
+        let err = load_roster(&path).expect_err("an over-limit roster must be rejected");
+        assert!(
+            matches!(err, IdentityError::RosterTooLarge { .. }),
+            "the size check must precede decoding, got: {err}"
+        );
+        cleanup(&path);
+    }
+
+    /// The writer refuses to produce a file the loader would reject, and
+    /// writes nothing.
+    #[test]
+    fn save_roster_over_the_limit_is_rejected_and_writes_nothing() {
+        let path = temp_path("roster-save-over-limit");
+        let keys = roster_keys(MAX_ROSTER_SIZE + 1);
+        let err = save_roster(&path, &keys).expect_err("an over-limit roster must not be written");
+        assert!(
+            matches!(err, IdentityError::RosterTooLarge { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !path.exists(),
+            "a refused roster must not leave a file behind"
+        );
+    }
+
+    /// The append path refuses to grow a full roster and leaves the file
+    /// untouched.
+    #[test]
+    fn append_roster_at_the_limit_is_rejected_and_leaves_the_file_unchanged() {
+        let path = temp_path("roster-append-at-limit");
+        let keys = roster_keys(MAX_ROSTER_SIZE);
+        save_roster(&path, &keys).expect("save roster at the limit");
+        let before = fs::read(&path).expect("read");
+
+        let extra = MlDsaKeypair::generate().expect("keygen").public_key();
+        let err = append_roster(&path, &extra).expect_err("a full roster must not grow");
+        assert!(
+            matches!(err, IdentityError::RosterTooLarge { .. }),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).expect("read"),
+            before,
+            "a refused append must not modify the file"
+        );
+        cleanup(&path);
+    }
+
+    /// End-to-end: the parser's limit and the core's effective limit are the
+    /// same number, so a roster that the parser accepts is one the server
+    /// will use, and one it rejects is one the server refuses.
+    #[test]
+    fn parser_limit_and_core_limit_agree() {
+        let (client_id, server_id) = (
+            MlDsaKeypair::generate().expect("keygen"),
+            MlDsaKeypair::generate().expect("keygen"),
+        );
+        let at_limit = roster_keys(MAX_ROSTER_SIZE);
+        let over_limit = roster_keys(MAX_ROSTER_SIZE + 1);
+
+        let accepted = HandshakeV2ServerConfig::new(server_id.clone(), at_limit.clone());
+        assert_eq!(
+            accepted.roster.len(),
+            MAX_ROSTER_SIZE,
+            "a roster the parser accepts must be adopted by the core"
+        );
+
+        let refused = HandshakeV2ServerConfig::new(server_id, over_limit);
+        assert!(
+            refused.roster.is_empty(),
+            "a roster the parser refuses must not be adopted by the core"
+        );
+        let _ = client_id;
     }
 }

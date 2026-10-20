@@ -35,6 +35,58 @@ use crate::codec::PACKET_SIZE;
 /// Default fixed cover rate (PROTOCOL_SPEC §12.1 / D6): 2 Mbps for v0.2.0.
 pub const DEFAULT_COVER_RATE_BPS: u64 = 2_000_000;
 
+/// Minimum cover emission interval, in nanoseconds.
+///
+/// # Derivation
+///
+/// A cover packet is not free: every emission costs one scheduler tick, one
+/// full 1280-byte record encryption, and the driver's timer/wake/send
+/// syscalls.  Measured on the reference host
+/// (`docs/performance/I-benchmark-methodology.md` §7.1, §7.3, §7.5):
+///
+/// | component | p50 |
+/// |---|---:|
+/// | `CoverScheduler::on_deadline` (emitting tick) | 11 109 ns |
+/// | `CipherSession::encrypt` (full 1280 B record) | 10 653 ns |
+/// | **per-cover-packet CPU (excludes syscalls)** | **21 762 ns** |
+///
+/// A cover interval *shorter than the time it takes to produce one cover
+/// packet* is unachievable by construction: the driver is asked to begin
+/// emission N+1 before emission N could have finished, so the schedule
+/// degenerates into a back-to-back spin whose real rate is set by the OS
+/// wake path rather than by the operator's setting.  The floor is therefore
+/// the measured per-packet cost, and it is a **lower** bound on the true
+/// cost (the timer create/arm/wait/close and the `sendto` are excluded from
+/// the measurement).
+///
+/// **What the floor does and does not guarantee.** It removes the
+/// pathological 1 ns interval and it **bounds the rate the operator may
+/// request**; the CLI rejects anything above it with a named error rather
+/// than silently clamping. It does **not** guarantee that the requested rate
+/// is achievable on any given host: the measurement excludes the syscalls,
+/// so the true per-packet cost is higher than the floor. On the reference
+/// host the measured minimum `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` wake
+/// latency is 15 200 ns (§7.4), which puts that host's achievable period at
+/// roughly 37 us (about 276 Mbps) — below the ceiling the floor admits. The
+/// floor is a **lower bound on cost and an upper bound on the requested
+/// rate**, not a promise of throughput.
+///
+/// Cross-check on the same host: the floor is above the timer's own
+/// achievable re-arm period.
+///
+/// The D19 default is unaffected: 2 Mbps is a 5.12 ms interval, 235x the
+/// floor.
+pub const MIN_COVER_INTERVAL_NANOS: u64 = 21_762;
+
+/// The highest cover rate whose interval is not shorter than
+/// [`MIN_COVER_INTERVAL_NANOS`].
+///
+/// `PACKET_SIZE * 8` bits per packet at `MIN_COVER_INTERVAL_NANOS` ns per
+/// packet.  Integer division floors, so the value is exactly the largest
+/// rate the floor admits.
+pub const MAX_COVER_RATE_BPS: u64 =
+    PACKET_SIZE as u64 * 8 * 1_000_000_000 / MIN_COVER_INTERVAL_NANOS;
+
 /// Cover emission schedule chosen by the operator.
 ///
 /// This is a transport/driver policy parameter.  In particular it does NOT
@@ -63,16 +115,20 @@ impl Default for CoverPolicy {
 /// Exact integer math (no float multiplication in the timed path):
 /// `interval_ns = PACKET_SIZE_bits * 1_000_000_000 / rate_bps`.
 /// Rate guards: a pathological `rate_bps = 0` is clamped to 1 bps, and the
-/// result is clamped to a nonzero interval (the exact math saturates to 0 ns
-/// for rates above ~10 Tbps — a zero interval would turn the driver's
-/// `sleep_until(now)` into a busy loop).  The clamp only affects rates that
-/// would already saturate the scheduling arithmetic; sane rates are exact.
+/// result is clamped into `[MIN_COVER_INTERVAL_NANOS, ..]` — the exact math
+/// saturates to 0 ns for rates above ~10 Tbps (a zero interval would turn
+/// the driver's `sleep_until(now)` into a busy loop), and an interval
+/// shorter than the time it takes to produce one cover packet is not
+/// schedulable at all (see [`MIN_COVER_INTERVAL_NANOS`] for the derivation).
+/// The clamp only affects rates that would already saturate the scheduling
+/// arithmetic; sane rates are exact — the D19 default (2 Mbps) is exactly
+/// 5.12 ms.
 pub fn interval_from_rate_bps(rate_bps: u64) -> Duration {
     let bits_per_packet = PACKET_SIZE as u64 * 8;
     let nanos = bits_per_packet
         .saturating_mul(1_000_000_000)
         .saturating_div(rate_bps.max(1));
-    Duration::from_nanos(nanos.max(1))
+    Duration::from_nanos(nanos.max(MIN_COVER_INTERVAL_NANOS))
 }
 
 /// A pure-periodic cover schedule for one direction of one session.
@@ -261,10 +317,76 @@ mod tests {
         assert!(!d.is_zero());
     }
 
+    /// The derived floor is **21 762 ns**, written out so a change to the
+    /// constant fails this test rather than silently re-basing it.
+    #[test]
+    fn min_cover_interval_is_21762_nanos() {
+        assert_eq!(MIN_COVER_INTERVAL_NANOS, 21_762);
+    }
+
+    /// No rate may produce an interval shorter than the derived floor: the
+    /// 1 ns clamp that used to be reachable (and that turned the driver's
+    /// `sleep_until` into a hot re-arm loop) is gone.
+    #[test]
+    fn interval_never_goes_below_the_derived_floor() {
+        for rate in [
+            0u64,
+            1,
+            1_000,
+            1_000_000,
+            2_000_000,
+            MAX_COVER_RATE_BPS,
+            MAX_COVER_RATE_BPS + 1,
+            1_000_000_000_000,
+            1_000_000_000_000_000,
+            u64::MAX / 2,
+            u64::MAX,
+        ] {
+            let d = interval_from_rate_bps(rate);
+            assert!(
+                d >= Duration::from_nanos(MIN_COVER_INTERVAL_NANOS),
+                "rate {rate} must not yield an interval below the derived floor, got {d:?}"
+            );
+        }
+        assert_eq!(
+            interval_from_rate_bps(u64::MAX),
+            Duration::from_nanos(MIN_COVER_INTERVAL_NANOS),
+            "the fastest possible rate lands exactly on the floor"
+        );
+    }
+
+    /// `MAX_COVER_RATE_BPS` is exactly the largest rate the floor admits:
+    /// one bit/s more would produce an interval one nanosecond short.
+    #[test]
+    fn max_cover_rate_bps_is_exactly_the_floor_boundary() {
+        let packet_bits = PACKET_SIZE as u64 * 8 * 1_000_000_000;
+        assert!(
+            MAX_COVER_RATE_BPS * MIN_COVER_INTERVAL_NANOS <= packet_bits,
+            "the max rate must not ask for an interval shorter than the floor"
+        );
+        assert!(
+            (MAX_COVER_RATE_BPS + 1) * MIN_COVER_INTERVAL_NANOS > packet_bits,
+            "one bit/s more must exceed the floor"
+        );
+        // The value itself, written out (not derived from the constant).
+        assert_eq!(MAX_COVER_RATE_BPS, 470_544_986);
+    }
+
+    /// The D19 default is untouched by the floor: 2 Mbps is still exactly
+    /// 5.12 ms, 235x the floor.
+    #[test]
+    fn default_rate_is_unaffected_by_the_floor() {
+        assert_eq!(
+            interval_from_rate_bps(DEFAULT_COVER_RATE_BPS),
+            Duration::from_nanos(5_120_000)
+        );
+        assert_eq!(MIN_COVER_INTERVAL_NANOS * 235, 5_114_070);
+    }
+
     #[test]
     fn absurd_rate_is_clamped_to_nonzero_interval() {
-        // The exact integer math saturates to 0 ns for huge rates; the 1 ns
-        // floor keeps the driver's sleep_until from busy-looping.
+        // The exact integer math saturates to 0 ns for huge rates; the
+        // derived floor keeps the driver's sleep_until from busy-looping.
         assert!(!interval_from_rate_bps(u64::MAX).is_zero());
         // Monotonicity: a higher rate never yields a longer interval
         // (quotients of positive integers are non-increasing in the rate).
