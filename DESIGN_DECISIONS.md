@@ -969,8 +969,13 @@ perfectly timed packets.
 
 **Advantages:**
 
-- the wire pattern of an established idle link is a constant, predictable
-  packet stream per direction — no timing/idle/burst leakage from the shaper
+- the shaper never bursts: a stalled host produces a single delayed record,
+  never a queued backlog, so the shaper itself contributes no burst or idle
+  structure — but the resulting pattern is bounded, not constant: the
+  measured steady-state cadence is 182.6 pkt/s (93.5% of the nominal 195.3)
+  with a p50 period of 5.5 ms against a nominal 5.12 ms, and session count,
+  liveness and lifecycle events stay observable by construction
+  (THREAT_MODEL.md §13.4–§13.6)
 - single-emit-on-stall rescheduling is clock-independent and unit-testable in
   virtual time
 - the scheduler is a pure module: core owns policy/timing, binary drivers own
@@ -1233,7 +1238,9 @@ never the vector.
 
 ## Status
 
-Accepted (M11, N-4)
+Accepted (M11, N-4; amended — the resource-bound claim this entry originally
+made was measured false and is replaced below; the counting rules are
+unchanged)
 
 ## Context
 
@@ -1251,14 +1258,42 @@ wrong in two mechanical details, both found in the M11 N-4 review.
 - **The consequence was unbounded attacker-controlled CPU.** The prune pass ran
   on every call once the table exceeded 32 entries, and at the 4096-entry cap a
   `min_by_key` scan ran per packet. Because the source key is the full
-  `SocketAddr`, one IP address yields up to **65,535** distinct keys by varying
-  the port. An attacker could therefore saturate the table and *hold* it there
+  `SocketAddr`, one IP address yields up to **65,535** distinct keys. An
+  attacker could therefore saturate the table and *hold* it there
   indefinitely — roughly 409.6 datagrams per window keeps every bucket's
   `last_refill` fresh enough to survive the prune — paying two O(n) scans per
   packet forever. Memory was sound (genuinely capped); CPU was the defect.
 
 Resource exhaustion was also missing from the formal threat-model enumeration
 altogether (see `THREAT_MODEL.md` §7, corrected alongside this decision).
+
+**A later verification pass found that the M11 fix did not finish the job, and
+that this entry's own resource-bound claim was false.** Two defects survived
+the lookup-first reordering, both confirmed by measurement on the pre-fix tree
+rather than by reading alone.
+
+- **Both linear scans were still on the packet path.** The reordering moved
+  *bucket creation* behind the AEAD failure, but the prune (`retain`) and the
+  cap eviction (`min_by_key`) still ran on every failing datagram, and the
+  table could still be driven to its cap — so the O(n)-per-packet cost the M11
+  review set out to remove was still reachable. Measured on the pre-fix tree:
+  40,000 AEAD-failing datagrams against a 200-entry table produced **12,600
+  prune passes and 2,520,000 bucket visits**; driving a 64-entry cap from
+  distinct source ports produced **136 cap scans and 8,704 bucket visits**.
+- **"Fail-gate state is bounded by the active session population" was false.**
+  The sid is cleartext in every packet header (it is AEAD associated data, not
+  a secret), so a party that observes one datagram learns a live sid and can
+  then present AEAD-failing traffic from a fresh source port per datagram.
+  Measured on the pre-fix tree: **one** live session plus **200** distinct
+  source ports produced **200** buckets. The table tracks *failing sources*,
+  not sessions; the live-session population was never a bound on it. The bound
+  is `max_fail_buckets` (default 4096) — exactly the bound the M11 review had
+  already identified for the table's *memory*, and the bound this entry
+  mis-stated as if it were a property of the *population*.
+
+The two defects have different shapes, and the fix must cover both: the CPU
+defect is about *where* the work happens (packet path versus off-path), and
+the false claim is about *what the bound is*.
 
 ## Decision
 
@@ -1269,19 +1304,67 @@ altogether (see `THREAT_MODEL.md` §7, corrected alongside this decision).
 - **The source key is `SocketAddr`, port included.** This is stated explicitly
   because it is the fact that made the old behaviour exploitable: one IP
   address is up to 65,535 distinct keys, so "per-source" must never be read as
-  "per-host".
+  "per-host". It is also the reason the source key space is *reachable* by an
+  unauthenticated party: the sid is cleartext in every header, so knowing a
+  live sid is enough to present a fresh source key per datagram.
 - **Lookup-first invariant (the fix).** Traffic bearing an unknown or unowned
   session id is resolved against the session table and dropped **before** the
   gate. It must not allocate or touch a fail-gate bucket. Such traffic performs
   no decryption and consumes no budget, so charging it is meaningless work that
   only inflates attacker-controlled state. The gate is now a pure *test* on the
   packet path and bucket creation happens only on the real-failure path, which
-  is its sole writer.
-- **Resource bound.** Fail-gate state is bounded by the **active session
-  population** — at most `max_sessions` live sessions (default 64) — and not by
-  unauthenticated source diversity reaching a 4096-entry table.
-  `max_fail_buckets` (default 4096) is retained as a hard backstop and as the
-  fail-closed switch: `max_fail_buckets == 0` disables the data path.
+  is its sole writer. (Unchanged by this amendment.)
+- **Resource bound (corrected — the earlier claim was false).** Fail-gate state
+  is bounded by `max_fail_buckets` (default 4096) and by **nothing else**. It
+  is *not* bounded by the active session population: the sid is cleartext in
+  every packet header, so one observed datagram is enough to learn a live sid,
+  and a party holding a live sid can mint one bucket per source port. The
+  supersession of the earlier claim is explicit and measured: one live session
+  plus 200 distinct source ports produced 200 buckets on the pre-fix tree.
+  `max_fail_buckets` remains the hard backstop and the fail-closed switch:
+  `max_fail_buckets == 0` disables the data path.
+- **Work bound (the fix that removes the O(n)-per-packet cost).** The CPU
+  bound is separate from the memory bound, and it is now stated per operation:
+  - the **packet path is O(1)**: the gate performs hash lookups only. No
+    datagram — failing, succeeding, or unknown-sid — scans the fail-gate
+    table, whatever the table holds;
+  - the **cap eviction is O(1)**: the victim is the oldest-inserted tracked
+    source, taken from an insertion-order queue maintained in lockstep with
+    the table — one table entry visited per eviction, not `n`;
+  - the **expiry sweep is off the packet path**: it runs in the manager's 1 Hz
+    tick, at most one pass per `fail_window`, so its cost is bounded by
+    `max_fail_buckets` bucket visits per `fail_window`. That is a *rate* bound:
+    the table's reclamation cost no longer scales with the attacker's datagram
+    rate, which is what the pre-fix per-datagram prune did.
+- **Expiry semantics.** A bucket is *logically* expired `fail_window` after
+  its last refill: the gate treats an expired bucket as absent (a full burst is
+  allowed) and refills it to a full burst on that source's next failure.
+  Physical reclamation of expired entries is a *memory cleanup* and happens in
+  the tick path, at most one pass per `fail_window`; a stale entry that has not
+  yet been reclaimed costs memory, never an accept/reject decision.
+- **Eviction victim policy (changed, and not a weakening).** The victim is now
+  the oldest-*inserted* tracked source rather than the least-recently-*refilled*
+  one. The two policies are equivalent for the adversary's achievable
+  throughput: what bounds a source's failure rate is that source's own budget
+  and the number of distinct sources it can present, not which tracked bucket
+  is sacrificed — and under table pressure *both* policies allow a budget
+  reset, because the least-recently-refilled bucket is precisely the one a
+  table-filling attacker would target (an attacker that keeps failing keeps
+  its own bucket fresh). The FIFO victim costs one queue pop and no scan.
+- **Why the added mechanism is safe (and what it is not).** This entry
+  originally declined to add "a clock or LRU eviction pass" because a second
+  eviction mechanism is a second thing to get wrong in the one path whose
+  failure mode is "the attacker shapes our internal state". That concern is
+  respected here in a specific way: the mechanism added is **not** a second
+  scan and **not** an LRU with a second ordering to keep consistent. It is an
+  insertion-order queue with one invariant — it holds exactly the table's keys,
+  `order.len() == buckets.len()` — maintained by construction: every insert
+  appends, every eviction pops the front and removes the same key from the
+  table, and the expiry sweep removes the same keys from both. The D29
+  analysis supplies the safety argument that makes moving the sweep off the
+  packet path legitimate at all: *a stale bucket costs memory, never
+  correctness*, so skipping a sweep can never change an accept/reject
+  decision.
 - **The gate still applies to known sessions.** Reordering the gate does not
   ungate it. A datagram that presents a live session id and then fails AEAD is
   charged, and once a source's budget is exhausted its packets are dropped
@@ -1293,14 +1376,6 @@ altogether (see `THREAT_MODEL.md` §7, corrected alongside this decision).
   global denial of service. The known consequence — clients behind one NAT
   egress share one budget — is accepted, and is benign in practice because
   consumption is failure-only, so honest traffic never drains the shared budget.
-- **The remaining bounded scan, and why no second eviction algorithm is
-  introduced.** After this change any scan that still occurs is bounded by the
-  active-session population (≤ `max_sessions`, default 64) rather than by 4096.
-  A clock or LRU eviction pass is deliberately **not** added at this time: the
-  asymptotic win is real but small against a bound of 64, and a second eviction
-  mechanism is a second thing to get wrong, in the one code path whose failure
-  mode is "attacker shapes our internal state". This is a deliberate,
-  revisitable tradeoff, not an oversight.
 - **Actual M1 accounting, recorded precisely.** A full 4-fragment M1 costs
   exactly **2** tokens; M1 + M3 costs exactly **3**. The charge points, which
   already existed in code and are now recorded here as contract:
@@ -1323,7 +1398,12 @@ D24 **does not modify** D13 (handshake construction and its DoS posture), D16
 (authentication model). It refines *where* the existing data-path gate is
 evaluated and *when* buckets are materialised, and it pins the accounting that
 D13's per-source limiter already implemented. D22 and D24 share no surface.
-Resource exhaustion is recorded in `THREAT_MODEL.md` §7 as an adversary
+The amendment aligns the data path with the shape the handshake path already
+uses (`handshake_v2::rate_ok`, D29 item 1: a window-gated prune that runs at
+most one pass per window); the handshake path's own cap-eviction question
+(D29 item 2, an open gate) is a separate decision on a different code path and
+is not changed by this entry. Resource exhaustion is recorded in
+`THREAT_MODEL.md` §7 as an adversary
 consideration; the bounded-resource invariants it lists — bounded pending table
 with TTL, per-source failure budget, lookup-first no-allocation — are the
 protocol-level statements of this decision. Out of scope for D24 remains what
@@ -1336,12 +1416,18 @@ legitimate-looking sources.
 
 **Advantages:**
 
-- unknown-session traffic performs no gate work at all, so the attacker-
-  controlled CPU sink (O(n) scans per packet over a 4096-entry table held
-  fresh by ~409.6 pkt/s) is gone
-- fail-gate state is now bounded by something the protocol already bounds and
-  the operator already configures (`max_sessions`), not by a number the
-  attacker influences directly
+- unknown-session traffic performs no gate work at all, so the
+  attacker-controlled CPU sink (O(n) scans per packet over a 4096-entry table
+  held fresh by ~409.6 pkt/s) is gone
+- no datagram scans the fail-gate table any more — not an unknown-sid one, not
+  a failing one, not a successful one — so the O(n)-per-packet cost is gone
+  from the *whole* data path, not only from the unknown-sid branch
+- the fail-gate table's cost is now bounded by a *rate* (at most
+  `max_fail_buckets` bucket visits per `fail_window`) rather than by the
+  attacker's packet rate, and its cap eviction is O(1)
+- the memory bound is honest and measured: `max_fail_buckets`, and nothing
+  else — the table tracks failing sources, and the claim that the live-session
+  population bounded it has been withdrawn with the measurement that refutes it
 - the bucket table's only writer is a real AEAD failure, which makes the
   "failure-only" property true by construction rather than by convention
 
@@ -1355,16 +1441,63 @@ legitimate-looking sources.
 - a deliberately large number of genuinely distinct sources that each cause
   real failures can still reach `max_fail_buckets`; that is now the correct
   signal (real failures, not probe noise), and the cap still holds
+- the eviction victim is now the oldest-*inserted* tracked source rather than
+  the least-recently-*refilled* one; the two are equivalent for the
+  adversary's achievable throughput (§ above), and the FIFO victim is O(1)
+- the expiry sweep runs from the manager's 1 Hz tick, so if the tick stops,
+  expired entries linger in the table (still capped) until it resumes; the
+  accounting is unaffected either way, because expiry is a property of the
+  budget, not of the table's contents
+- the per-source budget still bounds *a source's* failure rate, not the
+  total: a party that learns a live sid can present up to 65,535 distinct
+  source keys, so the total AEAD work it can request is bounded by the
+  number of source keys it can present, not by `max_fail_buckets`
 
-**Validation:** 10 new focused tests assert the resource invariants directly,
-not by timing: unknown-SID traffic across 4,096 distinct ports on one IP
-allocates **zero** buckets; the same volume repeated 8× still allocates zero;
-bucket count equals the live-session population under 2,000-source hostile
-churn and does not grow on a second churn round; the gate demonstrably still
-bites on a known sid whose AEAD fails; shared-source fairness holds; and the
-handshake limiter's exact M1=2 / M1+M3=3 accounting is pinned through
-observable gate behaviour with no wall clock. Existing suite: 226 core tests
-green, plus the wider workspace gates.
+**Validation:** the invariants are asserted directly, by structure and not by
+timing.
+
+*M11 (lookup-first).* 10 focused tests: unknown-SID traffic across 4,096
+distinct ports on one IP allocates **zero** buckets; the same volume repeated
+8× still allocates zero; the gate demonstrably still bites on a known sid
+whose AEAD fails; shared-source fairness holds; and the handshake limiter's
+exact M1=2 / M1+M3=3 accounting is pinned through observable gate behaviour
+with no wall clock.
+
+*This amendment (work bound and the corrected resource bound).* 7 further
+tests, all deterministic:
+
+- `d24_fail_gate_state_is_bounded_by_the_configured_cap` — unknown-SID
+  churn across 2,000 sources still allocates **zero** buckets, and the table
+  holds exactly one entry per *failing source*. (This test replaces the
+  superseded `d24_fail_gate_state_is_bounded_by_session_population`, whose
+  name asserted the claim this entry withdraws.)
+- `d24_one_live_session_can_drive_the_table_to_the_cap` — the counterexample
+  that refutes the withdrawn claim, pinned as a test: one live session plus
+  200 source ports reaches the configured cap.
+- `d24_repeated_aead_failure_does_no_table_scan` — an instrumented
+  table-visit counter proves the hot path visits **zero** table entries
+  across 1,000 repeated AEAD failures, and that the cap eviction visits
+  **exactly one** entry (O(1)), not the whole table.
+- `d24_unknown_sid_path_visits_no_fail_gate_entry` — 1,000 unknown-SID
+  datagrams from 1,000 sources allocate no bucket and visit no table entry.
+- `d24_cap_boundary_behaviour_is_defined` — the table never exceeds
+  `max_fail_buckets` under sustained churn, and the victim policy
+  (oldest-inserted) is pinned by observation.
+- `d24_expired_budget_is_refreshed_for_the_source` and
+  `d24_expired_buckets_are_reclaimed_by_the_sweep` — expiry semantics on the
+  crate's virtual clock: a budget expires `fail_window` after the last
+  refill, and stale entries are reclaimed by the tick-path sweep, at most one
+  pass per window.
+- `d24_per_source_budget_is_not_shared_between_sources` — an exhausted
+  source is gated while a different source is not starved, and successes
+  allocate no bucket.
+
+The pre-fix measurements quoted in the Context were taken on the baseline tree
+with an instrumented copy of the failure path: 12,600 prune passes and
+2,520,000 bucket visits for 40,000 failing datagrams against a 200-entry
+table; 136 cap scans and 8,704 bucket visits while filling a 64-entry cap;
+and 200 buckets from a single live session across 200 source ports. Existing
+suite: 280 core tests green, plus the wider workspace gates.
 
 ---
 

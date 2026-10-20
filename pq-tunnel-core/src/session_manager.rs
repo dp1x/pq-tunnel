@@ -46,9 +46,18 @@
 //!   re-establishment.  D24 pins the lookup-first ordering: a datagram whose
 //!   sid names no live session is dropped *before* the gate, so it allocates
 //!   and touches no bucket.  The source key is the full `SocketAddr` (port
-//!   included), so the table is bounded by the active session population
-//!   (`max_sessions`, default 64) rather than by unauthenticated source
-//!   diversity; `max_fail_buckets` (default 4096) remains a hard backstop.
+//!   included), so one address is up to 65,535 distinct keys.
+//! - **Fail-gate resource bound (D24, corrected)**: the bucket table is
+//!   bounded by `max_fail_buckets` (default 4096) and by *nothing else* — in
+//!   particular **not** by the live-session population.  The sid is cleartext
+//!   in every packet header, so a party that observes one packet learns a
+//!   live sid and can then mint one bucket per source port: the table can be
+//!   driven to its cap from a single live session.  The cap is the *memory*
+//!   bound; the *work* bound is separate and is what the packet path now
+//!   respects: the packet path is O(1) (hash lookups only, no table scan),
+//!   cap eviction is O(1), and the expiry sweep runs at most once per
+//!   `fail_window` from the driver's 1 Hz tick — never from a datagram
+//!   handler.  See [`FailGate`].
 //!
 //! # Event model
 //!
@@ -273,13 +282,194 @@ pub enum ManagerError {
 }
 
 // ---------------------------------------------------------------------------
-// Data-path failure gate (H1 review fix)
+// Data-path failure gate (H1 review fix; D24)
 // ---------------------------------------------------------------------------
 
+/// Per-source failure budget.
+///
+/// `tokens` is the remaining budget; `last_refill` is the instant of the last
+/// window refill (bucket creation counts as a refill).  A bucket older than
+/// `fail_window` is *logically* expired: the peek path treats it as absent
+/// and the consume path refills it to a full burst.  Expiry is therefore a
+/// property of the accounting, not of the table's physical contents.
 #[derive(Debug)]
 struct RateBucket {
     tokens: u32,
     last_refill: Instant,
+}
+
+/// Per-source data-path failure gate (D24).
+///
+/// # Bound
+///
+/// The table holds at most `max_fail_buckets` entries — a hard cap, enforced
+/// before every insert — and **not** one entry per live session.  The sid is
+/// cleartext in every packet header, so a party that observes a single packet
+/// learns a live sid and can then drive one bucket per source port; the
+/// table can be driven to its cap from a single live session.  The live
+/// session population is *not* a bound on this table, and `max_sessions` is
+/// not a bound on it either.
+///
+/// # Work
+///
+/// The packet path is O(1): [`FailGate::peek`] is one hash lookup and
+/// [`FailGate::consume`] is one hash lookup plus at most one insert and one
+/// O(1) cap eviction.  No packet path scans the table.  The only scans are
+/// off the packet path:
+///
+/// - [`FailGate::sweep`] reclaims expired buckets.  It runs at most once per
+///   `fail_window` (the driver calls it from its 1 Hz tick), so its cost is
+///   bounded by `max_fail_buckets` bucket visits per `fail_window`,
+///   independent of the packet rate.
+/// - the cap eviction pops one key from `order` — O(1), no scan.
+#[derive(Debug)]
+struct FailGate {
+    /// Tracked sources and their remaining failure budget.
+    buckets: HashMap<SocketAddr, RateBucket>,
+    /// Insertion order of `buckets`' keys.  The cap-eviction victim is the
+    /// front of this queue, so eviction is O(1) instead of a scan for the
+    /// least-recently-refilled bucket.
+    ///
+    /// Invariant: `order` holds exactly the keys of `buckets`, each once, so
+    /// `order.len() == buckets.len()`.  The sweep restores the invariant
+    /// after removing expired buckets; the eviction path removes from both.
+    order: VecDeque<SocketAddr>,
+    /// When the expiry sweep last ran (amortisation clock).
+    last_sweep: Instant,
+    /// Test instrumentation: the number of fail-gate table entries visited by
+    /// an operation that is not a plain hash lookup (cap evictions and sweep
+    /// passes).  The packet path must never move this counter.
+    #[cfg(test)]
+    table_visits: u64,
+    /// Test instrumentation: the number of expiry sweeps performed.
+    #[cfg(test)]
+    sweeps: u64,
+}
+
+impl FailGate {
+    fn new(now: Instant) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            order: VecDeque::new(),
+            last_sweep: now,
+            #[cfg(test)]
+            table_visits: 0,
+            #[cfg(test)]
+            sweeps: 0,
+        }
+    }
+
+    /// Number of tracked sources (diagnostic).
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Token check WITHOUT consuming, and WITHOUT allocating: report whether a
+    /// decrypt attempt for a *known* session may proceed.  A source with no
+    /// bucket — or with an expired one — has spent nothing yet, so a full
+    /// burst is assumed and no state is created (D24 lookup-first: buckets are
+    /// only materialised by a real failure).
+    fn peek(&self, from: SocketAddr, now: Instant, limits: &SessionLimits) -> bool {
+        if limits.max_fail_buckets == 0 {
+            // Degenerate configuration: fail closed (no data path).
+            return false;
+        }
+        match self.buckets.get(&from) {
+            // No bucket → nothing consumed, so nothing to gate on.
+            None => true,
+            Some(b) => {
+                if now.duration_since(b.last_refill) >= limits.fail_window {
+                    // Window elapsed: the bucket refills to a full burst on the
+                    // next real failure (see `consume`).
+                    return true;
+                }
+                b.tokens > 0
+            }
+        }
+    }
+
+    /// Consume one failure token (called only after a real AEAD failure).
+    ///
+    /// This is the only writer of the fail-gate table.  It performs no scan:
+    /// the cap is enforced by evicting the oldest-inserted tracked source
+    /// (O(1) — the front of `order`), and expiry is handled by the off-path
+    /// sweep.
+    fn consume(&mut self, from: SocketAddr, now: Instant, limits: &SessionLimits) {
+        if limits.max_fail_buckets == 0 {
+            // Degenerate configuration: fail closed (no data path).
+            return;
+        }
+        // Already tracked: charge the existing budget.  No eviction, no
+        // insert, no scan — the common case on the failure path.
+        if let Some(bucket) = self.buckets.get_mut(&from) {
+            if now.duration_since(bucket.last_refill) >= limits.fail_window {
+                bucket.tokens = limits.fail_burst;
+                bucket.last_refill = now;
+            }
+            bucket.tokens = bucket.tokens.saturating_sub(1);
+            return;
+        }
+        // A new source: make room first.  O(1) per eviction — `order` holds
+        // exactly the map's keys, so the front is a victim.  The victim is the
+        // *oldest-inserted* tracked source; it is never the source being
+        // inserted (that one is not tracked yet).
+        while self.buckets.len() >= limits.max_fail_buckets {
+            match self.order.pop_front() {
+                Some(victim) => {
+                    self.buckets.remove(&victim);
+                    #[cfg(test)]
+                    {
+                        self.table_visits += 1;
+                    }
+                }
+                // Unreachable while the `order`/`buckets` invariant holds.
+                None => break,
+            }
+        }
+        self.buckets.insert(
+            from,
+            RateBucket {
+                tokens: limits.fail_burst.saturating_sub(1),
+                last_refill: now,
+            },
+        );
+        self.order.push_back(from);
+        debug_assert_eq!(self.buckets.len(), self.order.len());
+    }
+
+    /// Reclaim expired buckets.  Runs from the driver's 1 Hz tick, never from
+    /// a datagram handler, and at most once per `fail_window`, so its cost is
+    /// bounded by `max_fail_buckets` bucket visits per window regardless of
+    /// the packet rate.
+    ///
+    /// Expiry is a *logical* property of the accounting — an expired bucket
+    /// is treated as absent by `peek` and refilled by `consume` — so skipping
+    /// a sweep never changes an accept/reject decision; it only leaves the
+    /// entry in the map for longer.
+    fn sweep(&mut self, now: Instant, limits: &SessionLimits) {
+        if self.buckets.is_empty() {
+            return;
+        }
+        if now.duration_since(self.last_sweep) < limits.fail_window {
+            return;
+        }
+        self.last_sweep = now;
+        #[cfg(test)]
+        let map_visits = self.buckets.len() as u64;
+        #[cfg(test)]
+        let order_visits = self.order.len() as u64;
+        let window = limits.fail_window;
+        self.buckets
+            .retain(|_, b| now.duration_since(b.last_refill) < window);
+        // Keep `order` in lockstep with `buckets`: the swept keys are gone.
+        let buckets = &self.buckets;
+        self.order.retain(|k| buckets.contains_key(k));
+        #[cfg(test)]
+        {
+            self.table_visits += map_visits + order_visits;
+            self.sweeps += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,31 +505,28 @@ pub struct ServerSessionManager {
     limits: SessionLimits,
     hs: ServerHandshake,
     sessions: HashMap<[u8; SESSION_ID_LEN], SessionEntry>,
-    fail_buckets: HashMap<SocketAddr, RateBucket>,
+    fail_gate: FailGate,
     pending_closed: VecDeque<ManagerEvent>,
 }
 
 impl ServerSessionManager {
     /// Create a server session manager.  Configuration is validated here
-    /// (version + non-empty roster) — fail closed (D12).
+    /// (version + non-empty roster + roster-size limit) — fail closed (D12).
     pub fn new(cfg: &ServerConfig, limits: SessionLimits) -> Result<Self, ManagerError> {
-        if cfg.version != crate::codec::PROTOCOL_VERSION {
-            return Err(ManagerError::InvalidConfig(format!(
-                "version {} unsupported (expected {})",
-                cfg.version,
-                crate::codec::PROTOCOL_VERSION
-            )));
-        }
-        if cfg.roster.is_empty() {
-            return Err(ManagerError::InvalidConfig(
-                "roster must not be empty (fail closed)".into(),
-            ));
-        }
+        // `ServerConfig::validate` is the single fail-closed validator
+        // (version, non-empty roster, roster-size limit).  Calling it here
+        // closes the struct-literal construction path: a config built by
+        // hand with an over-limit roster is rejected with a precise error
+        // instead of silently yielding a machine that trusts nobody.
+        cfg.validate().map_err(|e| match e {
+            HandshakeV2Error::InvalidConfig(msg) => ManagerError::InvalidConfig(msg),
+            other => ManagerError::Handshake(other),
+        })?;
         Ok(Self {
             limits,
             hs: ServerHandshake::new(cfg),
             sessions: HashMap::new(),
-            fail_buckets: HashMap::new(),
+            fail_gate: FailGate::new(Instant::now()),
             pending_closed: VecDeque::new(),
         })
     }
@@ -371,8 +558,12 @@ impl ServerSessionManager {
     }
 
     /// Number of data-path failure-gate buckets (diagnostics).
+    ///
+    /// Bounded by `max_fail_buckets`, not by the live-session population: a
+    /// party that learns a live sid (the sid is cleartext on the wire) can
+    /// drive one bucket per source port.
     pub fn fail_bucket_count(&self) -> usize {
-        self.fail_buckets.len()
+        self.fail_gate.len()
     }
 
     /// Process one received datagram (silent drop on anything irrelevant).
@@ -456,10 +647,10 @@ impl ServerSessionManager {
         if !self.sessions.contains_key(&sid) {
             return Ok(ManagerEvent::None);
         }
-        if !self.fail_gate_peek(from) {
+        let now = Instant::now();
+        if !self.fail_gate.peek(from, now, &self.limits) {
             return Ok(ManagerEvent::None);
         }
-        let now = Instant::now();
 
         let result = match self.sessions.get_mut(&sid) {
             None => return Ok(ManagerEvent::None),
@@ -501,7 +692,7 @@ impl ServerSessionManager {
                 Ok(ManagerEvent::Closed { sid, reason })
             }
             DataResult::Failed => {
-                self.fail_gate_consume(from);
+                self.fail_gate.consume(from, now, &self.limits);
                 Ok(ManagerEvent::None)
             }
         }
@@ -633,74 +824,11 @@ impl ServerSessionManager {
             }
         });
         out.extend(self.pending_closed.drain(..));
+        // Off-path fail-gate housekeeping: reclaim expired buckets.  This runs
+        // at most once per `fail_window` and never on the packet path, so the
+        // table's reclamation cost is independent of the packet rate (D24).
+        self.fail_gate.sweep(now, &self.limits);
         out
-    }
-
-    // -- data-path failure gate ----------------------------------------------
-
-    /// Token check WITHOUT consuming, and WITHOUT allocating: report whether a
-    /// decrypt attempt for a *known* session may proceed.  A source with no
-    /// bucket has spent nothing yet, so a full burst is assumed and no state is
-    /// created (D24 lookup-first: buckets are only materialised by a real
-    /// failure, which bounds the table by the active session population).
-    fn fail_gate_peek(&self, from: SocketAddr) -> bool {
-        if self.limits.max_fail_buckets == 0 {
-            // Degenerate configuration: fail closed (no data path).
-            return false;
-        }
-        match self.fail_buckets.get(&from) {
-            // No bucket → nothing consumed, so nothing to gate on.
-            None => true,
-            Some(b) => {
-                if Instant::now().duration_since(b.last_refill) >= self.limits.fail_window {
-                    // Window elapsed: the bucket refills to a full burst on the
-                    // next real failure (see `fail_gate_consume`).
-                    return true;
-                }
-                b.tokens > 0
-            }
-        }
-    }
-
-    /// Consume one failure token (called only after a real AEAD failure).
-    ///
-    /// The bucket is created on first failure — this is the only writer of the
-    /// fail-gate table.  Cap handling (prune stale, evict stalest at
-    /// `max_fail_buckets`) mirrors handshake_v2 `rate_ok`, but runs on the
-    /// failure path rather than on every datagram: after D24 the table can only
-    /// reach that size if the active session population itself reaches it.
-    fn fail_gate_consume(&mut self, from: SocketAddr) {
-        if self.limits.max_fail_buckets == 0 {
-            // Degenerate configuration: fail closed (no data path).
-            return;
-        }
-        let now = Instant::now();
-        if self.fail_buckets.len() > 32 {
-            self.fail_buckets
-                .retain(|_, b| now.duration_since(b.last_refill) < self.limits.fail_window);
-        }
-        // MSRV 1.85: nested if-let (let chains stabilize in 1.88). Cannot be
-        // collapsed via a `&& let` chain without breaking the MSRV gate.
-        #[allow(clippy::collapsible_if)]
-        if self.fail_buckets.len() >= self.limits.max_fail_buckets {
-            if let Some(stale) = self
-                .fail_buckets
-                .iter()
-                .min_by_key(|(_, b)| b.last_refill)
-                .map(|(k, _)| *k)
-            {
-                self.fail_buckets.remove(&stale);
-            }
-        }
-        let bucket = self.fail_buckets.entry(from).or_insert_with(|| RateBucket {
-            tokens: self.limits.fail_burst,
-            last_refill: now,
-        });
-        if now.duration_since(bucket.last_refill) >= self.limits.fail_window {
-            bucket.tokens = self.limits.fail_burst;
-            bucket.last_refill = now;
-        }
-        bucket.tokens = bucket.tokens.saturating_sub(1);
     }
 }
 
@@ -4441,11 +4569,17 @@ mod tests {
         );
     }
 
-    /// Fail-gate state is bounded by the ACTIVE SESSION POPULATION, not by
-    /// unauthenticated source diversity: N live sessions can produce at most N
-    /// buckets, no matter how much traffic arrives from elsewhere.
+    /// D24 (corrected): the fail-gate table is bounded by
+    /// `max_fail_buckets` — **not** by the live-session population.
+    ///
+    /// Two facts are pinned here:
+    ///
+    /// 1. *Lookup-first still holds*: traffic naming an unowned sid allocates
+    ///    no bucket at all, whatever the source diversity.
+    /// 2. *One bucket per failing source*: the table tracks the sources that
+    ///    actually failed an AEAD decrypt, not the sessions.
     #[test]
-    fn d24_fail_gate_state_is_bounded_by_session_population() {
+    fn d24_fail_gate_state_is_bounded_by_the_configured_cap() {
         let (cc, _sc) = shared_configs();
         let mut limits = SessionLimits::default();
         limits.max_sessions = 4;
@@ -4469,6 +4603,11 @@ mod tests {
             let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 1024 + port));
             let _ = manager.handle_datagram(&unknown, from).unwrap();
         }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "unknown-sid traffic must allocate no fail-gate bucket"
+        );
 
         // Every live session's source now fails AEAD once.
         for (ws, from) in sessions.iter_mut() {
@@ -4481,7 +4620,7 @@ mod tests {
         assert_eq!(
             manager.fail_bucket_count(),
             sessions.len(),
-            "bucket count must equal the session population ({}), got {}",
+            "one bucket per failing source ({}), got {}",
             sessions.len(),
             manager.fail_bucket_count()
         );
@@ -4495,6 +4634,331 @@ mod tests {
             manager.fail_bucket_count(),
             sessions.len(),
             "hostile churn must not grow the fail-gate table"
+        );
+    }
+
+    /// D24 (corrected): ONE live session is enough to drive the fail-gate
+    /// table to its cap.
+    ///
+    /// The sid is cleartext in every packet header, so a party that observes a
+    /// single packet learns a live sid and can then present AEAD-failing
+    /// traffic from a fresh source port per datagram.  This is the direct
+    /// counterexample to the superseded D24 claim that the table was "bounded
+    /// by the active session population": the table tracks *failing sources*,
+    /// and its bound is `max_fail_buckets`.
+    #[test]
+    fn d24_one_live_session_can_drive_the_table_to_the_cap() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_fail_buckets = 64;
+        let mut manager = server_manager(limits);
+        let (_c, mut ws) = established_client_session(&mut manager, &cc, SID);
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+        assert_eq!(manager.session_count(), 1, "exactly one live session");
+
+        // 200 distinct source ports, each presenting one AEAD-failing
+        // datagram that names that session's sid.
+        for port in 0..200u16 {
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 30), 1024 + port));
+            assert!(matches!(
+                manager.handle_datagram(&tampered(&good), from).unwrap(),
+                ManagerEvent::None
+            ));
+        }
+        assert_eq!(
+            manager.fail_bucket_count(),
+            64,
+            "one live session is enough to reach the configured cap"
+        );
+        assert!(
+            manager.fail_bucket_count() > manager.session_count(),
+            "the table is NOT bounded by the live-session population"
+        );
+    }
+
+    /// The AEAD-failure hot path performs NO table scan, and the cap
+    /// eviction visits exactly ONE table entry (O(1)), not the whole table.
+    ///
+    /// `FailGate::table_visits` counts every fail-gate table entry visited by
+    /// an operation that is not a plain hash lookup (cap evictions and sweep
+    /// passes).  The pre-fix path ran a full `retain` on every failing packet
+    /// once the table exceeded 32 entries, and a full `min_by_key` on every
+    /// insert at the cap.
+    ///
+    /// The assertion is structural (a counter), not a timing measurement.
+    #[test]
+    fn d24_repeated_aead_failure_does_no_table_scan() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_fail_buckets = 64;
+        let mut manager = server_manager(limits);
+        let (_c, mut ws) = established_client_session(&mut manager, &cc, SID);
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+        let src = |port: u16| SocketAddr::from((Ipv4Addr::new(198, 51, 100, 40), port));
+
+        // Fill the table to its cap.  No eviction is needed yet, so no table
+        // entry is visited at all.
+        for port in 0..64u16 {
+            let _ = manager
+                .handle_datagram(&tampered(&good), src(1024 + port))
+                .unwrap();
+        }
+        assert_eq!(manager.fail_bucket_count(), 64, "the table is at the cap");
+        assert_eq!(
+            manager.fail_gate.table_visits, 0,
+            "filling the table must not scan it"
+        );
+
+        // One more source: the cap is enforced by sacrificing exactly ONE
+        // entry (the oldest-inserted one).  A scan-based eviction would visit
+        // all 64.
+        let _ = manager
+            .handle_datagram(&tampered(&good), src(2048))
+            .unwrap();
+        assert_eq!(
+            manager.fail_gate.table_visits, 1,
+            "the cap eviction must visit exactly one table entry"
+        );
+        assert_eq!(manager.fail_bucket_count(), 64, "the cap still holds");
+
+        // 1,000 further AEAD failures from an already-tracked source.  The
+        // source's budget runs out after `fail_burst` of them and the gate
+        // then drops its packets before the decrypt; either way the packet
+        // path must not visit a single table entry.
+        let tracked = src(1024 + 63); // still tracked: it was not the victim
+        for _ in 0..1000 {
+            let _ = manager.handle_datagram(&tampered(&good), tracked).unwrap();
+        }
+        assert_eq!(
+            manager.fail_gate.table_visits, 1,
+            "repeated AEAD failure must not visit a single table entry"
+        );
+        assert_eq!(
+            manager.fail_gate.sweeps, 0,
+            "the expiry sweep must never run on the packet path"
+        );
+        assert_eq!(manager.fail_bucket_count(), 64, "the table did not grow");
+
+        // The sacrificed source (the oldest-inserted one) is re-inserted on
+        // its next failure, which costs exactly one further eviction — the
+        // documented FIFO victim policy, and still O(1) per packet.
+        let _ = manager
+            .handle_datagram(&tampered(&good), src(1024))
+            .unwrap();
+        assert_eq!(
+            manager.fail_gate.table_visits, 2,
+            "re-inserting an evicted source costs exactly one eviction"
+        );
+        assert_eq!(manager.fail_bucket_count(), 64, "the cap still holds");
+    }
+
+    /// The unknown-sid path touches no fail-gate state at all: no bucket is
+    /// allocated and no table entry is visited.
+    #[test]
+    fn d24_unknown_sid_path_visits_no_fail_gate_entry() {
+        let (_, sc) = shared_configs();
+        let mut manager =
+            ServerSessionManager::new(&sc, SessionLimits::default()).expect("manager");
+        let pkt = d24_data_packet([0xEE; SESSION_ID_LEN]);
+        for port in 0..1000u16 {
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 45), 1024 + port));
+            let _ = manager.handle_datagram(&pkt, from).unwrap();
+        }
+        assert_eq!(manager.fail_bucket_count(), 0, "no bucket allocated");
+        assert_eq!(
+            manager.fail_gate.table_visits, 0,
+            "the unknown-sid path must not visit a fail-gate table entry"
+        );
+    }
+
+    /// Cap-boundary behaviour is defined and pinned: the table never exceeds
+    /// `max_fail_buckets`, and at the cap the *oldest-inserted* tracked
+    /// source is sacrificed (its budget is reset).  Nothing about the
+    /// session, the wire, or the other sources' budgets changes.
+    #[test]
+    fn d24_cap_boundary_behaviour_is_defined() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.fail_burst = 2;
+        limits.max_fail_buckets = 4;
+        let mut manager = server_manager(limits.clone());
+        let (_c, mut ws) = established_client_session(&mut manager, &cc, SID);
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+        let src = |port: u16| SocketAddr::from((Ipv4Addr::new(198, 51, 100, 70), port));
+
+        // Four distinct failing sources fill the table to its cap.
+        for port in 0..4u16 {
+            let _ = manager
+                .handle_datagram(&tampered(&good), src(1024 + port))
+                .unwrap();
+        }
+        assert_eq!(manager.fail_bucket_count(), 4, "the table is at the cap");
+
+        // The oldest-inserted source exhausts its budget and is gated.
+        let oldest = src(1024);
+        let _ = manager.handle_datagram(&tampered(&good), oldest).unwrap();
+        assert!(
+            !manager.fail_gate.peek(oldest, Instant::now(), &limits),
+            "the exhausted source is gated"
+        );
+
+        // A fifth source arrives: the cap is enforced by sacrificing the
+        // oldest-inserted tracked source — O(1), one table entry visited.
+        let newcomer = src(2000);
+        let _ = manager.handle_datagram(&tampered(&good), newcomer).unwrap();
+        assert_eq!(manager.fail_bucket_count(), 4, "the cap still holds");
+        assert_eq!(
+            manager.fail_gate.table_visits, 1,
+            "the eviction visits exactly one table entry"
+        );
+        assert!(
+            manager.fail_gate.peek(oldest, Instant::now(), &limits),
+            "the sacrificed source's budget is reset"
+        );
+
+        // Sustained churn never grows the table, and the session survives.
+        for port in 0..500u16 {
+            let _ = manager
+                .handle_datagram(&tampered(&good), src(3000 + port))
+                .unwrap();
+            assert!(
+                manager.fail_bucket_count() <= 4,
+                "the table stays within the cap"
+            );
+        }
+        assert_eq!(manager.session_count(), 1, "the session survives");
+    }
+
+    /// Expiry is a property of the *accounting*: a source that has not failed
+    /// for a full `fail_window` gets a fresh budget, whether or not the
+    /// physical entry has been reclaimed yet.
+    #[test]
+    fn d24_expired_budget_is_refreshed_for_the_source() {
+        let (_, sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.fail_burst = 2;
+        let mut manager = ServerSessionManager::new(&sc, limits.clone()).expect("manager");
+        let t0 = Instant::now();
+        let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 50), 1234));
+
+        // No bucket yet: the gate allows the packet and allocates nothing.
+        assert!(manager.fail_gate.peek(from, t0, &limits));
+        assert_eq!(manager.fail_bucket_count(), 0, "peek must not allocate");
+
+        // Two real failures exhaust the budget.
+        manager.fail_gate.consume(from, t0, &limits);
+        manager.fail_gate.consume(from, t0, &limits);
+        assert!(
+            !manager.fail_gate.peek(from, t0, &limits),
+            "the budget is exhausted"
+        );
+
+        // One window later the budget is refreshed (logical expiry) and the
+        // source is allowed again.
+        let t1 = t0 + limits.fail_window;
+        assert!(
+            manager.fail_gate.peek(from, t1, &limits),
+            "an expired budget refills"
+        );
+        manager.fail_gate.consume(from, t1, &limits);
+        assert!(
+            manager.fail_gate.peek(from, t1, &limits),
+            "a refilled budget has a full burst again"
+        );
+        manager.fail_gate.consume(from, t1, &limits);
+        assert!(
+            !manager.fail_gate.peek(from, t1, &limits),
+            "the refilled budget is charged again"
+        );
+    }
+
+    /// Stale entries are physically reclaimed by the off-path sweep, at most
+    /// one pass per `fail_window`, on the driver's tick (virtual clock).
+    #[test]
+    fn d24_expired_buckets_are_reclaimed_by_the_sweep() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.max_fail_buckets = 64;
+        let mut manager = server_manager(limits.clone());
+        let (_c, mut ws) = established_client_session(&mut manager, &cc, SID);
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+        for port in 0..8u16 {
+            let from = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 60), 1024 + port));
+            let _ = manager.handle_datagram(&tampered(&good), from).unwrap();
+        }
+        assert_eq!(manager.fail_bucket_count(), 8, "8 failing sources tracked");
+
+        let t0 = Instant::now();
+        // A tick inside the window does not reclaim: the sweep is amortized to
+        // at most one pass per `fail_window`.
+        let _ = manager.tick(t0);
+        assert_eq!(manager.fail_bucket_count(), 8, "no sweep inside the window");
+        assert_eq!(manager.fail_gate.sweeps, 0, "no sweep pass yet");
+
+        // One window later the next tick reclaims every stale entry.
+        let _ = manager.tick(t0 + limits.fail_window + Duration::from_secs(1));
+        assert_eq!(
+            manager.fail_bucket_count(),
+            0,
+            "stale entries are reclaimed"
+        );
+        assert_eq!(manager.fail_gate.sweeps, 1, "exactly one sweep pass");
+
+        // And a further tick inside the next window does not sweep again.
+        let _ = manager.tick(t0 + limits.fail_window + Duration::from_secs(2));
+        assert_eq!(
+            manager.fail_gate.sweeps, 1,
+            "the sweep is amortized to one pass per window"
+        );
+        assert_eq!(manager.session_count(), 1, "the session is unaffected");
+    }
+
+    /// Per-source accounting (D24): a source that exhausts its budget is
+    /// gated, and a different source is not starved by it.  Successes never
+    /// consume budget and never allocate a bucket.
+    #[test]
+    fn d24_per_source_budget_is_not_shared_between_sources() {
+        let (cc, _sc) = shared_configs();
+        let mut limits = SessionLimits::default();
+        limits.fail_burst = 2;
+        let mut manager = server_manager(limits.clone());
+        let (_c, mut ws) = established_client_session(&mut manager, &cc, SID);
+        let good = ws.encrypt(MessageType::Data, &[0u8; PAYLOAD_LEN]).unwrap();
+        let a = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 80), 1024));
+        let b = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 81), 1024));
+
+        // Source A fails twice: its budget is exhausted.
+        for _ in 0..2 {
+            assert!(matches!(
+                manager.handle_datagram(&tampered(&good), a).unwrap(),
+                ManagerEvent::None
+            ));
+        }
+        assert!(
+            !manager.fail_gate.peek(a, Instant::now(), &limits),
+            "A is gated"
+        );
+        assert_eq!(manager.fail_bucket_count(), 1, "only A is tracked");
+
+        // A is dropped without decrypt work — even for a VALID packet.
+        assert!(matches!(
+            manager.handle_datagram(&good, a).unwrap(),
+            ManagerEvent::None
+        ));
+
+        // Source B is untouched: its valid packet still decrypts and the
+        // session roams to it (§10).  A's exhaustion must not starve B.
+        assert!(
+            matches!(
+                manager.handle_datagram(&good, b).unwrap(),
+                ManagerEvent::AppData { .. }
+            ),
+            "B must not be starved by A"
+        );
+        assert_eq!(
+            manager.fail_bucket_count(),
+            1,
+            "B's success must not allocate a bucket"
         );
     }
 
