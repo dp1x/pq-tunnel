@@ -841,6 +841,7 @@ impl ServerSessionManager {
                     match inner.msg_type {
                         MessageType::Data => DataResult::Payload(inner),
                         MessageType::Cover => DataResult::Payload(inner),
+                        MessageType::TunData => DataResult::Payload(inner),
                         MessageType::Close => DataResult::PeerClose,
                         // In-session control message: consumed internally,
                         // never relayed to the application, and never charged

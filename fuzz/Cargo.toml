@@ -112,5 +112,9 @@ path = "fuzz_targets/relay_overlay.rs"
 name = "manager_churn"
 path = "fuzz_targets/manager_churn.rs"
 
+[[bin]]
+name = "dataplane_overlay"
+path = "fuzz_targets/dataplane_overlay.rs"
+
 [workspace]
 resolver = "2"

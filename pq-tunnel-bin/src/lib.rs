@@ -18,6 +18,7 @@ pub mod identity;
 pub mod keygen;
 pub mod packet_len;
 pub mod relay;
+pub mod tun_policy;
 pub mod v2_client;
 pub mod v2_server;
 

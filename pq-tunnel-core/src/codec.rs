@@ -198,6 +198,9 @@ pub enum MessageType {
     Cover = 0x02,
     /// Clean session teardown (PROTOCOL_SPEC §8.4).
     Close = 0x03,
+    /// System-wide TUN/IP inner packet (D33). Carries the overlay-framed
+    /// inner IP packet. Distinct from `Data` (the D18 relay frame).
+    TunData = 0x04,
 }
 
 impl MessageType {
@@ -212,6 +215,7 @@ impl MessageType {
             0x01 => Ok(Self::Data),
             0x02 => Ok(Self::Cover),
             0x03 => Ok(Self::Close),
+            0x04 => Ok(Self::TunData),
             _ => Err(CodecError::InvalidMessageType(v)),
         }
     }
@@ -604,6 +608,7 @@ impl fmt::Display for MessageType {
             MessageType::Data => write!(f, "data"),
             MessageType::Cover => write!(f, "cover"),
             MessageType::Close => write!(f, "close"),
+            MessageType::TunData => write!(f, "tun-data"),
         }
     }
 }
@@ -682,11 +687,12 @@ mod tests {
             (MessageType::Data, 0x01),
             (MessageType::Cover, 0x02),
             (MessageType::Close, 0x03),
+            (MessageType::TunData, 0x04),
         ] {
             assert_eq!(mt.as_u8(), v);
             assert_eq!(MessageType::from_u8(v).unwrap(), mt);
         }
-        assert!(MessageType::from_u8(0x04).is_err());
+        assert!(MessageType::from_u8(0x05).is_err());
         assert!(MessageType::from_u8(0xFF).is_err());
     }
 

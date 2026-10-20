@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod dataplane;
 pub mod envelope;
 pub mod error;
 mod handshake_v2;
@@ -33,8 +34,13 @@ pub use codec::{
     MessageType, PACKET_NONCE_LEN, PACKET_SIZE, PAYLOAD_LEN, PROTOCOL_VERSION, PacketHeader,
     SESSION_ID_LEN, WirePacket,
 };
+pub use dataplane::{
+    DEFAULT_REASSEMBLY_DEADLINE, DataplaneError, FRAG_CAP, FeedOutcome, MAX_BYTES_PER_SESSION,
+    MAX_ENTRIES_PER_SESSION, MAX_FRAG_COUNT, MAX_IP_PACKET_LEN, OVERLAY_HEADER_LEN,
+    OVERLAY_VERSION, OverlayError, OverlayHeader, Reassembler, expected_frag_len,
+    fragment_ip_packet, replay_span_ok, validate_ip_packet,
+};
 pub use envelope::{CipherSession, Role};
-pub use error::CodecError;
 pub use metrics::SessionMetrics;
 pub use scheduler::{CoverPolicy, CoverScheduler, DEFAULT_COVER_RATE_BPS, interval_from_rate_bps};
 pub use state::{InvalidTransition, ProtocolState};
