@@ -17,6 +17,7 @@ use pq_tunnel_core::{
     SessionLimits, UdpTransport, run_client_manager, run_server_manager,
 };
 use pq_tunnel_lib::forward::Forwarder;
+use pq_tunnel_lib::forward::egress::EgressPolicy;
 use pq_tunnel_lib::relay;
 use pq_tunnel_lib::relay::{decode_relay, encode_relay};
 use tokio::net::UdpSocket;
@@ -132,7 +133,10 @@ async fn e2e_smoke_forwarding_roundtrip() {
         .await
     });
     let app_task = tokio::spawn(async move {
-        let mut forwarder = Forwarder::new(false, cmd_tx);
+        // The harness relays to a 127.0.0.1 echo fixture; the production
+        // egress policy denies loopback, so the test fixture uses the
+        // test-only `AllowLoopback` policy.
+        let mut forwarder = Forwarder::new_with_policy(false, cmd_tx, EgressPolicy::AllowLoopback);
         while let Some(ntf) = srv_app_rx.recv().await {
             match ntf {
                 ManagerNotification::Data { sid, inner } => {

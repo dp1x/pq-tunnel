@@ -31,6 +31,7 @@ use pq_tunnel_core::{
     run_server_manager,
 };
 use pq_tunnel_lib::forward::Forwarder;
+use pq_tunnel_lib::forward::egress::EgressPolicy;
 use pq_tunnel_lib::relay;
 use pq_tunnel_lib::relay::{decode_relay, encode_relay};
 use tokio::net::UdpSocket;
@@ -292,7 +293,11 @@ pub async fn build_gate(policy: CoverPolicy) -> Gate {
         .await;
     });
     let app_task = tokio::spawn(async move {
-        let mut forwarder = Forwarder::new(false, cmd_srv_tx);
+        // The harness relays to a 127.0.0.1 echo fixture, which the
+        // production egress policy correctly denies. The test-only
+        // `AllowLoopback` policy re-opens it for the fixture.
+        let mut forwarder =
+            Forwarder::new_with_policy(false, cmd_srv_tx, EgressPolicy::AllowLoopback);
         while let Some(ntf) = srv_app_rx.recv().await {
             match ntf {
                 ManagerNotification::Data { sid, inner } => {

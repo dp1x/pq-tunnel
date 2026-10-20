@@ -49,9 +49,9 @@ pub async fn run(args: &ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Provision (fail closed): a missing/malformed identity or an empty roster
     // aborts before any socket is opened (D12).
     let keypair = identity::load_identity(identity_path)?;
-    let roster = identity::load_roster(roster_path)?;
+    let roster = identity::load_roster_with_limit(roster_path, args.max_roster_size)?;
 
-    let cfg = HandshakeV2ServerConfig::new(keypair, roster);
+    let cfg = HandshakeV2ServerConfig::with_roster_limit(keypair, roster, args.max_roster_size);
     let cover = crate::cover_policy_from_args(args.no_cover, args.cover_mbps)?;
     let mut manager = ServerSessionManager::new(&cfg, SessionLimits::default())
         .map_err(|e| format!("server session manager init failed: {e}"))?;
