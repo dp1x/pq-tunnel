@@ -18,6 +18,8 @@ pub mod identity;
 pub mod keygen;
 pub mod packet_len;
 pub mod relay;
+#[cfg(feature = "tun")]
+pub mod tun;
 pub mod tun_policy;
 pub mod v2_client;
 pub mod v2_server;
@@ -137,9 +139,11 @@ pub struct ServerArgs {
     /// integration-sign-off marker.
     #[arg(long, default_value_t = 86_400)]
     pub lifetime_cap_secs: u64,
-}
 
-/// `pq-tunnel client` arguments.
+    /// Run in system-wide TUN mode (D33): client TUN device + raw IP.
+    #[arg(long)]
+    pub tun: bool,
+}
 #[derive(ClapArgs, Debug, Clone)]
 pub struct ClientArgs {
     /// Server UDP address to connect to.
@@ -183,9 +187,11 @@ pub struct ClientArgs {
     /// integration-sign-off marker.
     #[arg(long, default_value_t = 86_400)]
     pub lifetime_cap_secs: u64,
-}
 
-/// Largest `--cover-mbps` value whose bitrate is representable in a `u64`:
+    /// Run in system-wide TUN mode (D33).
+    #[arg(long)]
+    pub tun: bool,
+}
 /// `u64::MAX / 1_000_000` = 18_446_744_073_709 Mbps (~1.8e19 bit/s).  Any
 /// larger value is rejected rather than wrapped (D29).
 ///
@@ -285,8 +291,45 @@ pub async fn main_entry() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::Keygen(args) => keygen::run(&args),
-        Command::Server(args) => v2_server::run(&args).await,
-        Command::Client(args) => v2_client::run(&args).await,
+        Command::Server(args) => {
+            #[cfg(feature = "tun")]
+            if args.tun {
+                return crate::tun::server::run(
+                    args.listen,
+                    args.identity.as_deref(),
+                    args.roster.as_deref(),
+                    args.cover_mbps,
+                    args.no_cover,
+                    args.lifetime_cap_secs,
+                    args.max_roster_size,
+                )
+                .await;
+            }
+            v2_server::run(&args).await
+        }
+        Command::Client(args) => {
+            #[cfg(feature = "tun")]
+            if args.tun {
+                let identity = args
+                    .identity
+                    .as_deref()
+                    .ok_or("client TUN requires --identity")?;
+                let server_key = args
+                    .server_key
+                    .as_deref()
+                    .ok_or("client TUN requires --server-key")?;
+                return crate::tun::client::run(
+                    args.remote,
+                    identity,
+                    server_key,
+                    crate::cover_policy_from_args(args.no_cover, args.cover_mbps)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+                    args.lifetime_cap_secs,
+                )
+                .await;
+            }
+            v2_client::run(&args).await
+        }
     }
 }
 

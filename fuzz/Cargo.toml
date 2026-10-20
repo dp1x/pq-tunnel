@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 pq-tunnel-core = { path = "../pq-tunnel-core" }
 pq-crypto = { path = "../pq-crypto" }
-pq-tunnel-bin = { path = "../pq-tunnel-bin" }
+pq-tunnel-bin = { path = "../pq-tunnel-bin", default-features = false }
 libfuzzer-sys = "=0.4.13"
 
 # ---- provenance pins -------------------------------------------------

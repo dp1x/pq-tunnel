@@ -12,9 +12,15 @@ path = "src/lib.rs"
 name = "pq-tunnel"
 path = "src/main.rs"
 
+[features]
+default = ["tun"]
+tun = ["dep:tun"]
+proxy = []
+
 [dependencies]
 pq-tunnel-core = { path = "../pq-tunnel-core" }
 pq-crypto = { path = "../pq-crypto" }
+tun = { version = "0.8", optional = true }
 tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
@@ -22,7 +28,3 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 sha2 = "0.10"
-
-[features]
-default = []
-proxy = []

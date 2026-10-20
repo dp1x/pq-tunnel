@@ -971,7 +971,30 @@ impl ServerSessionManager {
         self.send_encrypted(sid, MessageType::Data, &padded)
     }
 
-    /// Encrypt a cover packet on `sid` (Phase 7 shaper hook).
+    /// Encrypt one overlay record on `sid` as `MessageType::TunData`.
+    ///
+    /// The payload must be exactly one [`PAYLOAD_LEN`] slot (overlay header +
+    /// fragment).  This is the transport contract for the system-wide TUN
+    /// data plane (D33): callers fragment the inner IP packet first via
+    /// `dataplane::fragment_ip_packet` and send one slot per record.
+    pub fn tun_outbound(
+        &mut self,
+        sid: &[u8; SESSION_ID_LEN],
+        payload: &[u8],
+    ) -> Result<ManagerEvent, ManagerError> {
+        if payload.len() != PAYLOAD_LEN {
+            return Err(ManagerError::Session(SessionError::Codec(
+                CodecError::WrongLength {
+                    field: "payload",
+                    expected: PAYLOAD_LEN,
+                    got: payload.len(),
+                },
+            )));
+        }
+        let mut slot = [0u8; PAYLOAD_LEN];
+        slot.copy_from_slice(payload);
+        self.send_encrypted(sid, MessageType::TunData, &slot)
+    }
     ///
     /// B4: a cover emission is **outbound** traffic and deliberately does
     /// *not* refresh `last_activity`.  The idle timeout counts authenticated
@@ -1916,6 +1939,29 @@ impl ClientSessionManager {
             return self.enqueue(padded.to_vec());
         }
         self.send_encrypted(MessageType::Data, &padded)
+    }
+
+    /// Encrypt one overlay record as `MessageType::TunData` (client side).
+    ///
+    /// Requires an established session; when none exists the packet is
+    /// dropped (the TUN read loop gates on `is_ready`).  The payload must
+    /// be exactly one [`PAYLOAD_LEN`] slot.
+    pub fn tun_outbound(&mut self, payload: &[u8]) -> Result<ManagerEvent, ManagerError> {
+        if payload.len() != PAYLOAD_LEN {
+            return Err(ManagerError::Session(SessionError::Codec(
+                CodecError::WrongLength {
+                    field: "payload",
+                    expected: PAYLOAD_LEN,
+                    got: payload.len(),
+                },
+            )));
+        }
+        if self.session.is_none() {
+            return Ok(ManagerEvent::None);
+        }
+        let mut slot = [0u8; PAYLOAD_LEN];
+        slot.copy_from_slice(payload);
+        self.send_encrypted(MessageType::TunData, &slot)
     }
 
     /// Buffer an application payload for a session that does not exist yet.
