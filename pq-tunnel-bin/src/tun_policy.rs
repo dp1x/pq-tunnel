@@ -173,9 +173,7 @@ pub fn validate_inner_packet(pkt: &[u8], assignment: &ClientAssignment) -> Packe
     let port = extract_dst_port(pkt);
     // Reuse shipped egress guard logic via forward::egress if available.
     // Here we inline the minimal guard to avoid coupling.
-    if let Some(p) = port
-        && p == 0
-    {
+    if port == Some(0) {
         return PacketVerdict::PortZero;
     }
     // Destination policy: deny loopback/unspecified/multicast/broadcast/metadata.

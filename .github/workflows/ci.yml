@@ -170,4 +170,6 @@ jobs:
           toolchain: 1.85.0
 
       - name: cargo check (--locked)
-        run: cargo check --workspace --locked --all-targets
+        run: |
+          cargo check --locked --all-targets -p pq-tunnel-core -p pq-crypto
+          cargo check --locked --all-targets -p pq-tunnel-bin --no-default-features

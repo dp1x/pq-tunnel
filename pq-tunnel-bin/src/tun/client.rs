@@ -80,14 +80,19 @@ pub async fn run(
                     ManagerNotification::Data { inner, .. } => {
                         if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                             let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
-                            if let pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt) = reasm.feed(&slot, std::time::Instant::now())
-                                && !is_boundary_dropped(&pkt) && validate_inner(&pkt) {
-                                let devw = dev_arc.clone();
-                                let p = pkt.clone();
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    let mut d = devw.lock().unwrap();
-                                    let _ = d.write(&p);
-                                }).await;
+                            match reasm.feed(&slot, std::time::Instant::now()) {
+                                pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt)
+                                    if !is_boundary_dropped(&pkt) && validate_inner(&pkt) =>
+                                {
+                                    let devw = dev_arc.clone();
+                                    let p = pkt.clone();
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        let mut d = devw.lock().unwrap();
+                                        let _ = d.write(&p);
+                                    })
+                                    .await;
+                                }
+                                _ => {}
                             }
                         }
                     }
