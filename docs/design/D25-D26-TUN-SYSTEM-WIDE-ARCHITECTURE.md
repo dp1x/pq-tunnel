@@ -1,12 +1,31 @@
 # D25 / D26 — System-Wide TUN Architecture: TUN Integration, Routing, Dual-Stack and Length Semantics
 
 **Status:** **SUPERSEDED (design content) — DO NOT IMPLEMENT FROM THIS DOCUMENT.**
-**Superseded by:** [`D30-corrected-system-wide-data-plane.md`](D30-corrected-system-wide-data-plane.md).
+**Superseded by:** [`D30-corrected-system-wide-data-plane.md`](D30-corrected-system-wide-data-plane.md),
+which is itself **superseded** by the corrected successor
+[`D33-corrected-tun-architecture.md`](D33-corrected-tun-architecture.md).
+**Implement from D33, not from D30 and not from this document.**
 **Author:** TRACK A design pass
 **Date:** 2026-10-05
 **Supersedes/scope:** Does **not** alter D19 (cover scheduling), D22 (metadata target is
 reduction, not anonymity), D24 (data-path failure budget), or the fixed 1280-byte
 `PACKET_SIZE` wire record.
+
+> **Status note (2026-10-21).** This document remains **SUPERSEDED**; its
+> technical content is not resurrected by the later passes. The correction
+> chain is
+> `D25/D26 -> D30 -> D33`.
+> D30 re-derived the architecture and corrected the D25/D26 defects listed in
+> the supersession notice below; D30 has since been **superseded in turn** by
+> **D33**, which corrects five substantive errors and two stale claims in D30
+> (notably: the inner IP-level fragment *rejection* rule, the optimistic
+> reassembly deadline, the u32 `datagram_id`, and the reading of the
+> 1280-byte constant as an outer IP packet length). The product framing in
+> §0 below -- Tunnel as a system-wide OS/networking tool, D18 as relay
+> infrastructure rather than the product model -- remains correct and is
+> confirmed by the owner.
+> **Reference:** [`D30-corrected-system-wide-data-plane.md`](D30-corrected-system-wide-data-plane.md)
+> and [`D33-corrected-tun-architecture.md`](D33-corrected-tun-architecture.md).
 
 > ### SUPERSESSION NOTICE — READ THIS FIRST
 >

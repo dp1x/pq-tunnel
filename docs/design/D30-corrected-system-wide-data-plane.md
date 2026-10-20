@@ -1173,3 +1173,422 @@ None of these may be guessed.
   https://crates.io/api/v1/crates/tun/0.8.14
 * `setsockopt` (Winsock) — `SO_*` options; `IP_UNICAST_IF` / `IP_DONTFRAGMENT` live in the `IPPROTO_IP`/`IPPROTO_IPV6` option pages.
   https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-setsockopt
+
+---
+
+# Amendment A — Verified status, corrections and successor (2026-10-21)
+
+**Status after this amendment:** **SUPERSEDED by
+[`D33-corrected-tun-architecture.md`](D33-corrected-tun-architecture.md).**
+This document is retained as the record of the first correction pass. Its
+*structure*, its hard-fact table and its verdict on D25/D26 remain useful; its
+data-plane design does not. **Do not implement from this document alone** --
+implement from D33.
+
+**Baseline for this amendment:** commit `c6c0f12373f45cba02f6e8f44b386ea46d5da659`.
+Every `file:line` below was re-verified against that commit. The working tree
+is concurrently under edit; the *constructs* are unchanged.
+
+**What was re-verified:** every in-tree claim in §0 (F1 to F13) and every
+external claim in §0 (E1 to E15) was re-derived against the baseline and, for
+the platform and RFC claims, against the primary sources. Five substantive
+**errors** and two **stale claims** were found and are corrected below. The
+byte arithmetic is corrected and shown. The "is a TUN library the first native
+dependency" premise is corrected.
+
+---
+
+## A.1 Claims that are CORRECT (retain)
+
+| # | Claim | Comment |
+|---|---|---|
+| F1 | The Tunnel record is the UDP payload at 1280 B; the cleartext header is 17 B; the inner plaintext is 1247 B (type + direction + 1245 B payload). | **Confirmed.** `codec.rs:112`, `:141`, `:144`, `:147`. The compile-time partition assertion is at `codec.rs:152-160`. |
+| F2 | The 8-byte `packet_nonce` is cleartext and strictly monotonic, incremented once per emitted packet for both data and cover (one shared `send_counter`). | **Confirmed.** `envelope.rs:138`, `:257-300`. |
+| F3 | The replay window is 1024 counters (`WINDOW_BITS`); a counter more than 1024 below the highest accepted is rejected. | **Confirmed.** `replay.rs:37`, `:88-140`. |
+| F4 | Cover is a separate driver path at a user-tunable rate (`--cover-mbps`), default 2 Mbit/s = 5.12 ms/packet = 195.3125 pkt/s. | **Confirmed.** `pq-tunnel-bin/src/lib.rs:105`, `pq-tunnel-core/src/scheduler.rs:36`. |
+| F5 | The relay framing is `family(1)‖addr(4\|16)‖port(2)‖len(2)‖datagram`; only family `0x04`/`0x06` decode; anything else is dropped silently by the forwarder. | **Confirmed.** `pq-tunnel-bin/src/relay.rs:36-48`, `:103-145`; `pq-tunnel-bin/src/forward.rs:134-141`. |
+| F6 | `MAX_DATAGRAM_V4 = 1236 < PAYLOAD_LEN = 1245`; the relay framing is single-slot by construction and cannot carry a 1500-byte IP packet. | **Confirmed.** `relay.rs:41-48`. |
+| F7 | `ip_packet_len()` exists, is fuzz-covered, and has **no production caller**. | **Confirmed.** `pq-tunnel-bin/src/packet_len.rs:13-39`; the only callers are its own tests and `fuzz/fuzz_targets/relay_overlay.rs:20,76`. |
+| F8 | The outer transport binds **one** address family and is deliberately left unconnected so peer roaming works. | **Confirmed.** `pq-tunnel-core/src/udp.rs:97-106`. |
+| F9 | `PROTOCOL_VERSION = 1`, strict equality, no negotiation, no downgrade window, bound into the transcript bodies and the KDF `info` strings. | **Confirmed.** `codec.rs:82`, `:281-288`. |
+| F10 | The handshake's `FragmentAssembler` tolerates out-of-order delivery and ignores duplicates, and `frag_total` is pinned per message type. | **Confirmed.** |
+| F11 | The identity file is written with `File::create` + `rename` and reserved with `create_new`, with **no permission/ACL hardening**. | **Confirmed.** `pq-tunnel-bin/src/identity.rs:325-352`. This is a standalone defect worth fixing regardless of the TUN work. |
+| F12 | `SessionLimits::default()` = `max_sessions: 64`, `idle_timeout: 5 min`, `liveness_timeout: 30 s`, `handshake_timeout: 30 s`, `lifetime_cap: None`. | **Confirmed.** `pq-tunnel-core/src/session_manager.rs:145-156`. |
+| F13 | `ManagerEvent::Send { packets: Vec<WirePacket>, peer }` already exists; a multi-datagram burst channel is available without a new event type. | **Confirmed.** `session_manager.rs:193-198`. |
+| E1 to E5, E7 to E13, E15 | The RFC 8200 §4.5 / §5 quotations, the RFC 8201 Appendix A "no DF bit" statement, the RFC 791 §3.1 total-length definition, the Linux `IPV6_MIN_MTU` enforcement, the `ip-rule(8)` / `ip-route(8)` semantics, the `wg-quick` formulation, the Windows `New-NetRoute` parameter set, the Windows firewall precedence, the Wintun distribution model, and the RFC 1812 §5.3.8 / RFC 2827 references. | **Confirmed against the primary sources.** The Windows firewall precedence was re-read verbatim: "Explicitly defined allow rules take precedence over the default block setting. Explicit block rules take precedence over any conflicting allow rules. More specific rules take precedence over less specific rules, except if there are explicit block rules... Outbound rules follow the same precedence behaviors." The `ip-rule(8)` man page was re-read verbatim; the rule ordering is "in order of increasing number", with the first match terminating the lookup. |
+| E14 | The `tun` crate 0.8.14 `Configuration` surface: a single `address`/`netmask`/`destination`/`broadcast`, plus `mtu`, `up`, `platform_config`; and the claim that it "installs **no routes**". | **PARTIALLY CONFIRMED -- one clause is wrong.** The single-address shape is confirmed, and `Layer::L3` is the default (`#[default] L3`). But the crate's Windows device path **does** install a default route: `src/platform/windows/device.rs` calls `sys::set_default_route(luid_value, gw)` when `config.destination` is an IPv4 address, sets the interface metric from `config.metric`, and sets the DNS servers from `platform_config.dns_servers`. **There is no `routes` field**, and no DNS field on `Configuration` (DNS is Windows-only, via `platform_config`). See §A.5. |
+| §3.1 | The overlay must be dispatched by a new `MessageType`, not an in-band payload byte. | **Agreed.** Retained and sharpened in D33 §7. |
+| §4.1 | `datagram_id` must be independent of the AEAD counter. | **Agreed.** Retained in D33 §4.5. |
+| §4.6 | The **IP header** is authoritative for the length; `ip_total_len` is a cross-check. | **Agreed.** Retained in D33 §4.1. |
+| §4.7 | No tunnel-layer retransmission; the loss amplification is stated rather than hidden. | **Agreed.** Retained in D33 §4.7 and §1.5. |
+| §8.1 | The routing recipe must use a **destination** exception; a source-address selector creates the loop it claims to prevent. | **Agreed.** Retained in D33 §2.3. |
+| §9 | Bump `PROTOCOL_VERSION` and add `MessageType::TunData = 0x04`, so a v1 peer fails the **handshake** rather than becoming a silent black hole. | **Agreed.** Retained in D33 §7. |
+| §12 | The tunnel must not synthesise ICMP PTB or frag-needed; it is a link, not a router. | **Agreed.** Retained in D33 §2.8.3. |
+| §14.1 | The list of D25/D26 claims that are correct (C1 to C14). | **Retained as the record of the D25/D26 verdict.** |
+| §14.2 | The list of D25/D26 claims that are wrong (W1 to W16). | **Retained as the record of the D25/D26 verdict.** In particular W8 (the source-selector loop) and W10 are the two findings that survive into D33. |
+
+---
+
+## A.2 Claims that are WRONG (five errors), with the corrected value
+
+### A.2.1 ERROR 1 -- the "reject inner IP-level fragments" rule is wrong
+
+**Where:** §2.2 item 4 ("IP-level fragment rejection (mandatory, new)"), invariant
+I9, the fail-secure matrix row "Server receives an inner IP-level fragment |
+Silent drop", and gap M-M.
+
+**Why it is wrong:** IPv4 IP-level fragmentation is **routine** on a TUN. When
+the host's IP stack sends a datagram larger than the TUN MTU to an off-link
+destination, it fragments the datagram itself and writes each fragment to the
+TUN. Rejecting them breaks large UDP transfers and any TCP transfer that
+exceeds the inner MTU. The premise -- that carrying IP fragments into the
+server's kernel would create "a second, conflicting reassembly layer" -- is
+wrong because the *only* reassembly layer is the end hosts' own IP stacks,
+which reassemble exactly as they would on a physical link. A link carries
+fragments; it does not refuse them.
+
+**Corrected rule:**
+
+- The tunnel **carries inner IP-level fragments verbatim**. The end hosts' IP
+  stacks reassemble them.
+- The tunnel **does not implement IP-level reassembly**. That is the whole
+  subject of RFC 6946 §1 to §4: IPv6 fragment-based attacks are why the
+  mechanism is discouraged.
+- The tunnel's **overlay-level** fragmentation is a separate, private mechanism
+  and is explicitly **not** RFC 8200 fragmentation.
+- An IPv6 **atomic fragment** (Fragment header, offset 0, M flag 0) must be
+  processed in isolation by the receiving host (RFC 6946 §4). Because the
+  tunnel delivers the inner datagram to the host's stack as a whole packet, the
+  host's stack does that; the tunnel needs no special case.
+- The **source-address check** and the **destination policy** apply to every
+  inner packet, fragment or not. The **L4 port-0** rule is evaluated only where
+  a transport header is parsable (the first fragment of an IPv4 datagram, or
+  any IPv6 datagram whose Fragment header has offset 0), and is skipped
+  otherwise.
+
+**Corrected invariant I9:** "The server accepts an inner packet only if its
+source equals the client's assigned address, its destination passes the D28
+policy, and -- where a transport header is parsable -- its L4 port is non-zero."
+**Corrected I9 corollary I10** and the fail-secure matrix row become "inner IP-
+level fragment: **carried verbatim**; the source and destination checks still
+apply."
+
+### A.2.2 ERROR 2 -- the reassembly deadline is optimistic and rate-blind
+
+**Where:** §4.8 "Timeout" and "Effective ceiling from the replay window",
+unresolved question Q1, and invariant I7's reliance on it.
+
+**Why it is wrong:** §4.8 says "the *effective* deadline is
+`min(configured, replay-window horizon)`" and recommends 2 s, but it does not
+carry the horizon's **rate dependence** through to the recommendation. The
+horizon is `1024 / (record rate)`, so it collapses as the tunnel rate rises:
+
+| Aggregate record rate | Records per second | Replay horizon |
+|---|---|---|
+| Default cover alone (195.3125 pkt/s, 2 Mbit/s) | 195.3125 | **5.24 s** |
+| 10 Mbit/s of tunnel payload | 976.5625 | **1.05 s** |
+| 100 Mbit/s of tunnel payload | 9 765.625 | **105 ms** |
+
+**A 2 s deadline is therefore unreachable at any useful tunnel rate.** Above
+about 5.2 Mbit/s of aggregate record rate (1024 counters / 2 s = 512 counters/s
+= 512 x 1280 B x 8) the replay window binds first, the late fragment is
+rejected by the replay window regardless of the deadline, and the datagram is
+lost no matter what the deadline is. §4.8's own framing -- "A configured
+deadline longer than the replay horizon is not 'safer' -- it is meaningless" --
+applies with full force to its own recommended value.
+
+**Corrected value:** the deadline remains a **fixed, cover-independent
+parameter** (default 2 s, derived from a latency budget, never from
+`--cover-mbps`), **and** the achievability of that deadline is bounded by the
+rate-dependent replay horizon. A deployment that needs a 2 s deadline at a high
+tunnel rate must raise `WINDOW_BITS`: 2 s at 100 Mbit/s needs about 19 532
+counters, so 32 768 (a 4096-byte bitmap per session per direction) would
+suffice. That is a change to a protocol-relevant parameter and must land in
+the same change set as the overlay.
+
+**Additional arithmetic error inside §4.8.** The sentence "at 10 Mbit/s of
+tunnel payload (9 765 pkt/s) they span **105 ms**" is internally consistent
+but mislabels the rate: 9 765 records/s at 1280 B per record is **100 Mbit/s**,
+not 10. At 10 Mbit/s the rate is 976.6 records/s and the horizon is **1.05 s**.
+
+### A.2.3 ERROR 3 -- the `datagram_id` is a u32
+
+**Where:** §3.3 (the overlay layout, `datagram_id` at offset 6, 4 bytes),
+§4.1, rule S4, invariant I8 and unresolved question Q11.
+
+**Why it is wrong:** a u32 exhausts far inside a normal session. At the maximum
+plausible tunnel rate of 1 Gbit/s = 97 656.25 records/s, a 1280-byte inner
+packet consumes 2 records, so 48 828.125 datagrams/s.
+`2^32 / 48 828.125 = 87 964 s = **about 24.4 hours**`. §4.3's S4 acknowledges
+this ("at a 10^5 pkt/s burst rate it is ~12 h, which is why the rekey (not an id
+wrap) is the correct mechanism") -- but that makes the u32 an id that expires
+on a routine daily rekey cycle, which is a needless coupling between the
+overlay and the session lifetime.
+
+**Corrected value:** `datagram_id` is a **u64**, allocated from a
+per-(session, direction) counter that never wraps and whose exhaustion triggers
+a rekey (mirroring `CloseReason::NonceExhausted`, `session_manager.rs:172`,
+`envelope.rs:269-273`). The exhaustion arithmetic: `2^64 / 48 828.125 =
+3.778e14 s = about 1.2e7 years`. The cost is 4 bytes per record (0.3 % of the
+slot).
+
+### A.2.4 ERROR 4 -- the `datagram_tag` covers only fragment 0
+
+**Where:** §3.3 (`datagram_tag` at offset 10: "the first 32 bits of SHA-256
+over fragment 0"), §4.2 (the paragraph defining it), optional optimisation O1,
+and gap M-L.
+
+**Why it is wrong:** the tag's stated purpose is to detect a datagram assembled
+from fragments of **two different** inner IP packets. A digest computed over
+fragment 0 only cannot detect a splice in any *later* fragment: replacing
+fragment 3 of datagram X with fragment 3 of datagram Y leaves the fragment-0
+digest unchanged, so the corruption is written to the host's IP stack. The
+control does not do the job it was introduced to do.
+
+**Corrected value:** a **whole-packet CRC-32**, computed by the sender over the
+entire inner IP packet *before* fragmenting and carried identically in every
+fragment, recomputed by the receiver over the assembled buffer before the
+write. A mismatch poisons the entry. CRC-32 is an **error-detecting code, not
+a cryptographic primitive** -- the security boundary remains the AEAD
+(`envelope.rs:257-301`); the CRC's job is to catch a *sender bug*, not an
+adversary. It needs **no new dependency** (`sha2` is already a core
+dependency, but a CRC is the right tool). SHA-256 is dropped from the hot
+path.
+
+### A.2.5 ERROR 5 -- the overlay byte arithmetic
+
+**Where:** §3.3 (the overlay layout table), §4.5, §5 ("Bounds summary"),
+§1.1, invariant I4.
+
+**Why it is wrong:** the overlay header is specified as **14 bytes**
+(`OVERLAY_HEADER_LEN = 14`, `FRAG_CAP = PAYLOAD_LEN - 14 = 1231`). That is
+self-consistent but it is not the best available shape, and it forces two
+unnecessary compromises: the `datagram_id` has to be a u32 to fit in 4 bytes
+(ERROR 3), and the integrity tag has to be a fragment-0 digest to fit in 4
+bytes without an alignment hole (ERROR 4).
+
+**Corrected value:** a **20-byte** overlay header, which buys both corrections
+at once:
+
+```
+ off  size  field            semantics
+   0    1   overlay_version  MUST be 0x01
+   1    1   frag_index       0-based; 0 <= idx < frag_count
+   2    1   frag_count       1 <= count <= 54
+   3    1   flags            reserved, MUST be 0
+   4    2   ip_total_len     BE u16: total length of THIS inner IP packet
+   6    2   reserved         MUST be 0
+   8    8   datagram_id      BE u64: per-(session, direction) sender-assigned
+  16    4   datagram_crc     BE u32: CRC-32 of the WHOLE inner IP packet
+  20 1225   ip_fragment      this fragment's slice of the inner IP packet
+```
+
+Derived constants (compile-time asserted):
+
+```
+OVERLAY_HEADER_LEN = 20
+FRAG_CAP           = PAYLOAD_LEN - 20 = 1225
+MAX_FRAG_COUNT     = ceil(65535 / 1225) = 54
+MAX_IP_PACKET_LEN  = 65535
+```
+
+The knock-on arithmetic, all re-derived:
+
+| Quantity | D30 (14-byte header) | Corrected (20-byte header) |
+|---|---|---|
+| `FRAG_CAP` | 1231 | **1225** |
+| `MAX_FRAG_COUNT` = ceil(65535 / FRAG_CAP) | 54 (53 x 1231 = 65 243 < 65 535 <= 66 474) | **54** (53 x 1225 = 64 925 < 65 535 <= 66 300) -- unchanged |
+| Records per datagram at inner MTU 1280 | ceil(1280 / 1231) = 2 | **2** -- unchanged |
+| Records per datagram at inner MTU 1500 | ceil(1500 / 1231) = 2 | **2** -- unchanged |
+| Tunnel efficiency at inner MTU 1280 | 1280 / 2560 = 50 % | **50 %** -- unchanged |
+| Per-record header overhead | 14 B | **20 B** (+6 B = 0.48 % of the slot) |
+| `datagram_id` width | u32 | **u64** |
+| Integrity field | fragment-0 SHA-256 prefix | **whole-packet CRC-32** |
+
+The structural fact that §1.1 gets right is unchanged: a 1280-byte inner IP
+packet can **never** fit in one Tunnel record, because the payload is 1245 B
+and even a zero-length overlay header would leave 1245 < 1280. The tunnelled
+link is therefore necessarily a fragmenting link, and the efficiency at inner
+MTU 1280 is exactly 50 %.
+
+---
+
+## A.3 Stale claims (two), with the corrected reading
+
+### A.3.1 STALE 1 -- the attribution of a false claim to `codec.rs:94-98`
+
+**Where:** §1.2 ("`codec.rs:94-98` claims the 1280-byte record 'fits a
+standard IPv4/IPv6 MTU (1500 / 1280)'. **That is false for the 1280 case.**"),
+§7.3 (the last bullet: "The codec's doc comment (`codec.rs:94-98`) must be
+corrected"), mandatory item M14, and the W10 row of §14.2.
+
+**Why it is stale:** the baseline codec **already states the correct thing**.
+`pq-tunnel-core/src/codec.rs:98-106` reads:
+
+> "**This is the Tunnel record size, not an outer IP packet size.** The record
+> is the UDP payload, so the complete outer packet is 1280 + 8 (UDP) + 20
+> (IPv4) = **1308 bytes**, or 1280 + 8 + 40 (IPv6) = **1328 bytes**.
+> Consequently the record fits a 1500-byte-MTU path (1472 bytes of usable IPv4
+> UDP payload, 1452 for IPv6) but **not** a 1280-byte-MTU path: on IPv6 the
+> outer packet is 48 bytes over, and IPv6 routers do not fragment (RFC 8200
+> §4.5 ...). A deployment therefore requires a path MTU of at least 1328 bytes,
+> which is a stated deployment assumption rather than a guarantee."
+
+**Corrected status:** the codec needs **no change**. D30's §1.2 arithmetic
+(1308 / 1328) and its §1.2 conclusion ("a hard minimum path MTU of 1328 B") are
+correct and are retained. What is obsolete is the *instruction* to correct the
+codec (M14) and the *citation* that attributes the false claim to it (W10).
+D30's own §0 verification-status paragraph already hedges this correctly --
+"the false '1280 fits a 1280-MTU path' claim in `pq-tunnel-core/src/codec.rs`"
+is **not** in the baseline; the baseline codec is already corrected.
+
+**The residual D30 correctly identified still stands:** a fixed record size is
+still a path-MTU assumption, so PROTOCOL_SPEC §7.5's "SHOULD avoid depending
+on ... specific MTU sizes" is not met by the current record. That is a
+**documentation** obligation (`PROTOCOL_SPEC.md` must record the path-MTU
+assumption explicitly), not a **codec-comment** obligation.
+
+### A.3.2 STALE 2 -- the 1280-byte constant is the UDP payload, not the outer IP packet
+
+**Where:** the framing throughout §0 F1, §1.2, §5 and §7.1; and, in the
+original brief, the premise that "the 1280-byte constant is the outer IP packet
+length".
+
+**Why it is stale:** `PACKET_SIZE = 1280` (`codec.rs:112`) is the **UDP
+payload** -- one `WirePacket` is one UDP datagram
+(`pq-tunnel-core/src/udp.rs:142` sends `packet.as_bytes()`; `udp.rs:143-150`
+rejects any other length; the receive buffer is `PACKET_SIZE + 1` at
+`udp.rs:168` so an oversize datagram is detected rather than truncated). The
+**outer IP packet** is:
+
+```
+outer IPv4 total length = 20 (IPv4 header) + 8 (UDP) + 1280 (record) = 1308 bytes
+outer IPv6 total length = 40 (IPv6 header) + 8 (UDP) + 1280 (record) = 1328 bytes
+```
+
+**Corrected value, and the minimum outer path MTU:**
+
+| Path | Usable UDP payload | Fits the 1280-byte record? |
+|---|---|---|
+| IPv4, 1500-byte MTU | 1500 - 20 - 8 = 1472 | **Yes** -- 192 bytes spare |
+| IPv6, 1500-byte MTU | 1500 - 40 - 8 = 1452 | **Yes** -- 172 bytes spare |
+| IPv4, 1280-byte MTU | 1280 - 20 - 8 = 1252 | **No** -- 28 bytes over |
+| IPv6, 1280-byte MTU | 1280 - 40 - 8 = 1232 | **No** -- 48 bytes over |
+
+**Minimum required outer path MTU: 1308 bytes (IPv4 outer) / 1328 bytes (IPv6
+outer).** Any reader who takes 1280 as an IP packet size will size the path
+MTU wrongly and will believe a 1280-byte-MTU path is adequate.
+
+A related coincidence worth recording: 1232 = 1280 - 40 - 8 is the same number
+RFC 6946 §3 quotes for an IPv6 atomic fragment's payload ("the payload may have
+to be reduced to 1232 octets (1280 minus 40 for the IPv6 header and 8 for the
+Fragment header)").
+
+---
+
+## A.4 False premises from the original brief (corrected here, not in D30)
+
+| Brief premise | Correct position |
+|---|---|
+| "RFC 8200 §6.4 (Packet Too Big / ICMPv6 Type 2)" | **There is no RFC 8200 §6.4.** RFC 8200 §6 is "Flow Labels". ICMPv6 Type 2 (Packet Too Big) is **RFC 4443 §3.2**. |
+| "RFC 8981 (IPv6 fragment header size)" | **There is no such RFC.** RFC 8981 is *Temporary Address Extensions for Stateless Address Autoconfiguration in IPv6*. The Fragment header's fixed 8-octet size is **RFC 8200 §4.5**, and RFC 6946 §4 refers to "the length of the Fragment Header (that is, 8)". |
+| "A TUN library choice may be the FIRST native dependency and that changes the CI matrix" | **False premise -- see A.5.** |
+
+---
+
+## A.5 The corrected "is a TUN library the first native dependency" premise
+
+**D30's §13 Q3 and the original brief treat the TUN library as a native-build
+and CI-matrix problem. It is not. It is an MSRV problem and a binary-artifact
+problem.**
+
+**Verified** (independently re-checked against the crates.io API for this
+amendment):
+
+| crate | version | edition | declared `rust-version` |
+|---|---|---|---|
+| `tun` | 0.8.14 | **2024** | **none declared** |
+| `wintun-bindings` | 0.7.39 | **2024** | **none declared** |
+
+- **No native compilation is introduced.** Neither `tun` nor `wintun-bindings`
+  depends on `cc`, `cmake` or `bindgen`. `wintun-bindings` uses `libloading`
+  (a runtime DLL load) and `windows-sys`. **The CI matrix does not change for
+  native-build reasons.** (The `tun` crate does have a build script --
+  `serde_json` as a build dependency -- so `Cargo.lock` gains a build-time
+  dependency and `fuzz/Cargo.lock` must be re-synced, or the CI lock-sync gate
+  at `.github/workflows/ci.yml:68-107` fails.)
+- **The MSRV headroom is exactly zero.** The workspace MSRV is **1.85**
+  (`Cargo.toml:12`) and the workspace itself is edition 2024 (`Cargo.toml:11`).
+  A crate that is edition 2024 requires Rust 1.85 or newer to compile, and
+  neither crate declares a `rust-version` to enforce it. Every other transitive
+  dependency of `tun` declares at most 1.71, so the edition-2024 pair is the
+  binding constraint -- exactly at the floor. **Mitigation: pin exactly**
+  (`tun = "=0.8.14"`), and add a CI assertion that `wintun-bindings` stays at
+  or below 0.7.39. Exact pinning is established practice here
+  (`Cargo.toml:23`, `x25519-dalek = "=3.0.0-rc.1"`). A future `tun` release
+  could move to edition 2027 or require 1.86 and break the MSRV job
+  (`ci.yml:157-173`) with no warning.
+- **The real new supply-chain surface is a runtime binary artifact.**
+  `wintun.dll` must ship next to the executable. It is a third-party signed
+  binary, and `cargo-audit` **cannot see it** -- the CI audit job
+  (`ci.yml:129-155`) audits the Rust lockfiles only. **Owner decision
+  required:** vendor the DLL with a pinned SHA-256, or download and verify it
+  at install time. A partial mitigation is available in the dependency itself:
+  both `tun` and `wintun-bindings` expose a `verify_binary_signature` feature
+  (`tun` forwards it to `wintun-bindings/verify_binary_signature`), so
+  Authenticode verification of the DLL is available as a feature flag rather
+  than requiring a bespoke check. Hand-rolling the Wintun IOCTL protocol
+  against `windows-sys` alone would remove the `wintun-bindings` crate but
+  **not** the DLL.
+- **The crate itself assigns the DLL's provenance to the caller.** Verified
+  from `tun` 0.8.14 `src/platform/windows/mod.rs`: the default
+  `PlatformConfig::wintun_file` is `"wintun.dll"` (so the DLL is looked up in
+  the working directory), and the crate's own documentation of
+  `PlatformConfig::wintun_file` states: "Use a custom path to the wintun.dll
+  instead of looking in the working directory. **Security note: It is up to
+  the caller to ensure that the library can be safely loaded from the indicated
+  path.**" A deployment must therefore pin the path explicitly and verify the
+  artifact, rather than accepting the default lookup.
+- **The crate's `Configuration` surface, verified from its source**
+  (`src/configuration.rs`): a **single** `address` / `netmask` /
+  `destination` / `broadcast` (one family only), plus `tun_name`,
+  `platform_config`, `mtu`, `up`/`down`, `layer`, `metric` (Windows),
+  `ring_capacity` (Windows), `raw_fd` / `raw_handle`, `close_fd_on_drop`
+  (Unix), and a **deprecated** `queues` (always 1). **No `routes` field** and
+  **no DNS field on `Configuration`**; DNS is Windows-only, via
+  `platform_config.dns_servers`. `Layer::L3` is the default (`#[default] L3`).
+  **Correction to D30's E14:** the crate **does** install a default route on
+  the Windows path (`sys::set_default_route` when `config.destination` is an
+  IPv4 address), and it sets the interface metric and the DNS servers. The
+  crate's Windows IPv6 support is limited: `Device::address()` finds only an
+  IPv4 address and `Device::set_address()` returns `unimplemented!("do not
+  support IPv6 yet")` for an IPv6 address.
+
+---
+
+## A.6 The successor
+
+**[`D33-corrected-tun-architecture.md`](D33-corrected-tun-architecture.md) is
+the corrected successor to this document.** The chain is now:
+
+```
+D25 / D26  (SUPERSEDED -- do not implement)
+     |
+     v
+D30        (SUPERSEDED by D33 -- the record of the first correction pass)
+     |
+     v
+D33        (the corrected end-to-end TUN/IP architecture)
+```
+
+D33 carries forward everything this document got right (the hard-fact table,
+the §14 verdict on D25/D26, the version-bump reasoning, the destination-exception
+routing recipe, the IP-header-authoritative rule, the no-retransmission rule
+and its loss-amplification cost), and replaces the five items corrected in
+§A.2. D33 also adds the parts D30 left open: the platform-specific
+implementation graph per OS with the rollback path and the Windows stale-route
+failure mode, the prioritised independently-shippable milestones with their
+test plans and the riskiest stage named, and an explicit list of what could
+**not** be verified.
+
+**Do not implement from this document.**
