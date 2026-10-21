@@ -126,6 +126,7 @@ pub async fn run(
             },
             Some(pkt) = tun_rx.recv() => {
                 eprintln!("server: TUN read {} bytes", pkt.len());
+                eprintln!("server: TUN hdr {:?}", &pkt[..pkt.len().min(20)]);
                 if is_boundary_dropped(&pkt) { eprintln!("server: boundary dropped"); continue; }
                 if !validate_inner(&pkt) { eprintln!("server: invalid inner"); continue; }
                 if let Some(sid) = current_sid {
