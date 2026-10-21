@@ -70,7 +70,9 @@ pub async fn run(
             r = udp.recv() => match r {
                 Err(_) => {}
                 Ok((pkt, from)) => {
-                    match manager.handle_datagram(&pkt, from) {
+                    let hd = manager.handle_datagram(&pkt, from);
+                    eprintln!("client: handle_datagram => {:?}", hd);
+                    match hd {
                         Ok(pq_tunnel_core::ManagerEvent::Send { packets, peer }) => {
                             for p in packets { let _ = udp.send_to(&p, peer).await; }
                         }
