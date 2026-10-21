@@ -5,7 +5,7 @@ set -euo pipefail
 
 BIN="${1:-./target/debug/pq-tunnel}"
 WORK="$(mktemp -d)"
-trap 'cleanup' EXIT
+trap 'rc=$?; echo "=== server.log ==="; cat "$WORK/server.log" 2>/dev/null || true; echo "=== client.log ==="; cat "$WORK/client.log" 2>/dev/null || true; cleanup; exit $rc' EXIT
 
 cleanup() {
     set +e
