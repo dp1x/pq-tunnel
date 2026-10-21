@@ -78,6 +78,7 @@ pub async fn run(
                             let _ = udp.send_to(&packet, peer).await;
                         }
                         Ok(pq_tunnel_core::ManagerEvent::AppData { inner, .. }) => {
+                            eprintln!("client: AppData msg_type {:?}", inner.msg_type);
                             if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                                 let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
                                 match reasm.feed(&slot, std::time::Instant::now()) {
