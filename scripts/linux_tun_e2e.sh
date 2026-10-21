@@ -40,7 +40,7 @@ ip -n serverns addr add 192.0.2.1/32 dev lo
 ip -n serverns addr add 2001:db8::1/128 dev lo
 
 # Start server.
-ip netns exec serverns "$BIN" server --tun \
+ip netns exec serverns env RUST_LOG=debug "$BIN" server --tun \
     --listen 10.200.0.2:4433 \
     --identity "$WORK/server.pqti" \
     --roster "$WORK/roster.pqti" \
@@ -48,7 +48,7 @@ ip netns exec serverns "$BIN" server --tun \
 SERVER_PID=$!
 
 # Start client.
-ip netns exec clientns "$BIN" client --tun \
+ip netns exec clientns env RUST_LOG=debug "$BIN" client --tun \
     --remote 10.200.0.2:4433 \
     --identity "$WORK/client.pqti" \
     --server-key "$WORK/server.pub" \
@@ -60,9 +60,15 @@ sleep 8
 
 echo "=== processes ==="
 ps aux | grep pq-tunnel | grep -v grep || true
-echo "=== client ns routes ==="
+echo "=== client ns rules ==="
+ip -n clientns rule show
+ip -n clientns -6 rule show
+echo "=== client ns routes main ==="
 ip -n clientns route show
 ip -n clientns -6 route show
+echo "=== client ns routes table 100 ==="
+ip -n clientns route show table 100
+ip -n clientns -6 route show table 100
 echo "=== server ns routes ==="
 ip -n serverns route show
 ip -n serverns -6 route show
