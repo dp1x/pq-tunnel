@@ -84,6 +84,7 @@ pub async fn run(
                                     pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt)
                                         if !is_boundary_dropped(&pkt) && validate_inner(&pkt) =>
                                     {
+                                        eprintln!("client: TUN write {} bytes", pkt.len());
                                         let _ = tun_writer.write(&pkt);
                                     }
                                     _ => {}
@@ -98,6 +99,7 @@ pub async fn run(
                 }
             },
             Some(pkt) = tun_rx.recv() => {
+                eprintln!("client: TUN read {} bytes", pkt.len());
                 if is_boundary_dropped(&pkt) { continue; }
                 if !validate_inner(&pkt) { continue; }
                 static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

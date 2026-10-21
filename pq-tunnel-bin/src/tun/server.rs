@@ -83,6 +83,7 @@ pub async fn run(
                             let _ = udp.send_to(&packet, p).await;
                         }
                         Ok(pq_tunnel_core::ManagerEvent::AppData { sid, inner }) => {
+                            eprintln!("server: AppData sid");
                             current_sid = Some(sid);
                             if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                                 let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
@@ -93,6 +94,7 @@ pub async fn run(
                                     pq_tunnel_core::dataplane::FeedOutcome::Complete(ipkt)
                                         if validate_inner_packet(&ipkt, &assignment) == PacketVerdict::Allow =>
                                     {
+                                        eprintln!("server: TUN write {} bytes", ipkt.len());
                                         let _ = tun_writer.write(&ipkt);
                                     }
                                     _ => {}
@@ -118,6 +120,7 @@ pub async fn run(
                 }
             },
             Some(pkt) = tun_rx.recv() => {
+                eprintln!("server: TUN read {} bytes", pkt.len());
                 if is_boundary_dropped(&pkt) { continue; }
                 if !validate_inner(&pkt) { continue; }
                 if let Some(sid) = current_sid {
