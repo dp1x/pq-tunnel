@@ -126,18 +126,32 @@ pub async fn run(
             },
             Some(pkt) = tun_rx.recv() => {
                 eprintln!("server: TUN read {} bytes", pkt.len());
-                if is_boundary_dropped(&pkt) { continue; }
-                if !validate_inner(&pkt) { continue; }
+                if is_boundary_dropped(&pkt) { eprintln!("server: boundary dropped"); continue; }
+                if !validate_inner(&pkt) { eprintln!("server: invalid inner"); continue; }
                 if let Some(sid) = current_sid {
                     static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                     let id = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Ok(slots) = pq_tunnel_core::dataplane::fragment_ip_packet(&pkt, id) {
-                        for slot in slots {
-                            if let Ok(pq_tunnel_core::ManagerEvent::SendPacket { packet, peer: p }) = manager.tun_outbound(&sid, &slot) {
-                                let _ = udp.send_to(&packet, p).await;
+                    match pq_tunnel_core::dataplane::fragment_ip_packet(&pkt, id) {
+                        Ok(slots) => {
+                            eprintln!("server: fragmented into {} slots", slots.len());
+                            for slot in slots {
+                                match manager.tun_outbound(&sid, &slot) {
+                                    Ok(pq_tunnel_core::ManagerEvent::SendPacket { packet, peer: p }) => {
+                                        eprintln!("server: sending reply slot");
+                                        let _ = udp.send_to(&packet, p).await;
+                                    }
+                                    other => {
+                                        eprintln!("server: tun_outbound {:?}", other);
+                                    }
+                                }
                             }
                         }
+                        Err(e) => {
+                            eprintln!("server: fragment error {:?}", e);
+                        }
                     }
+                } else {
+                    eprintln!("server: no current sid");
                 }
             }
             _ = ticker.tick() => {
