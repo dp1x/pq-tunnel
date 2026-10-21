@@ -83,7 +83,6 @@ pub async fn run(
                             let _ = udp.send_to(&packet, p).await;
                         }
                         Ok(pq_tunnel_core::ManagerEvent::AppData { sid, inner }) => {
-                            eprintln!("server: AppData sid");
                             current_sid = Some(sid);
                             if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                                 let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
@@ -91,18 +90,12 @@ pub async fn run(
                                     .entry(sid)
                                     .or_insert_with(|| pq_tunnel_core::dataplane::Reassembler::new(REASSEMBLY_DEADLINE));
                                 match reasm.feed(&slot, std::time::Instant::now()) {
-                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(ipkt) => {
-                                        eprintln!("server: reassembled {} bytes", ipkt.len());
-                                        let v = validate_inner_packet(&ipkt, &assignment);
-                                        eprintln!("server: verdict {:?}", v);
-                                        if v == PacketVerdict::Allow {
-                                            eprintln!("server: TUN write {} bytes", ipkt.len());
-                                            let _ = tun_writer.write(&ipkt);
-                                        }
+                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(ipkt)
+                                        if validate_inner_packet(&ipkt, &assignment) == PacketVerdict::Allow =>
+                                    {
+                                        let _ = tun_writer.write(&ipkt);
                                     }
-                                    other => {
-                                        eprintln!("server: feed outcome {:?}", other);
-                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -125,34 +118,18 @@ pub async fn run(
                 }
             },
             Some(pkt) = tun_rx.recv() => {
-                eprintln!("server: TUN read {} bytes", pkt.len());
-                eprintln!("server: TUN hdr {:?}", &pkt[..pkt.len().min(20)]);
-                if is_boundary_dropped(&pkt) { eprintln!("server: boundary dropped"); continue; }
-                if !validate_inner(&pkt) { eprintln!("server: invalid inner"); continue; }
+                if is_boundary_dropped(&pkt) { continue; }
+                if !validate_inner(&pkt) { continue; }
                 if let Some(sid) = current_sid {
                     static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                     let id = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    match pq_tunnel_core::dataplane::fragment_ip_packet(&pkt, id) {
-                        Ok(slots) => {
-                            eprintln!("server: fragmented into {} slots", slots.len());
-                            for slot in slots {
-                                match manager.tun_outbound(&sid, &slot) {
-                                    Ok(pq_tunnel_core::ManagerEvent::SendPacket { packet, peer: p }) => {
-                                        eprintln!("server: sending reply slot");
-                                        let _ = udp.send_to(&packet, p).await;
-                                    }
-                                    other => {
-                                        eprintln!("server: tun_outbound {:?}", other);
-                                    }
-                                }
+                    if let Ok(slots) = pq_tunnel_core::dataplane::fragment_ip_packet(&pkt, id) {
+                        for slot in slots {
+                            if let Ok(pq_tunnel_core::ManagerEvent::SendPacket { packet, peer: p }) = manager.tun_outbound(&sid, &slot) {
+                                let _ = udp.send_to(&packet, p).await;
                             }
                         }
-                        Err(e) => {
-                            eprintln!("server: fragment error {:?}", e);
-                        }
                     }
-                } else {
-                    eprintln!("server: no current sid");
                 }
             }
             _ = ticker.tick() => {

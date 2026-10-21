@@ -1584,7 +1584,6 @@ impl ClientSessionManager {
         from: SocketAddr,
     ) -> Result<ManagerEvent, ManagerError> {
         let Some(session) = self.session.as_ref() else {
-            eprintln!("client on_data: no session");
             return Ok(ManagerEvent::None);
         };
         // B11: the sid is compared against the session's sid **before** the
@@ -1595,7 +1594,6 @@ impl ClientSessionManager {
             .try_into()
             .expect("fixed-size sid slice");
         if sid != *session.session_id() {
-            eprintln!("client on_data: sid mismatch");
             return Ok(ManagerEvent::None);
         }
         let session = self.session.as_mut().expect("checked");
@@ -1604,8 +1602,8 @@ impl ClientSessionManager {
             Err(SessionError::RekeyRequired) => {
                 DataResult::SessionDead(CloseReason::NonceExhausted)
             }
-            Err(SessionError::Codec(CodecError::Rejected)) => { eprintln!("client on_data: rejected"); DataResult::Rejected }
-            Err(SessionError::Codec(CodecError::DecryptionFailed)) => { eprintln!("client on_data: decryption failed"); DataResult::Failed },
+            Err(SessionError::Codec(CodecError::Rejected)) => DataResult::Rejected,
+            Err(SessionError::Codec(CodecError::DecryptionFailed)) => DataResult::Failed,
             Err(SessionError::Codec(CodecError::NonceExhausted { .. })) => {
                 DataResult::SessionDead(CloseReason::NonceExhausted)
             }
@@ -1622,7 +1620,6 @@ impl ClientSessionManager {
                 self.rounds_unanswered = 0;
                 // §10 roaming: rebind only on an authenticated packet.
                 self.peer = from;
-                eprintln!("client on_data: msg_type {:?}", inner.msg_type);
                 match inner.msg_type {
                     MessageType::Data => Ok(ManagerEvent::AppData { sid, inner }),
                     MessageType::TunData => Ok(ManagerEvent::AppData { sid, inner }),

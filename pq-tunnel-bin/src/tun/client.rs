@@ -70,9 +70,7 @@ pub async fn run(
             r = udp.recv() => match r {
                 Err(_) => {}
                 Ok((pkt, from)) => {
-                    let hd = manager.handle_datagram(&pkt, from);
-                    eprintln!("client: handle_datagram => {:?}", hd);
-                    match hd {
+                    match manager.handle_datagram(&pkt, from) {
                         Ok(pq_tunnel_core::ManagerEvent::Send { packets, peer }) => {
                             for p in packets { let _ = udp.send_to(&p, peer).await; }
                         }
@@ -80,42 +78,26 @@ pub async fn run(
                             let _ = udp.send_to(&packet, peer).await;
                         }
                         Ok(pq_tunnel_core::ManagerEvent::AppData { inner, .. }) => {
-                            eprintln!("client: AppData msg_type {:?}", inner.msg_type);
                             if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                                 let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
                                 match reasm.feed(&slot, std::time::Instant::now()) {
-                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt) => {
-                                        eprintln!("client: reassembled {} bytes", pkt.len());
-                                        if is_boundary_dropped(&pkt) {
-                                            eprintln!("client: boundary dropped");
-                                        } else if !validate_inner(&pkt) {
-                                            eprintln!("client: invalid inner");
-                                        } else {
-                                            eprintln!("client: TUN write {} bytes", pkt.len());
-                                            let _ = tun_writer.write(&pkt);
-                                        }
+                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt)
+                                        if !is_boundary_dropped(&pkt) && validate_inner(&pkt) =>
+                                    {
+                                        let _ = tun_writer.write(&pkt);
                                     }
-                                    other => {
-                                        eprintln!("client: feed outcome {:?}", other);
-                                    }
+                                    _ => {}
                                 }
                             }
                         }
                         Ok(pq_tunnel_core::ManagerEvent::Closed { .. }) => {
                             reasm.clear();
-                            eprintln!("client: closed");
                         }
-                        Ok(other) => {
-                            eprintln!("client: manager event {:?}", other);
-                        }
-                        Err(e) => {
-                            eprintln!("client: handle_datagram error {:?}", e);
-                        }
+                        _ => {}
                     }
                 }
             },
             Some(pkt) = tun_rx.recv() => {
-                eprintln!("client: TUN read {} bytes", pkt.len());
                 if is_boundary_dropped(&pkt) { continue; }
                 if !validate_inner(&pkt) { continue; }
                 static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
