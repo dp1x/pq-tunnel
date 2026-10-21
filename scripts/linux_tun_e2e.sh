@@ -82,7 +82,6 @@ ip netns exec clientns timeout 5 tcpdump -n -i veth-c -c 8 udp 2>&1 | head -20 |
 
 echo "=== IPv4 ping through tunnel ==="
 ip netns exec clientns ping -c 2 -W 2 192.0.2.1 || true
-wait 2>/dev/null || true
 
 echo "=== IPv6 ping through tunnel ==="
 ip netns exec clientns ping6 -c 3 -W 2 2001:db8::1
