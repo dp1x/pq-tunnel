@@ -100,8 +100,14 @@ pub async fn run(
                         }
                         Ok(pq_tunnel_core::ManagerEvent::Closed { .. }) => {
                             reasm.clear();
+                            eprintln!("client: closed");
                         }
-                        _ => {}
+                        Ok(other) => {
+                            eprintln!("client: manager event {:?}", other);
+                        }
+                        Err(e) => {
+                            eprintln!("client: handle_datagram error {:?}", e);
+                        }
                     }
                 }
             },
