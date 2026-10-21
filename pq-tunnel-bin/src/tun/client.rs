@@ -146,7 +146,7 @@ fn install_networking(remote: SocketAddr) -> Result<(), Box<dyn std::error::Erro
     #[cfg(target_os = "linux")]
     {
         let server_ip = remote.ip().to_string();
-        let cmds = os_net::linux_install_routes(&server_ip, &server_ip, "pqtun0", "eth0");
+        let cmds = super::os_net::linux_install_routes(&server_ip, &server_ip, "pqtun0", "eth0");
         for c in &cmds {
             let st = std::process::Command::new("sh").arg("-c").arg(c).status()?;
             if !st.success() {
@@ -166,7 +166,7 @@ fn uninstall_networking(remote: SocketAddr) {
     #[cfg(target_os = "linux")]
     {
         let server_ip = remote.ip().to_string();
-        let cmds = os_net::linux_teardown_routes("pqtun0", &server_ip, &server_ip);
+        let cmds = super::os_net::linux_teardown_routes("pqtun0", &server_ip, &server_ip);
         for c in &cmds {
             let _ = std::process::Command::new("sh").arg("-c").arg(c).status();
         }
