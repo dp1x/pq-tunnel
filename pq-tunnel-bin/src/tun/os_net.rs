@@ -285,6 +285,10 @@ pub fn linux_server_install(
     if !client_v6_cidr.is_empty() {
         cmds.push(format!("ip -6 addr add {client_v6_cidr} dev {tun_iface}"));
     }
+    // Route the client's inner addresses back through the TUN so replies and
+    // return traffic reach the tunnel instead of being dropped as unroutable.
+    cmds.push(format!("ip route add 10.77.0.2/32 dev {tun_iface}"));
+    cmds.push(format!("ip -6 route add fd00:77::2/128 dev {tun_iface}"));
     cmds
 }
 
