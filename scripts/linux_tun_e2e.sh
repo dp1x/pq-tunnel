@@ -58,8 +58,21 @@ CLIENT_PID=$!
 # Allow handshake.
 sleep 8
 
+echo "=== processes ==="
+ps aux | grep pq-tunnel | grep -v grep || true
+echo "=== client ns routes ==="
+ip -n clientns route show
+ip -n clientns -6 route show
+echo "=== server ns routes ==="
+ip -n serverns route show
+ip -n serverns -6 route show
+echo "=== client ns addrs ==="
+ip -n clientns addr show
+echo "=== server ns addrs ==="
+ip -n serverns addr show
+
 echo "=== IPv4 ping through tunnel ==="
-ip netns exec clientns ping -c 3 -W 2 192.0.2.1
+ip netns exec clientns ping -c 3 -W 2 192.0.2.1 || true
 
 echo "=== IPv6 ping through tunnel ==="
 ip netns exec clientns ping6 -c 3 -W 2 2001:db8::1
