@@ -77,6 +77,9 @@ ip -n clientns addr show
 echo "=== server ns addrs ==="
 ip -n serverns addr show
 
+# Capture a few packets on the outer link to confirm the tunnel is exchanging UDP.
+ip netns exec clientns timeout 5 tcpdump -n -i veth-c -c 8 udp 2>&1 | head -20 || true
+
 echo "=== IPv4 ping through tunnel ==="
 ip netns exec clientns ping -c 3 -W 2 192.0.2.1 || true
 
