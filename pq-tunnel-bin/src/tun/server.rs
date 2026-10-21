@@ -37,23 +37,19 @@ pub async fn run(
         .await
         .map_err(|e| format!("UDP bind {listen}: {e}"))?;
 
-    let mut dev = device::open_tun("pqtun0")
+    let dev = device::open_tun("pqtun0")
         .await
         .map_err(|e| format!("TUN open: {e}"))?;
-    // Configure the server's inner address before splitting.
-    let _ = device::set_v4_address(
-        &mut dev,
-        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 77, 0, 1)),
-    );
     let (mut tun_reader, mut tun_writer) = dev.split();
 
-    enable_forwarding()?;
+    enable_networking()?;
 
     let cover = crate::cover_policy_from_args(no_cover, cover_mbps)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let assignment = ClientAssignment::default();
-    let mut reasm = pq_tunnel_core::dataplane::Reassembler::new(REASSEMBLY_DEADLINE);
+    let mut reasms: std::collections::HashMap<[u8; 8], pq_tunnel_core::dataplane::Reassembler> =
+        std::collections::HashMap::new();
     let mut current_sid: Option<[u8; 8]> = None;
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
 
@@ -90,6 +86,9 @@ pub async fn run(
                             current_sid = Some(sid);
                             if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                                 let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
+                                let reasm = reasms
+                                    .entry(sid)
+                                    .or_insert_with(|| pq_tunnel_core::dataplane::Reassembler::new(REASSEMBLY_DEADLINE));
                                 match reasm.feed(&slot, std::time::Instant::now()) {
                                     pq_tunnel_core::dataplane::FeedOutcome::Complete(ipkt)
                                         if validate_inner_packet(&ipkt, &assignment) == PacketVerdict::Allow =>
@@ -101,10 +100,16 @@ pub async fn run(
                             }
                         }
                         Ok(pq_tunnel_core::ManagerEvent::Established { sid, .. }) => {
+                            reasms
+                                .entry(sid)
+                                .or_insert_with(|| pq_tunnel_core::dataplane::Reassembler::new(REASSEMBLY_DEADLINE));
                             current_sid = Some(sid);
                         }
-                        Ok(pq_tunnel_core::ManagerEvent::Closed { .. }) => {
-                            reasm.clear();
+                        Ok(pq_tunnel_core::ManagerEvent::Closed { sid, .. }) => {
+                            if let Some(r) = reasms.get_mut(&sid) {
+                                r.clear();
+                            }
+                            reasms.remove(&sid);
                             current_sid = None;
                         }
                         Ok(pq_tunnel_core::ManagerEvent::OutboundDropped { .. }) => {}
@@ -136,11 +141,17 @@ pub async fn run(
                         pq_tunnel_core::ManagerEvent::SendPacket { packet, peer } => {
                             let _ = udp.send_to(&packet, peer).await;
                         }
-                        pq_tunnel_core::ManagerEvent::Closed { .. } => {
-                            reasm.clear();
+                        pq_tunnel_core::ManagerEvent::Closed { sid, .. } => {
+                            if let Some(r) = reasms.get_mut(&sid) {
+                                r.clear();
+                            }
+                            reasms.remove(&sid);
                             current_sid = None;
                         }
                         pq_tunnel_core::ManagerEvent::Established { sid, .. } => {
+                            reasms
+                                .entry(sid)
+                                .or_insert_with(|| pq_tunnel_core::dataplane::Reassembler::new(REASSEMBLY_DEADLINE));
                             current_sid = Some(sid);
                         }
                         _ => {}
@@ -163,20 +174,22 @@ pub async fn run(
     Ok(())
 }
 
-fn enable_forwarding() -> Result<(), Box<dyn std::error::Error>> {
+fn enable_networking() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
-        let st = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sysctl -w net.ipv4.ip_forward=1")
-            .status()?;
-        if !st.success() {
-            return Err("failed to enable IP forwarding".into());
-        }
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("iptables -t nat -A POSTROUTING -s 10.77.0.0/24 -j MASQUERADE")
-            .status();
+        let cmds =
+            crate::tun::os_net::linux_server_install("pqtun0", "10.77.0.1/32", "fd00:77::1/128");
+        crate::tun::os_net::run_commands(&cmds)
+            .map_err(|e| format!("server TUN address setup failed: {e}").into())?;
+        let cmds = crate::tun::os_net::linux_enable_forwarding();
+        crate::tun::os_net::run_commands(&cmds)
+            .map_err(|e| format!("IP forwarding setup failed: {e}").into())?;
+        let cmds = crate::tun::os_net::linux_nat_install("10.77.0.0/24");
+        crate::tun::os_net::run_commands(&cmds)
+            .map_err(|e| format!("NAT setup failed: {e}").into())?;
+        let cmds = crate::tun::os_net::linux_nat_install_ipv6("fd00:77::/64");
+        crate::tun::os_net::run_commands(&cmds)
+            .map_err(|e| format!("IPv6 NAT setup failed: {e}").into())?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]

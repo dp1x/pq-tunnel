@@ -145,14 +145,28 @@ pub async fn run(
 fn install_networking(remote: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
-        let server_ip = remote.ip().to_string();
-        let cmds = super::os_net::linux_install_routes(&server_ip, &server_ip, "pqtun0", "eth0");
-        for c in &cmds {
-            let st = std::process::Command::new("sh").arg("-c").arg(c).status()?;
-            if !st.success() {
-                return Err(format!("route command failed: {c}").into());
-            }
-        }
+        let (phys_iface, gateway) =
+            super::os_net::discover_physical_route(&remote.ip().to_string())
+                .map_err(|e| format!("route discovery failed: {e}"))?;
+        let (server_v4, server_v6) = match remote.ip() {
+            std::net::IpAddr::V4(v) => (v.to_string(), String::new()),
+            std::net::IpAddr::V6(v) => (String::new(), v.to_string()),
+        };
+        let (gw_v4, gw_v6) = if remote.ip().is_ipv4() {
+            (gateway, None)
+        } else {
+            (None, gateway)
+        };
+        let cmds = super::os_net::linux_install_routes_with_gateway(
+            &server_v4,
+            &server_v6,
+            "pqtun0",
+            &phys_iface,
+            gw_v4.as_deref(),
+            gw_v6.as_deref(),
+        );
+        super::os_net::run_commands(&cmds)
+            .map_err(|e| format!("route command failed: {e}").into())?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
@@ -165,10 +179,13 @@ fn install_networking(remote: SocketAddr) -> Result<(), Box<dyn std::error::Erro
 fn uninstall_networking(remote: SocketAddr) {
     #[cfg(target_os = "linux")]
     {
-        let server_ip = remote.ip().to_string();
-        let cmds = super::os_net::linux_teardown_routes("pqtun0", &server_ip, &server_ip);
-        for c in &cmds {
-            let _ = std::process::Command::new("sh").arg("-c").arg(c).status();
+        let (server_v4, server_v6) = match remote.ip() {
+            std::net::IpAddr::V4(v) => (v.to_string(), String::new()),
+            std::net::IpAddr::V6(v) => (String::new(), v.to_string()),
+        };
+        let cmds = super::os_net::linux_teardown_routes("pqtun0", &server_v4, &server_v6);
+        for c in cmds {
+            let _ = super::os_net::run_command(&c);
         }
     }
     #[cfg(not(target_os = "linux"))]

@@ -184,24 +184,53 @@ pub fn validate_inner_packet(pkt: &[u8], assignment: &ClientAssignment) -> Packe
 }
 
 fn is_denied_destination(dst: IpAddr) -> bool {
+    // Normalise IPv4-embedded IPv6 forms before applying the IPv4 rules.
+    let dst = match dst {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_denied_destination(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            if s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0 {
+                let hi = s[6];
+                let lo = s[7];
+                let v4 = Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+                return is_denied_destination(IpAddr::V4(v4));
+            }
+            IpAddr::V6(v6)
+        }
+        other => other,
+    };
+
     match dst {
         IpAddr::V4(v4) => {
             if v4.is_loopback() {
-                return true;
+                return true; // 127.0.0.0/8
             }
             if v4.octets()[0] == 0 {
-                return true;
+                return true; // 0.0.0.0/8
             }
             if v4.is_multicast() {
-                return true;
+                return true; // 224.0.0.0/4
             }
             if v4 == Ipv4Addr::new(255, 255, 255, 255) {
-                return true;
+                return true; // limited broadcast
+            }
+            if v4.octets()[0] == 169 && v4.octets()[1] == 254 {
+                return true; // link-local 169.254.0.0/16
             }
             if v4 == Ipv4Addr::new(169, 254, 169, 254) {
-                return true;
+                return true; // metadata
             }
             if v4 == Ipv4Addr::new(100, 100, 100, 200) {
+                return true; // metadata
+            }
+            // CGNAT 100.64.0.0/10
+            if v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 {
+                return true;
+            }
+            // 240.0.0.0/4
+            if v4.octets()[0] >= 240 {
                 return true;
             }
             false
@@ -216,8 +245,25 @@ fn is_denied_destination(dst: IpAddr) -> bool {
             if v6.is_multicast() {
                 return true;
             }
-            // AWS/GCP metadata v6
-            if v6.to_string() == "fd00:ec2::254" || v6.to_string() == "fd20:ce::254" {
+            // link-local fe80::/10
+            let seg0 = v6.segments()[0];
+            if (seg0 & 0xFFC0) == 0xFE80 {
+                return true;
+            }
+            // metadata
+            if v6 == Ipv6Addr::new(0xFD00, 0x0EC2, 0, 0, 0, 0, 0, 0x0254)
+                || v6 == Ipv6Addr::new(0xFD20, 0x00CE, 0, 0, 0, 0, 0, 0x0254)
+            {
+                return true;
+            }
+            // 6to4 2002::/16, Teredo 2001::/32, NAT64 64:ff9b::/96
+            if v6.segments()[0] == 0x2002 {
+                return true;
+            }
+            if v6.segments()[0] == 0x2001 && v6.segments()[1] == 0x0000 {
+                return true;
+            }
+            if v6.segments()[0] == 0x0064 && v6.segments()[1] == 0xFF9B {
                 return true;
             }
             false
