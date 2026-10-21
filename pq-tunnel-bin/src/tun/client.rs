@@ -166,7 +166,7 @@ fn install_networking(remote: SocketAddr) -> Result<(), Box<dyn std::error::Erro
             gw_v6.as_deref(),
         );
         super::os_net::run_commands(&cmds)
-            .map_err(|e| format!("route command failed: {e}").into())?;
+            .map_err(|e| format!("route command failed: {e}"))?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]

@@ -180,16 +180,16 @@ fn enable_networking() -> Result<(), Box<dyn std::error::Error>> {
         let cmds =
             crate::tun::os_net::linux_server_install("pqtun0", "10.77.0.1/32", "fd00:77::1/128");
         crate::tun::os_net::run_commands(&cmds)
-            .map_err(|e| format!("server TUN address setup failed: {e}").into())?;
+            .map_err(|e| format!("server TUN address setup failed: {e}"))?;
         let cmds = crate::tun::os_net::linux_enable_forwarding();
         crate::tun::os_net::run_commands(&cmds)
-            .map_err(|e| format!("IP forwarding setup failed: {e}").into())?;
+            .map_err(|e| format!("IP forwarding setup failed: {e}"))?;
         let cmds = crate::tun::os_net::linux_nat_install("10.77.0.0/24");
         crate::tun::os_net::run_commands(&cmds)
-            .map_err(|e| format!("NAT setup failed: {e}").into())?;
+            .map_err(|e| format!("NAT setup failed: {e}"))?;
         let cmds = crate::tun::os_net::linux_nat_install_ipv6("fd00:77::/64");
         crate::tun::os_net::run_commands(&cmds)
-            .map_err(|e| format!("IPv6 NAT setup failed: {e}").into())?;
+            .map_err(|e| format!("IPv6 NAT setup failed: {e}"))?;
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
