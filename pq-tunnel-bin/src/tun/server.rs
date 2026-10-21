@@ -91,13 +91,18 @@ pub async fn run(
                                     .entry(sid)
                                     .or_insert_with(|| pq_tunnel_core::dataplane::Reassembler::new(REASSEMBLY_DEADLINE));
                                 match reasm.feed(&slot, std::time::Instant::now()) {
-                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(ipkt)
-                                        if validate_inner_packet(&ipkt, &assignment) == PacketVerdict::Allow =>
-                                    {
-                                        eprintln!("server: TUN write {} bytes", ipkt.len());
-                                        let _ = tun_writer.write(&ipkt);
+                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(ipkt) => {
+                                        eprintln!("server: reassembled {} bytes", ipkt.len());
+                                        let v = validate_inner_packet(&ipkt, &assignment);
+                                        eprintln!("server: verdict {:?}", v);
+                                        if v == PacketVerdict::Allow {
+                                            eprintln!("server: TUN write {} bytes", ipkt.len());
+                                            let _ = tun_writer.write(&ipkt);
+                                        }
                                     }
-                                    _ => {}
+                                    other => {
+                                        eprintln!("server: feed outcome {:?}", other);
+                                    }
                                 }
                             }
                         }

@@ -81,13 +81,20 @@ pub async fn run(
                             if inner.msg_type == pq_tunnel_core::codec::MessageType::TunData {
                                 let slot: [u8; pq_tunnel_core::codec::PAYLOAD_LEN] = inner.payload;
                                 match reasm.feed(&slot, std::time::Instant::now()) {
-                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt)
-                                        if !is_boundary_dropped(&pkt) && validate_inner(&pkt) =>
-                                    {
-                                        eprintln!("client: TUN write {} bytes", pkt.len());
-                                        let _ = tun_writer.write(&pkt);
+                                    pq_tunnel_core::dataplane::FeedOutcome::Complete(pkt) => {
+                                        eprintln!("client: reassembled {} bytes", pkt.len());
+                                        if is_boundary_dropped(&pkt) {
+                                            eprintln!("client: boundary dropped");
+                                        } else if !validate_inner(&pkt) {
+                                            eprintln!("client: invalid inner");
+                                        } else {
+                                            eprintln!("client: TUN write {} bytes", pkt.len());
+                                            let _ = tun_writer.write(&pkt);
+                                        }
                                     }
-                                    _ => {}
+                                    other => {
+                                        eprintln!("client: feed outcome {:?}", other);
+                                    }
                                 }
                             }
                         }
