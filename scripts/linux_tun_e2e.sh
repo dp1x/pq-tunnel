@@ -80,8 +80,13 @@ ip -n serverns addr show
 # Capture a few packets on the outer link to confirm the tunnel is exchanging UDP.
 ip netns exec clientns timeout 5 tcpdump -n -i veth-c -c 8 udp 2>&1 | head -20 || true
 
+# Capture on TUN devices to see whether ICMP enters/leaves the tunnel.
+ip netns exec clientns timeout 6 tcpdump -n -i pqtun0 -c 6 2>&1 | head -20 || true &
+ip netns exec serverns timeout 6 tcpdump -n -i pqtun0 -c 6 2>&1 | head -20 || true &
+
 echo "=== IPv4 ping through tunnel ==="
-ip netns exec clientns ping -c 3 -W 2 192.0.2.1 || true
+ip netns exec clientns ping -c 2 -W 2 192.0.2.1 || true
+wait 2>/dev/null || true
 
 echo "=== IPv6 ping through tunnel ==="
 ip netns exec clientns ping6 -c 3 -W 2 2001:db8::1
