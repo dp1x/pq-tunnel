@@ -322,8 +322,6 @@ pub async fn main_entry() -> Result<(), Box<dyn std::error::Error>> {
                     args.remote,
                     identity,
                     server_key,
-                    crate::cover_policy_from_args(args.no_cover, args.cover_mbps)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
                     args.lifetime_cap_secs,
                 )
                 .await;

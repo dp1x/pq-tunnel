@@ -871,6 +871,7 @@ impl ServerSessionManager {
         match result {
             DataResult::Payload(inner) => match inner.msg_type {
                 MessageType::Data => Ok(ManagerEvent::AppData { sid, inner }),
+                MessageType::TunData => Ok(ManagerEvent::AppData { sid, inner }),
                 // Cover is consumed silently (it is not application data).
                 _ => Ok(ManagerEvent::None),
             },
@@ -1623,6 +1624,7 @@ impl ClientSessionManager {
                 self.peer = from;
                 match inner.msg_type {
                     MessageType::Data => Ok(ManagerEvent::AppData { sid, inner }),
+                    MessageType::TunData => Ok(ManagerEvent::AppData { sid, inner }),
                     // Cover is consumed silently (it is not application data).
                     MessageType::Close => {
                         // The peer told us it is closing: no `Close` in reply
